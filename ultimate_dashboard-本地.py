@@ -1,0 +1,652 @@
+import os
+import sys
+
+# ================= 🔐 安全挂载全局金库 =================
+CONFIG_DIR = os.path.expanduser('~/market_dashboard')
+if CONFIG_DIR not in sys.path:
+    sys.path.append(CONFIG_DIR)
+
+try:
+    import market_config as cfg
+except ImportError:
+    print("❌ 致命错误：找不到 market_config.py 密钥文件！程序终止。")
+    sys.exit(1)
+
+os.environ["PYTHONWARNINGS"] = "ignore" 
+import warnings
+warnings.filterwarnings("ignore")
+
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+import math
+import json
+import pytz
+import pandas_market_calendars as mcal
+NY_TZ = pytz.timezone('America/New_York')
+
+class UltimateDashboard:
+    def __init__(self):
+        # ✅ 从金库安全读取 FRED API 密钥
+        self.fred_api_key = cfg.FRED_API_KEY
+        self.lake_dir = os.path.expanduser('~/DataLake')
+        os.makedirs(self.lake_dir, exist_ok=True)
+
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json'
+        }
+        
+        self.tickers_dict = {'QQQ': 'NDX 100 (QQQ)', 'SPY': 'S&P 500 (SPY)', 'DIA': 'Dow Jones (DIA)', 'IWM': 'Russell 2000 (IWM)'}
+        self.sector_dict = {
+            'XLK': '科技', 'XLF': '金融', 'XLV': '医疗', 'XLY': '可选消费', 
+            'XLP': '日常消费', 'XLE': '能源', 'XLI': '工业', 'XLU': '公用事业', 
+            'XLB': '材料', 'XLRE': '房地产', 'XLC': '通信'
+        }
+        
+        self.data_cache, self.smf, self.liquidity, self.regime, self.score_details, self.macro_engines = {}, {}, {}, {}, {}, {}
+        self.sector_rs, self.risk_scissors, self.vol_metrics = {}, {}, {}
+
+    def is_trading_day(self):
+        try:
+            today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+            nyse = mcal.get_calendar('NYSE')
+            schedule = nyse.schedule(start_date=today_str, end_date=today_str)
+            return not schedule.empty
+        except Exception as e:
+            print(f"日历检测异常: {e}")
+            return False
+
+    def clean_trading_days(self, series):
+        s = series.replace([np.inf, -np.inf], np.nan).dropna()
+        s = s[s.index.dayofweek < 5]
+        return s.loc[~s.index.duplicated(keep='last')]
+
+    def calc_zscore(self, series, window=252):
+        s = self.clean_trading_days(series)
+        if len(s) < 10: return 0.0
+        rolling_mean, rolling_std = s.rolling(window=window).mean(), s.rolling(window=window).std()
+        z = (s - rolling_mean) / rolling_std
+        return float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else 0.0
+
+    def fetch_market_data(self):
+        try:
+            real_time_tickers = list(self.tickers_dict.keys()) + list(self.sector_dict.keys()) + [
+                '^VIX', '^MOVE', '^VIX3M', '^VVIX', '^SKEW', 
+                'DX-Y.NYB', 'JPY=X', 'BTC-USD', 'GC=F', 'CL=F', '^TNX', 
+                'HYG', 'TLT', 'HG=F'
+            ]
+            recent_df = yf.download(real_time_tickers, period="6mo", interval="1d", progress=False)['Close']
+            if not recent_df.empty:
+                if isinstance(recent_df, pd.Series): recent_df = recent_df.to_frame(name=real_time_tickers[0])
+                recent_df.index = pd.to_datetime(recent_df.index).normalize().tz_localize(None)
+                self.data_cache['raw_close'] = recent_df
+                self.data_cache['close'] = recent_df.ffill()
+            
+            vol_data = yf.download(['QQQ'], period="6mo", interval="1d", progress=False).dropna(how='all')
+            if not vol_data.empty:
+                vol_data.index = pd.to_datetime(vol_data.index).normalize().tz_localize(None)
+                self.data_cache['qqq_full'] = vol_data[~vol_data.index.duplicated(keep='last')]
+        except Exception: pass
+
+    def fetch_fred_data_direct(self):
+        fred_map = {
+            'WALCL': 'Fed_Assets', 'WTREGEN': 'TGA', 'RRPONTSYD': 'RRP',
+            'BAMLH0A0HYM2': 'Credit_Spread', 'BAMLC0A0CM': 'IG_Spread',
+            'M2SL': 'M2_Money_Supply', 'T10Y2Y': 'Spread_10Y2Y',
+            'NFCI': 'NFCI', 'DGS10': 'US10Y', 'DFII10': 'TIPS10Y', 
+            'SOFR': 'SOFR', 'TOTRESNS': 'Reserves', 'ECBASSETSW': 'ECB_Assets', 
+            'JPNASSETS': 'BOJ_Assets', 'DEXUSEU': 'EUR_USD', 'DEXJPUS': 'USD_JPY'
+        }
+        
+        session = requests.Session()
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry_strategy = Retry(
+            total=5, 
+            backoff_factor=1, 
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+        
+        series_dict = {}
+        for series_id, col_name in fred_map.items():
+            try:
+                url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={self.fred_api_key}&file_type=json"
+                res = session.get(url, headers=self.headers, timeout=30)
+                if res.status_code == 200:
+                    data = res.json().get('observations', [])
+                    if data:
+                        s = pd.DataFrame(data)
+                        s['value'] = pd.to_numeric(s['value'], errors='coerce')
+                        s['date'] = pd.to_datetime(s['date'])
+                        series_dict[col_name] = s.dropna().set_index('date')['value']
+            except: continue
+                
+        if series_dict:
+            df_fred = pd.DataFrame(series_dict).sort_index()
+            all_days = pd.date_range(start=df_fred.index.min(), end=pd.Timestamp.now().normalize(), freq='B')
+            df_fred = df_fred.reindex(df_fred.index.union(all_days)).ffill().reindex(all_days)
+            self.data_cache['fred_historical'] = df_fred
+            latest = df_fred.iloc[-1]
+            
+            self.liquidity.update({
+                'assets': round(latest.get('Fed_Assets', 0)/1000, 2) if pd.notna(latest.get('Fed_Assets')) else '-',
+                'tga': round(latest.get('TGA', 0)/1000, 2) if pd.notna(latest.get('TGA')) else '-',
+                'rrp': round(latest.get('RRP', 0), 2) if pd.notna(latest.get('RRP')) else '-',
+                'credit': round(latest.get('Credit_Spread', 0), 2) if pd.notna(latest.get('Credit_Spread')) else '-',
+                'ig_spread': round(latest.get('IG_Spread', 0), 2) if pd.notna(latest.get('IG_Spread')) else '-',
+                'nfci': round(latest.get('NFCI', 0), 3) if pd.notna(latest.get('NFCI')) else '-',
+                'sofr': round(latest.get('SOFR', 0), 2) if pd.notna(latest.get('SOFR')) else '-',
+                'y10': round(latest.get('US10Y', 0), 2) if pd.notna(latest.get('US10Y')) else '-',
+                'tips': round(latest.get('TIPS10Y', 0), 2) if pd.notna(latest.get('TIPS10Y')) else '-',
+                'reserves': round(latest.get('Reserves', 0)/1000, 2) if pd.notna(latest.get('Reserves')) else '-'
+            })
+            
+            if self.liquidity['assets'] != '-' and self.liquidity['tga'] != '-' and self.liquidity['rrp'] != '-':
+                self.liquidity['net_liq'] = round(self.liquidity['assets'] - self.liquidity['tga'] - self.liquidity['rrp'], 2)
+            
+            self.regime['spread'] = int(latest.get('Spread_10Y2Y', 0) * 100) if pd.notna(latest.get('Spread_10Y2Y')) else '-'
+            
+            try:
+                fed = latest.get('Fed_Assets', 0) / 1000
+                ecb_usd = (latest.get('ECB_Assets', 0) * latest.get('EUR_USD', 1)) / 1000
+                boj_usd = (latest.get('BOJ_Assets', 0) / 10) / latest.get('USD_JPY', 150)
+                if fed > 0: self.liquidity['g3_liq'] = round(fed + ecb_usd + boj_usd, 2)
+            except: self.liquidity['g3_liq'] = '-'
+
+    def fetch_liquidity_and_smf(self):
+        self.smf = {'dix': '-', 'gex': '-', 'sp500_net': '-', 'nasdaq_net': '-', 'cot_vix': '-', 'spy_sh': '-', 'qqq_sh': '-', 'hyg_sh': '-', 'jnk_sh': '-', 'hyg_px': '-', 'jnk_px': '-', 'junk_flow': '-'}
+        self.score_details.update({'trin': '-', 'pct_20ma': '-', 'pct_50ma': '-', 'pct_200ma': '-', 'nh': '-', 'nl': '-', 'net_nh_nl': '-', 'breadth_thrust': '⚪ 未触发'})
+        self.fetch_fred_data_direct()
+
+        try:
+            df_sm = pd.read_csv("https://squeezemetrics.com/monitor/static/DIX.csv")
+            self.smf.update({'dix': round(df_sm.iloc[-1]['dix'] * 100, 2), 'gex': round(df_sm.iloc[-1]['gex'] / 1e9, 2)})
+        except: pass
+
+        try:
+            url_cftc = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+            date_res = requests.get(url_cftc, params={"$limit": "1", "$select": "report_date_as_yyyy_mm_dd", "$order": "report_date_as_yyyy_mm_dd DESC"}, headers=self.headers, timeout=10).json()
+            if date_res:
+                latest_date = date_res[0]['report_date_as_yyyy_mm_dd'][:10]
+                for item in requests.get(url_cftc, params={"report_date_as_yyyy_mm_dd": latest_date, "$limit": "1500"}, headers=self.headers, timeout=15).json():
+                    name = item.get('contract_market_name', '').upper()
+                    net = int(float(item.get('lev_money_positions_long_all', item.get('lev_money_positions_long', 0))) - float(item.get('lev_money_positions_short_all', item.get('lev_money_positions_short', 0))))
+                    if 'S&P 500' in name and 'MINI' in name and 'MICRO' not in name: self.smf['sp500_net'] = f"{net:,}"
+                    elif 'NASDAQ' in name and '100' in name and 'MICRO' not in name: self.smf['nasdaq_net'] = f"{net:,}"
+                    elif 'VIX FUTURES' in name: self.smf['cot_vix'] = f"{net:,}"
+        except: pass
+
+        try:
+            url_scan = "https://scanner.tradingview.com/america/scan"
+            payload = {
+                "filter": [
+                    {"left": "exchange", "operation": "in_range", "right": ["NYSE", "NASDAQ"]},
+                    {"left": "is_primary", "operation": "equal", "right": True},
+                    {"left": "type", "operation": "equal", "right": "stock"}
+                ],
+                "columns": ["name", "change", "close", "SMA20", "SMA50", "SMA200", "price_52_week_high", "price_52_week_low", "volume"],
+                "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+                "range": [0, 500] 
+            }
+            stocks = requests.post(url_scan, json=payload, headers=self.headers, timeout=15).json().get("data", [])
+            if stocks and len(stocks) >= 450:
+                total = len(stocks)
+                adv_i = dec_i = adv_v = dec_v = a20 = a50 = a200 = nh = nl = 0
+                for item in stocks:
+                    d = item['d']
+                    chg, cl, s20, s50, s200, hi52, lo52, vol = d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]
+                    if chg and vol:
+                        if chg > 0: adv_i += 1; adv_v += vol
+                        elif chg < 0: dec_i += 1; dec_v += vol
+                    if cl:
+                        if s20 and cl > s20: a20 += 1
+                        if s50 and cl > s50: a50 += 1
+                        if s200 and cl > s200: a200 += 1
+                    if cl and hi52 and cl >= hi52 * 0.99: nh += 1
+                    if cl and lo52 and cl <= lo52 * 1.01: nl += 1
+                
+                trin = (adv_i / dec_i) / (adv_v / dec_v) if dec_i > 0 and dec_v > 0 and (adv_v/dec_v) > 0 else 0.0
+                self.score_details.update({
+                    'trin': round(trin, 2), 'pct_20ma': round((a20 / total) * 100, 1), 
+                    'pct_50ma': round((a50 / total) * 100, 1), 'pct_200ma': round((a200 / total) * 100, 1), 
+                    'net_nh_nl': nh - nl, 'nh': nh, 'nl': nl
+                })
+
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                cache_file = os.path.join(self.lake_dir, 'breadth_history.json')
+                history = []
+                if os.path.exists(cache_file):
+                    try:
+                        with open(cache_file, 'r') as f: history = json.load(f)
+                    except: pass
+                
+                history = [h for h in history if h['date'] != today_str]
+                pct_adv = (adv_i / (adv_i + dec_i)) * 100 if (adv_i + dec_i) > 0 else 0
+                history.append({'date': today_str, 'pct_adv': pct_adv})
+                history = history[-10:]
+                
+                with open(cache_file, 'w') as f: json.dump(history, f)
+                
+                thrust_alert = "⚪ 未触发"
+                if len(history) >= 2:
+                    if pct_adv >= 90:
+                        for past in history[-4:-1]:
+                            if past['pct_adv'] <= 10:
+                                thrust_alert = "🚀【极致广度推力】90%抛售瞬间切为90%买盘！底部确立"
+                                break
+                    elif pct_adv <= 10:
+                        thrust_alert = "🔴【极致恐慌抛售】市场内超90%股票处于下跌状态"
+                self.score_details['breadth_thrust'] = thrust_alert
+
+        except: pass
+
+        try:
+            new_records, hyg_flow, jnk_flow = [], 0.0, 0.0
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            csv_file = os.path.expanduser("~/market_dashboard/ETF_Flows_Cache.csv")
+            for ticker in ['SPY', 'QQQ', 'HYG', 'JNK']:
+                tk = yf.Ticker(ticker)
+                shares = tk.info.get('sharesOutstanding', 0)
+                if shares == 0 and hasattr(tk, 'fast_info'):
+                    try: shares = tk.fast_info.get('shares', 0)
+                    except: pass
+                hist = tk.history(period="1d")
+                if not hist.empty:
+                    price = hist['Close'].iloc[-1]
+                    if ticker == 'HYG': self.smf['hyg_px'] = round(price, 2)
+                    if ticker == 'JNK': self.smf['jnk_px'] = round(price, 2)
+                    if shares > 0:
+                        new_records.append({'Date': today_str, 'Ticker': ticker, 'Shares': shares, 'Price': price})
+                        if ticker == 'SPY': self.smf['spy_sh'] = f"{round(shares/1e6, 2)}M"
+                        elif ticker == 'QQQ': self.smf['qqq_sh'] = f"{round(shares/1e6, 2)}M"
+                        elif ticker == 'HYG': self.smf['hyg_sh'] = f"{round(shares/1e6, 2)}M"
+                        elif ticker == 'JNK': self.smf['jnk_sh'] = f"{round(shares/1e6, 2)}M"
+
+            if os.path.exists(csv_file) and new_records:
+                df_hist = pd.read_csv(csv_file)
+                for rec in new_records:
+                    past = df_hist[df_hist['Ticker'] == rec['Ticker']]
+                    if not past.empty:
+                        flow = ((rec['Shares'] - past.iloc[-1]['Shares']) * rec['Price']) / 1e6
+                        if rec['Ticker'] == 'HYG': hyg_flow = flow
+                        elif rec['Ticker'] == 'JNK': jnk_flow = flow
+            self.smf['junk_flow'] = round(hyg_flow + jnk_flow, 2)
+        except: pass
+
+    def calculate_metrics(self):
+        df, raw_df = self.data_cache.get('close', pd.DataFrame()), self.data_cache.get('raw_close', pd.DataFrame())
+        fh = self.data_cache.get('fred_historical', pd.DataFrame())
+        
+        self.score_details.update({'macro_score': 0, 'micro_score': 0, 'vix': '-', 'move': '-', 'pcr': '-', 'cmf': '-'})
+        self.regime = {'desc': '不明朗', 'spread': self.regime.get('spread', '-'), 'cg_ratio': '-', 'hyg': '-', 'oil': '-', 'dxy': '-', 'btc': '-', 'gold': '-', 'jpy': '-'}
+        
+        for k, t in {'dxy':'DX-Y.NYB', 'jpy':'JPY=X', 'oil':'CL=F', 'gold':'GC=F'}.items(): 
+            self.regime[k] = round(df[t].iloc[-1], 2) if t in df.columns else '-'
+        if 'BTC-USD' in df.columns: self.regime['btc'] = f"{int(df['BTC-USD'].iloc[-1]):,}"
+        
+        if self.liquidity.get('y10', '-') == '-' and '^TNX' in df.columns:
+            s_tnx = self.clean_trading_days(df['^TNX'])
+            if not s_tnx.empty:
+                self.liquidity['y10'] = round(s_tnx.iloc[-1], 2)
+
+        micro_add_score = 0
+        try:
+            h = self.data_cache.get('qqq_full', pd.DataFrame())
+            if not h.empty:
+                cl, hi, lo, vo = (h['Close']['QQQ'], h['High']['QQQ'], h['Low']['QQQ'], h['Volume']['QQQ']) if isinstance(h.columns, pd.MultiIndex) else (h['Close'], h['High'], h['Low'], h['Volume'])
+                range_hl = (hi - lo).replace(0, 0.01)
+                mfv = (((cl - lo) - (hi - cl)) / range_hl) * vo
+                self.score_details['cmf'] = round((mfv.rolling(21).sum() / vo.rolling(21).sum()).dropna().iloc[-1], 2)
+        except: pass
+
+        try:
+            tk_qqq = yf.Ticker("QQQ")
+            opts = tk_qqq.options
+            if opts: 
+                valid_exps = [exp for exp in opts if datetime.strptime(exp, '%Y-%m-%d').date() >= datetime.now().date()]
+                if valid_exps:
+                    chain = tk_qqq.option_chain(valid_exps[0])
+                    c_vol = pd.to_numeric(chain.calls['volume'], errors='coerce').fillna(0).sum()
+                    p_vol = pd.to_numeric(chain.puts['volume'], errors='coerce').fillna(0).sum()
+                    if c_vol > 0: self.score_details['pcr'] = round(p_vol / c_vol, 2)
+        except: pass
+
+        self.vol_metrics = {'vix': '-', 'move': '-', 'vix_term': '-', 'vrp': '-', 'vvix': '-', 'skew': '-'}
+        if '^VVIX' in df.columns: self.vol_metrics['vvix'] = round(df['^VVIX'].iloc[-1], 2)
+        if '^SKEW' in df.columns: self.vol_metrics['skew'] = round(df['^SKEW'].iloc[-1], 2)
+        if '^MOVE' in df.columns: 
+            self.vol_metrics['move'] = round(df['^MOVE'].iloc[-1], 2)
+            self.score_details['move'] = self.vol_metrics['move']
+        
+        if '^VIX' in df.columns:
+            vix_cur = df['^VIX'].replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
+            self.vol_metrics['vix'] = round(vix_cur, 2)
+            self.score_details['vix'] = self.vol_metrics['vix']
+            
+            if '^VIX3M' in df.columns:
+                vix3m_cur = df['^VIX3M'].replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
+                ratio = vix_cur / vix3m_cur
+                state = "🔴倒挂极限(Backwardation)" if ratio >= 1.0 else "🟢正常升水(Contango)"
+                self.vol_metrics['vix_term'] = f"{ratio:.2f} [{state}]"
+                
+            if 'SPY' in df.columns:
+                spy_s = self.clean_trading_days(df['SPY'])
+                if len(spy_s) >= 21:
+                    log_ret = np.log(spy_s / spy_s.shift(1)).dropna()
+                    hv20 = log_ret.tail(20).std() * np.sqrt(252) * 100
+                    vrp = vix_cur - hv20
+                    vrp_state = "🔥极度恐慌(做市商Sell Put底牌)" if vrp > 10 else ("🧊情绪麻木" if vrp < 0 else "⚪情绪正常")
+                    self.vol_metrics['vrp'] = f"{vrp:+.2f} [{vrp_state}] (HV20: {hv20:.1f})"
+
+        self.risk_scissors = {'ratio': '-', 'roc_21d': '-', 'state': '-'}
+        if 'HYG' in df.columns and 'TLT' in df.columns:
+            s_hyg, s_tlt = self.clean_trading_days(df['HYG']), self.clean_trading_days(df['TLT'])
+            common_idx = s_hyg.index.intersection(s_tlt.index)
+            if len(common_idx) >= 21:
+                ratio_s = s_hyg.loc[common_idx] / s_tlt.loc[common_idx]
+                cur_r, past_r = ratio_s.iloc[-1], ratio_s.iloc[-21]
+                roc = (cur_r / past_r - 1) * 100
+                state = "🔴聪明钱狂买美债避险" if roc < -2.0 else ("🟢风险偏好全开" if roc > 2.0 else "⚪情绪震荡")
+                self.risk_scissors = {'ratio': f"{cur_r:.3f}", 'roc_21d': f"{roc:+.2f}%", 'state': state}
+
+        cg_val = cg_z = '-'
+        if 'HG=F' in df.columns and 'GC=F' in df.columns:
+            cg_series = self.clean_trading_days((df['HG=F'] * 100) / df['GC=F'])
+            if not cg_series.empty:
+                cg_val = round(cg_series.iloc[-1], 2)
+                cg_z = self.calc_zscore(cg_series)
+        self.regime['cg_ratio'] = cg_val
+
+        self.sector_rs = {}
+        if 'SPY' in df.columns:
+            spy_s = self.clean_trading_days(df['SPY'])
+            for sym, name in self.sector_dict.items():
+                if sym in df.columns:
+                    sec_s = self.clean_trading_days(df[sym])
+                    c_idx = sec_s.index.intersection(spy_s.index)
+                    if len(c_idx) > 63:
+                        sec_c, spy_c = sec_s.loc[c_idx], spy_s.loc[c_idx]
+                        a_1w = ((sec_c.iloc[-1]/sec_c.iloc[-6]) - (spy_c.iloc[-1]/spy_c.iloc[-6])) * 100
+                        a_1m = ((sec_c.iloc[-1]/sec_c.iloc[-22]) - (spy_c.iloc[-1]/spy_c.iloc[-22])) * 100
+                        a_3m = ((sec_c.iloc[-1]/sec_c.iloc[-64]) - (spy_c.iloc[-1]/spy_c.iloc[-64])) * 100
+                        self.sector_rs[name] = f"1周: {a_1w:+.2f}% | 1月: {a_1m:+.2f}% | 3月: {a_3m:+.2f}%"
+                    else:
+                        self.sector_rs[name] = "数据不足"
+
+        # ==================== 修复的宏观打分引擎 (Macro Score) ====================
+        m_score = 0
+        
+        # 1. 10Y美债急升度 (TNX)
+        if '^TNX' in df.columns: 
+            z = self.calc_zscore(df['^TNX'], 63)
+            self.macro_engines['tnx'] = f"Z: {z:+.2f}"
+            m_score += 15 if z > 2.0 else (5 if z > 1.0 else 0)
+        
+        # 2. 原油暴涨率 (OIL)
+        if 'CL=F' in df.columns:
+            oil = self.clean_trading_days(df['CL=F'])
+            if len(oil) >= 21:
+                oil_roc = (oil.iloc[-1] / oil.iloc[-21] - 1) * 100
+                self.macro_engines['oil'] = f"ROC: {oil_roc:+.2f}%"
+                m_score += 15 if oil_roc > 15.0 else (10 if oil_roc > 10.0 else 0)
+            else: self.macro_engines['oil'] = "-"
+        else: self.macro_engines['oil'] = "-"
+
+        if not fh.empty:
+            # 3. 10Y-2Y利差变动 (Yield Curve)
+            if 'Spread_10Y2Y' in fh.columns and len(fh['Spread_10Y2Y']) >= 21:
+                yc_cur = fh['Spread_10Y2Y'].iloc[-1]
+                yc_1m = fh['Spread_10Y2Y'].iloc[-21]
+                yc_chg = yc_cur - yc_1m
+                self.macro_engines['yc'] = f"{yc_chg:+.2f}%"
+                # 只有在倒挂期恶化时才计算宏观压力
+                if yc_cur < 0: 
+                    m_score += 15 if yc_chg > 0.2 else (5 if yc_chg > 0.0 else 0)
+            else: self.macro_engines['yc'] = "-"
+
+            # 4. 短期净流动性抽水 (Liquidity)
+            nl = (fh['Fed_Assets']/1000) - (fh['TGA']/1000) - fh['RRP']
+            if len(nl) >= 63:
+                l_roc = (nl.iloc[-1] / nl.iloc[-63] - 1) * 100
+                self.macro_engines['liq'] = f"ROC: {l_roc:+.2f}%"
+                m_score += 15 if l_roc < -5.0 else (8 if l_roc < -2.0 else 0)
+            
+            # 5. M2 货币供应 (M2)
+            if len(fh['M2_Money_Supply']) >= 252:
+                m2_yoy = (fh['M2_Money_Supply'].iloc[-1] / fh['M2_Money_Supply'].iloc[-252] - 1) * 100
+                self.macro_engines['m2'] = f"YoY: {m2_yoy:+.2f}%"
+                m_score += 10 if m2_yoy < 0 else (5 if m2_yoy < 2.0 else 0)
+            
+            # 6. 金融摩擦压力 (NFCI)
+            if 'NFCI' in fh.columns:
+                nfci_val = fh['NFCI'].iloc[-1]
+                self.macro_engines['stress'] = f"{nfci_val:.2f} (NFCI)"
+                m_score += 10 if nfci_val > 1.0 else (5 if nfci_val > 0.5 else 0)
+                
+            # 7. 信用利差 (Credit Spread)
+            cs_z = self.calc_zscore(fh['Credit_Spread'])
+            self.macro_engines['credit'] = f"Z: {cs_z:+.2f}"
+            m_score += 10 if cs_z > 2.0 else (5 if cs_z > 1.0 else 0)
+            
+            # 8. 铜金比避险偏离 (Copper/Gold)
+            self.macro_engines['cg'] = f"Z: {cg_z:+.2f}" if cg_z != '-' else '-'
+            if cg_z != '-':
+                m_score += 10 if float(cg_z) < -2.0 else (5 if float(cg_z) < -1.0 else 0)
+            
+        self.score_details['macro_score'] = min(100, m_score)
+        # ==================== 修复的宏观打分引擎结束 ====================
+
+        # ==================== V8.6 微观评分引擎整合开始 ====================
+        try:
+            # 1. 安全提取各维度核心数据
+            v_vix = float(self.vol_metrics.get('vix', 14.0)) if self.vol_metrics.get('vix') != '-' else 14.0
+            v_move = float(self.score_details.get('move', 0)) if self.score_details.get('move') != '-' else 0
+            v_cred = float(self.liquidity.get('credit', 0)) if self.liquidity.get('credit') != '-' else 0
+            v_trin = float(self.score_details.get('trin', 1.0)) if self.score_details.get('trin') != '-' else 1.0
+            v_pcr  = float(self.score_details.get('pcr', 0.8)) if self.score_details.get('pcr') != '-' else 0.8
+            v_cmf  = float(self.score_details.get('cmf', 0)) if self.score_details.get('cmf') != '-' else 0
+            
+            # 提取暗池数据 (本程序使用 DIX 接口，DIX > 45% 等效于之前讨论的 DPSV > 50%)
+            v_dix  = float(self.smf.get('dix', 0)) if self.smf.get('dix') != '-' else 0
+
+            # 判定标普大盘是否收跌 (用于 TRIN 逻辑的交叉验证)
+            spy_down = False
+            if 'SPY' in df.columns:
+                spy_s = self.clean_trading_days(df['SPY'])
+                if len(spy_s) >= 2 and spy_s.iloc[-1] < spy_s.iloc[-2]:
+                    spy_down = True
+
+            # 2. 计算 VIX 基础分 (牛市自适应平滑机制，封顶 60 分)
+            base_s = 0
+            if v_vix >= 35: base_s = 60
+            elif 25 <= v_vix < 35: base_s = 40 + ((v_vix - 25) / 10.0) * 20
+            elif 18 <= v_vix < 25: base_s = 20 + ((v_vix - 18) / 7.0) * 20
+            elif 12 <= v_vix < 18: base_s = ((v_vix - 12) / 6.0) * 20
+
+            # 3. 跨资产惩罚与防骗奖励机制
+            add_s = 0
+            
+            # 债市与信用惩罚
+            if v_move >= 120: add_s += 15
+            elif v_move >= 100: add_s += 10
+            if v_cred > 5.0: add_s += 15
+            
+            # 广度动能与假摔防骗
+            if v_trin > 1.5 and spy_down: add_s += 15
+            elif v_trin > 1.2: add_s += 10
+            elif v_trin < 0.7 and spy_down: add_s -= 10 # 缩量空跌(假摔奖励)
+            
+            # 期权与现货抛压
+            if v_pcr > 1.0: add_s += 10
+            if v_cmf < -0.05: add_s += 10
+
+            # 4. 暗池(DIX)托底反转防骗
+            if v_dix > 45.0:
+                add_s -= 15 # 机构利用恐慌掩护吸筹，强制对冲表层恐慌分数
+
+            # 5. 总分核算 (严格限制在 0-100 区间)
+            self.score_details['micro_score'] = max(0, min(int(base_s + add_s), 100))
+
+        except Exception as e:
+            self.log(f"⚠️ V8.6 微观打分系统异常: {e}")
+            self.score_details['micro_score'] = 0
+        # ==================== V8.6 微观评分引擎整合结束 ====================
+
+        p200 = self.score_details.get('pct_200ma', 0)
+        if p200 != '-':
+            if p200 > 60: self.score_details['skeleton'] = "🛡️ 结构牛市"
+            elif p200 < 40: self.score_details['skeleton'] = "🧊 结构熊市"
+            else: self.score_details['skeleton'] = "🔄 宽幅震荡"
+
+        y10_val = self.liquidity['y10'] if self.liquidity['y10'] != '-' else (df['^TNX'].iloc[-1] if '^TNX' in df.columns else '-')
+        oil_val = self.regime['oil']
+        hyg_val = round(df['HYG'].iloc[-1], 2) if 'HYG' in df.columns else '-'
+        
+        if y10_val != '-' and oil_val != '-' and cg_val != '-':
+            if y10_val > 4.3 and oil_val > 80 and cg_val > 20: self.regime['desc'] = "🔥 再通胀/不着陆"
+            elif y10_val < 3.8 and hyg_val != '-' and hyg_val < 75 and oil_val < 70: self.regime['desc'] = "🧊 硬着陆/衰退"
+            elif y10_val < 4.2 and hyg_val != '-' and hyg_val > 77 and oil_val < 75: self.regime['desc'] = "🌤️ 金发女孩"
+            elif y10_val > 4.5 and cg_val < 18 and oil_val > 85: self.regime['desc'] = "🌪️ 滞胀"
+
+        dix_div_alert = "⚪ 未触发"
+        if 'SPY' in df.columns and self.smf.get('dix') != '-':
+            spy_c = self.clean_trading_days(df['SPY'])
+            if len(spy_c) >= 20:
+                min_20d = spy_c.iloc[-21:-1].min()
+                curr_px = spy_c.iloc[-1]
+                dix_val = float(self.smf['dix'])
+                if curr_px < min_20d and dix_val > 45.0:
+                    dix_div_alert = f"🚨【暗池背离吸筹】现价跌破20日低点, 且机构在暗池极端吸筹({dix_val}%)"
+        self.score_details['dix_divergence'] = dix_div_alert
+
+        self.heatmap_df, self.current_prices = pd.DataFrame(), {}
+        for sym, name in self.tickers_dict.items():
+            if sym in df.columns:
+                s_data = self.clean_trading_days(df[sym])
+                if len(s_data) > 64:
+                    self.current_prices[name] = round(s_data.iloc[-1], 2)
+                    self.heatmap_df[name] = {
+                        '1_Day': round((s_data.iloc[-1]/s_data.iloc[-2]-1)*100, 2),
+                        '1_Week': round((s_data.iloc[-1]/s_data.iloc[-6]-1)*100, 2),
+                        '1_Month': round((s_data.iloc[-1]/s_data.iloc[-22]-1)*100, 2),
+                        '3_Months': round((s_data.iloc[-1]/s_data.iloc[-64]-1)*100, 2)
+                    }
+        self.heatmap_df = self.heatmap_df.T
+
+    def generate_outputs(self):
+        mac_s, mic_s = self.score_details.get('macro_score', 0), self.score_details.get('micro_score', 0)
+        m_val = lambda k: self.macro_engines.get(k, '-')
+        
+        text_output = f"""
+[尾部黑天鹅预警]: {self.score_details.get('net_nh_nl', '-')} (净新高-新低)
+[深度广度推力信号]: {self.score_details.get('breadth_thrust', '-')}
+[机构暗池背离信号]: {self.score_details.get('dix_divergence', '-')}
+
+==== 🌊 全球宏观流动性 ====
+[G3净流动性]: {self.liquidity.get('g3_liq', '-')}
+[美联储总资产]: {self.liquidity.get('assets', '-')}
+[真实净流动性]: {self.liquidity.get('net_liq', '-')}
+[TGA账户余额]: {self.liquidity.get('tga', '-')}
+[隔夜逆回购RRP]: {self.liquidity.get('rrp', '-')}
+[银行准备金]: {self.liquidity.get('reserves', '-')}
+[SOFR尾部利差]: {self.liquidity.get('sofr', '-')}
+[OFR金融压力指数]: {self.liquidity.get('nfci', '-')}
+
+==== 📈 利率收益率结构 ====
+[10年期美债]: {self.liquidity.get('y10', '-')}
+[实际收益率TIPS]: {self.liquidity.get('tips', '-')}
+[10Y-2Y利差]: {self.regime.get('spread', '-')}
+[投资级信用利差]: {self.liquidity.get('ig_spread', '-')}
+[高收益债信用利差]: {self.liquidity.get('credit', '-')}
+[垃圾债资金流入]: {self.smf.get('junk_flow', '-')}
+[铜金比]: {self.regime.get('cg_ratio', '-')}
+
+==== 🌪️ 资产波动情绪 ====
+[标普恐慌VIX]: {self.vol_metrics.get('vix', '-')}
+[美债恐慌MOVE]: {self.vol_metrics.get('move', '-')}
+[波率之波VVIX]: {self.vol_metrics.get('vvix', '-')}
+[黑天鹅SKEW]: {self.vol_metrics.get('skew', '-')}
+[期权看跌比PCR]: {self.score_details.get('pcr', '-')}
+[VIX倒挂比]: {self.vol_metrics.get('vix_term', '-')}
+[VRP波动率风险溢价]: {self.vol_metrics.get('vrp', '-')}
+[VIX净持仓COT]: {self.smf.get('cot_vix', '-')}
+
+==== 🦅 股市结构与广度 ====
+[大盘骨架评级]: {self.score_details.get('skeleton', '-')}
+[20MA占比]: {self.score_details.get('pct_20ma', '-')}
+[50MA占比]: {self.score_details.get('pct_50ma', '-')}
+[200MA占比]: {self.score_details.get('pct_200ma', '-')}
+[净新高新低]: 创新高 {self.score_details.get('nh', '-')} / 创新低 {self.score_details.get('nl', '-')}
+[TRIN成交量广度]: {self.score_details.get('trin', '-')}
+[做市商敞口GEX]: {self.smf.get('gex', '-')}
+[暗池买盘DIX]: {self.smf.get('dix', '-')}
+
+==== ⚖️ 聪明钱避险剪刀差 (HYG/TLT) ====
+[垃圾债/长债比值]: {self.risk_scissors.get('ratio', '-')}
+[近21天趋势动能]: {self.risk_scissors.get('roc_21d', '-')} -> {self.risk_scissors.get('state', '-')}
+
+==== 🏭 11 大 GICS 行业轮动 (相对 SPY 超额收益) ====
+"""
+        for name, data in self.sector_rs.items():
+            text_output += f"[{name}]: {data}\n"
+
+        text_output += f"""
+==== 🌍 资产定价与仓位 ====
+[S&P500净持仓]: {self.smf.get('sp500_net', '-')}
+[纳指净持仓]: {self.smf.get('nasdaq_net', '-')}
+[美元指数DXY]: {self.regime.get('dxy', '-')}
+[日元汇率JPY]: {self.regime.get('jpy', '-')}
+[WTI原油Oil]: {self.regime.get('oil', '-')}
+[黄金XAU]: {self.regime.get('gold', '-')}
+[比特币BTC]: {self.regime.get('btc', '-')}
+[资金流向CMF]: {self.score_details.get('cmf', '-')}
+
+==== 附加数据 ====
+[宏观压力得分]: {mac_s}
+[微观战术得分]: {mic_s}
+【判定象限】: {self.regime.get('desc', '-')}
+[SPY份额]: {self.smf.get('spy_sh', '-')}
+[QQQ份额]: {self.smf.get('qqq_sh', '-')}
+[HYG份额]: {self.smf.get('hyg_sh', '-')}
+[JNK份额]: {self.smf.get('jnk_sh', '-')}
+[HYG价格]: {self.smf.get('hyg_px', '-')}
+[JNK价格]: {self.smf.get('jnk_px', '-')}
+
+==== 🏛️ 宏观八大引擎数据 ====
+[宏观]10Y急升度Z: {m_val('tnx')}
+[宏观]原油20日ROC: {m_val('oil')}
+[宏观]10Y-2Y利差变动: {m_val('yc')}
+[宏观]净流动性ROC: {m_val('liq')}
+[宏观]M2同比YoY: {m_val('m2')}
+[宏观]STLFSI压力: {m_val('stress')}
+[宏观]信用利差Z: {m_val('credit')}
+[宏观]铜金比Z: {m_val('cg')}
+
+==== 四大指数动能矩阵 ====
+"""
+        for name in self.heatmap_df.index:
+            try:
+                chg_1d = self.heatmap_df.loc[name, '1_Day']
+                chg_1w = self.heatmap_df.loc[name, '1_Week']
+                chg_1m = self.heatmap_df.loc[name, '1_Month']
+                chg_3m = self.heatmap_df.loc[name, '3_Months']
+                text_output += f"[{name}] 最新价: ${self.current_prices.get(name, 0)} | 1日: {chg_1d:+.2f}% | 1周: {chg_1w:+.2f}% | 1月: {chg_1m:+.2f}% | 3月: {chg_3m:+.2f}%\n"
+            except:
+                text_output += f"[{name}] 最新价: ${self.current_prices.get(name, 0)}\n"
+
+        print(text_output)
+
+if __name__ == "__main__":
+    app = UltimateDashboard()
+    if not app.is_trading_day():
+        print("🛑 今天是美股休市日，UltimateDashboard 终止运行。")
+        sys.exit(0)
+        
+    app.fetch_market_data()
+    app.fetch_liquidity_and_smf()
+    app.calculate_metrics()
+    app.generate_outputs()

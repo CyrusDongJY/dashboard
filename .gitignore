@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+market_config.py
+sniper.log
+.claude/
