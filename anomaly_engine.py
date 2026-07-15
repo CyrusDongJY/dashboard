@@ -100,7 +100,10 @@ class AnomalyEvent:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_row(self):
-        return asdict(self)
+        d = asdict(self)
+        # DB 列名用 window_scope（window 是 PostgreSQL 保留字）
+        d['window_scope'] = d.pop('window')
+        return d
 
 
 # ============================================================
@@ -226,6 +229,96 @@ def scan_metric(metric, series, report_date, scope=None, source_date=None):
 
 
 # ============================================================
+#  每日全量快照：不管越不越线，都算出完整派生向量
+#  这是"曲线化 / 环境评估"的地基——scan_metric 每天已经算了这些，
+#  以前没越线就扔掉，现在无条件持久化到 metric_daily。
+# ============================================================
+def _dist_to_threshold(reg, cur):
+    """当前值到"入场阈值"（该指标 abs 列表里最不严重的那条）的带符号距离。
+    正=尚有安全边际，负=已越线。无 abs 阈值的指标返回 None。"""
+    absr = reg.get("abs")
+    if not absr:
+        return None
+    # 取 severity 最小的那条作为"入场线"
+    op, thr, _sev = min(absr, key=lambda x: x[2])
+    # 危险方向：> 阈值危险 → 距离 = thr - cur（cur 越过 thr 后为负）
+    #           < 阈值危险 → 距离 = cur - thr
+    if op in (">", ">="):
+        return round(float(thr - cur), 4)
+    else:
+        return round(float(cur - thr), 4)
+
+
+def _days_in_risk(series, reg):
+    """连续多少个交易日处于风险区（按 abs 入场阈值判定，末尾往前数）。
+    无 abs 阈值的指标返回 None（避免用滚动 z 造成误导性数字）。"""
+    absr = reg.get("abs")
+    if not absr:
+        return None
+    op, thr, _sev = min(absr, key=lambda x: x[2])
+    s = _clean(series)
+    if s.empty:
+        return 0
+    count = 0
+    for v in reversed(s.values):
+        if _cmp(op, float(v), thr):
+            count += 1
+        else:
+            break
+    return count
+
+
+def metric_snapshot(metric, series, report_date, scope=None, source_date=None):
+    """输出单指标的每日派生向量（dict），供 metric_daily 落库画曲线。
+    与 scan_metric 用同一套统计口径，但无条件产出（不依赖是否越线）。"""
+    reg = METRIC_REGISTRY.get(metric)
+    if reg is None:
+        return None
+    s = _clean(series)
+    if s.empty:
+        return None
+
+    scope = scope or reg["scope"]
+    lag = lag_trading_days(source_date, report_date) if source_date else 0
+    z, n = zscore_252(s)
+    pct = percentile_252(s)
+    chg = {w: window_change(s, k) for w, k in WINDOWS.items()}
+    cur = float(s.iloc[-1])
+
+    # 该指标当日触发的最高 severity（与 scan_metric 一致，供面板着色）
+    sev = 0
+    if reg.get("abs"):
+        for op, thr, sv in reg["abs"]:
+            if _cmp(op, cur, thr):
+                sev = max(sev, sv)
+    if z is not None and reg["bad_dir"] != 0:
+        z_dir = z * reg["bad_dir"]
+        s2, s3 = reg["z"]
+        sev = max(sev, 3 if z_dir >= s3 else (2 if z_dir >= s2 else 0))
+
+    return {
+        "report_date": report_date,
+        "metric": metric,
+        "scope": scope,
+        "cn_name": reg["cn"],
+        "value": round(cur, 4),
+        "chg_1d": round(chg["1D"], 4) if chg["1D"] is not None else None,
+        "chg_5d": round(chg["5D"], 4) if chg["5D"] is not None else None,
+        "chg_21d": round(chg["21D"], 4) if chg["21D"] is not None else None,
+        "chg_63d": round(chg["63D"], 4) if chg["63D"] is not None else None,
+        "zscore": round(z, 3) if z is not None else None,
+        "percentile": round(pct, 1) if pct is not None else None,
+        "severity": sev,
+        "dist_to_thr": _dist_to_threshold(reg, cur),
+        "days_in_risk": _days_in_risk(s, reg),
+        "sample_len": n,
+        "source_date": source_date,
+        "lag_days": lag,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============================================================
 # 第三层：跨资产共振
 # ============================================================
 RESONANCE_THEMES = {
@@ -310,6 +403,7 @@ def run_engine(supabase, report_date=None, persist=True):
     report_date = report_date or datetime.now().strftime('%Y-%m-%d')
     events = []
     snapshot = {}
+    snap_rows = []   # metric_daily：每日无条件全指标派生向量（不论越没越线）
 
     # ---- 宏观：market_history ----
     mh = _fetch_history(supabase, 'market_history', 'record_date')
@@ -322,6 +416,8 @@ def run_engine(supabase, report_date=None, persist=True):
         for m in macro_metrics:
             if m in mh.columns:
                 events += scan_metric(m, mh[m], report_date, scope="MACRO", source_date=src)
+                row = metric_snapshot(m, mh[m], report_date, scope="MACRO", source_date=src)
+                if row: snap_rows.append(row)
                 snapshot[m] = pd.to_numeric(latest.get(m), errors='coerce')
         # 派生量：hyg_tlt 21日 ROC
         if 'hyg_tlt_ratio' in mh.columns:
@@ -337,6 +433,8 @@ def run_engine(supabase, report_date=None, persist=True):
         for m in ['vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct']:
             if m in ms.columns:
                 events += scan_metric(m, ms[m], report_date, scope="MACRO", source_date=src)
+                row = metric_snapshot(m, ms[m], report_date, scope="MACRO", source_date=src)
+                if row: snap_rows.append(row)
                 snapshot[m] = pd.to_numeric(latest.get(m), errors='coerce')
 
     # ---- 个股微观：盘前 DPSV + 盘后 IVR（逐标的拉取，规避1000行截断）----
@@ -347,6 +445,8 @@ def run_engine(supabase, report_date=None, persist=True):
             if not g.empty and 'dpsv_pct' in g.columns:
                 src = g.iloc[-1].get('dpsv_source_date') or g.iloc[-1].get('source_date') or g.iloc[-1].get('date')
                 events += scan_metric('dpsv_pct', g['dpsv_pct'], report_date, scope=tkr, source_date=src)
+                row = metric_snapshot('dpsv_pct', g['dpsv_pct'], report_date, scope=tkr, source_date=src)
+                if row: snap_rows.append(row)
                 dv = pd.to_numeric(g.iloc[-1].get('dpsv_pct'), errors='coerce')
                 if pd.notna(dv): dpsv_vals.append(dv)
         except Exception:
@@ -356,6 +456,8 @@ def run_engine(supabase, report_date=None, persist=True):
             if not g.empty and 'ivr_pct' in g.columns:
                 src = g.iloc[-1].get('source_date') or g.iloc[-1].get('date')
                 events += scan_metric('ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src)
+                row = metric_snapshot('ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src)
+                if row: snap_rows.append(row)
                 iv = pd.to_numeric(g.iloc[-1].get('ivr_pct'), errors='coerce')
                 if pd.notna(iv): ivr_vals.append(iv)
         except Exception:
@@ -371,12 +473,17 @@ def run_engine(supabase, report_date=None, persist=True):
     # 排序：severity desc, confidence desc
     events.sort(key=lambda e: (e.severity, e.confidence), reverse=True)
 
-    if persist and events:
-        rows = [e.to_row() for e in events]
-        # 唯一键 (report_date, metric, scope, window, layer)，重复运行覆盖
+    if persist:
         from market_utils import safe_upsert
-        safe_upsert(supabase, 'anomaly_events', rows,
-                    conflict_cols='report_date,metric,scope,window,layer')
+        if events:
+            rows = [e.to_row() for e in events]
+            # 唯一键 (report_date, metric, scope, window, layer)，重复运行覆盖
+            safe_upsert(supabase, 'anomaly_events', rows,
+                        conflict_cols='report_date,metric,scope,window_scope,layer')
+        # 每日全量快照：不管越不越线都落库，供曲线/环境评估（唯一键去当日重复）
+        if snap_rows:
+            safe_upsert(supabase, 'metric_daily', snap_rows,
+                        conflict_cols='report_date,metric,scope')
 
     return events, snapshot
 

@@ -10,14 +10,89 @@
    - `stock_options_pre_market` / `stock_spot_post_close`（拆表）+ `stock_options_unified` 视图
    - `data_quality`（抓取质量审计）
    - `anomaly_events`（结构化异常矩阵，可回测）
+   - `sentinel_runs`（哨兵每次评估的指纹与是否发警，用于去重防轰炸 + 回测）
    - 现有表补 `source_date` / `as_of_time` / `ingested_at` 三列
 
-2. **部署代码**：把以下文件同步到服务器 `~/market_dashboard/`（与 `market_config.py` 同目录）：
-   - 新增：`market_utils.py`、`anomaly_engine.py`
-   - 覆盖：`ultimate_dashboard.py`、`auto_review.py`、`auto_analyst.py`、
-     `market_probes.py`、`daily_pre_market.py`、`daily_post_close.py`、`ib_intraday_sniper.py`
+2. **部署代码（按目录放对，否则会 ImportError）**：新增的共享模块
+   `market_utils.py` / `anomaly_engine.py` 靠各脚本开头的
+   `sys.path.append('~/market_dashboard')` 被 import，因此 **`~/market_dashboard/`
+   是全系统的共享模块中枢**。文件按运行它的 cron 所在目录分发：
 
-3. **无需改动 cron**：各脚本入口、时间闸门、命令行参数不变。
+   **📁 `~/market_dashboard/`（共享模块 + 本目录脚本，全部放这里）**
+   | 文件 | 动作 |
+   |---|---|
+   | `market_utils.py` | 新增（**必须**放这里） |
+   | `anomaly_engine.py` | 新增（**必须**放这里） |
+   | `market_probes.py` | 覆盖 |
+   | `ultimate_dashboard.py` | 覆盖 |
+   | `auto_review.py` | 覆盖 |
+   | `daily_pre_market.py` | 覆盖 |
+   | `daily_post_close.py` | 覆盖 |
+   | `market_config.py` | 不动（原有密钥文件） |
+
+   **📁 `~/quant_bot/`**
+   | 文件 | 动作 |
+   |---|---|
+   | `auto_analyst.py` | 覆盖 —— 从 `~/market_dashboard` 拉共享模块，**不要**把模块复制到这里 |
+
+   **📁 `~/TradingRadar/`**
+   | 文件 | 动作 |
+   |---|---|
+   | `ib_intraday_sniper.py` | 覆盖 —— 仅改查询表名，无新依赖 |
+
+   新增哨兵 `market_sentinel.py` 放 **`~/market_dashboard/`**（它 import
+   `anomaly_engine` / `market_utils`，与共享模块同目录最省事）。
+
+   ⚠️ **最易犯的错**：把 `market_utils.py` / `anomaly_engine.py` 复制到了 `quant_bot`
+   或 `TradingRadar`。那样 `auto_analyst` 可能侥幸能跑（同目录），但
+   `daily_pre_market` / `daily_post_close` 会 `ModuleNotFoundError`。
+   **这两个新模块只保留 `~/market_dashboard/` 一份。**
+
+3. **cron 调整**：时间/路径/参数基本不变，只建议一处——
+   把 `auto_analyst` 从 `16:35` 挪到 `16:45`。原因：升级后 `auto_review`（16:30）
+   拉 2 年数据变慢，若它没在 16:35 前写完 `market_history`，异常引擎会拿昨天的
+   基准行配今天的现货数据（时点错配）。留 15 分钟余量更稳：
+   ```cron
+   45 16 * * 1-5 /usr/bin/python3 /home/winters_dong426/quant_bot/auto_analyst.py >> /home/winters_dong426/quant_bot/run.log 2>&1
+   ```
+   其余 cron 行保持原样。**无需新装 pip 包**：三处运行环境（trading_venv 与全局
+   `/usr/bin/python3`）原本就具备 pandas / numpy / pandas_market_calendars /
+   supabase / yfinance / requests，`anomaly_engine` 未引入任何新外部库。
+
+   **新增两行哨兵 cron**（全局审查 + 主动预警，与抓取/日报彻底解耦）：
+   ```cron
+   # 🛰️ 全局哨兵·早盘：盘前数据(08:45)落库后审查，抓早间 GEX/DPSV/Call Wall 异常
+   55 8 * * 1-5 /usr/bin/python3 /home/winters_dong426/market_dashboard/market_sentinel.py >> /home/winters_dong426/market_dashboard/sentinel.log 2>&1
+   # 🛰️ 全局哨兵·盘后：auto_review(16:30) 写完 market_history 后做跨源全局审查
+   55 16 * * 1-5 /usr/bin/python3 /home/winters_dong426/market_dashboard/market_sentinel.py >> /home/winters_dong426/market_dashboard/sentinel.log 2>&1
+   ```
+   哨兵有交易日闸门（非交易日自动跳过）和当日去重（同一组触发指标只发一次），
+   多跑一次不会重复轰炸。只在异常越过红线时才发邮件，平静日只入库、不打扰。
+
+4. **部署后立即手动验证一次**（用 `now` 参数绕过时间闸门，不必等收盘）：
+   ```bash
+   # ① 先在 Supabase SQL Editor 执行 migrations.sql
+
+   # ② 盘前脚本（trading_venv）
+   /home/winters_dong426/trading_venv/bin/python3 \
+       /home/winters_dong426/market_dashboard/daily_pre_market.py now
+
+   # ③ 盘后脚本（全局环境）
+   /usr/bin/python3 /home/winters_dong426/market_dashboard/daily_post_close.py now
+
+   # ④ 复盘链路（最能暴露跨目录 import 问题）
+   /usr/bin/python3 /home/winters_dong426/market_dashboard/auto_review.py
+   /usr/bin/python3 /home/winters_dong426/quant_bot/auto_analyst.py
+
+   # ⑤ 全局哨兵（dry=只评估打印，不发邮件、不写库）
+   /usr/bin/python3 /home/winters_dong426/market_dashboard/market_sentinel.py dry
+   ```
+   `dry` 模式会打印完整异常矩阵和"若触发将发送的邮件正文"，但不发信、不写库，
+   最适合部署当天确认红线行为是否符合预期。
+
+   若第 ④/⑤ 步报 `ModuleNotFoundError: No module named 'market_utils'`（或
+   `'anomaly_engine'`），说明这两个新文件没放进 `~/market_dashboard/`——这是
+   唯一需要盯紧的点。
 
 ## 二、修复的致命问题
 
@@ -57,7 +132,39 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 - `auto_analyst` 的 AI prompt 明确"只叙述归因，禁止推翻或加码矩阵 severity；
   低置信/高滞后异常必须明示局限；矩阵为空时不得编造风险"。
 
-## 五、注意事项
+## 五、全局哨兵与预警红线（market_sentinel.py）
+
+哨兵与抓取、日报**彻底解耦**：抓取程序只管写库，哨兵在数据落库后跨所有表跑
+`anomaly_engine`，**只在异常越过红线 `ALERT_GATE` 时主动发预警邮件**，其余仅入库备查。
+
+**唯一的"发不发邮件"判定集中在 `market_sentinel.py` 顶部的 `ALERT_GATE`**（当前=稳健档）：
+
+| 触发规则 | 稳健档设定 | 含义 |
+|---|---|---|
+| 单指标极端 | `solo_severity=3`, 置信≥0.50 | 只有 sev3（VIX倒挂/z>3 等）单独触发 |
+| 中度异常聚集 | `cluster_severity=2`, `cluster_count=2`, 置信≥0.50 | ≥2 条 sev≥2 同现才报（防单点误报） |
+| 跨资产共振 | `resonance_always=True` | 命中任一共振主题必报（价值最高） |
+| 多窗口确认 | `multiwindow_always=True` | 当日+5日+21日三窗口确认必报 |
+| 硬置信度地板 | `hard_confidence_floor=0.35` | 低于此的异常永不触发邮件，只入库 |
+
+**调灵敏度不改引擎，只改这一处配置**：
+- 觉得太吵 → 调高 `hard_confidence_floor`、或把 `cluster_count` 提到 3；
+- 想更敏感（激进档）→ `solo_severity=2`；
+- **回测校准**：`anomaly_events` 表存了每天**所有**异常（含未触发预警的），
+  可统计"若把某项调成 X，过去 N 天会发多少封"，用数据定阈值而非拍脑袋。
+
+**防轰炸**：同一交易日、同一组触发指标只发一次（指纹记录在 `sentinel_runs`），
+早晚两次运行不会重复骚扰。
+
+**降级不静默**：引擎抛错或快照全空（上游没写库）时，哨兵发降级提示邮件，
+绝不"以为今天没异常"。
+
+运行节奏（cron 已配）：
+- **盘前 08:55**：抓 GEX/DPSV/Call Wall 后立即审查，morning 异常当天早上就报，
+  不用干等到收盘。
+- **盘后 16:55**：`auto_review`（16:30）写完 `market_history` 后做全量跨源审查。
+
+## 六、注意事项
 
 - `ultimate_dashboard-本地.py` 是旧版本地备份，本次未动；如仍在使用请手动同步。
 - 探针读新表为空时自动回退旧表 `stock_options_daily`，因此迁移当天旧数据仍可用；
