@@ -460,9 +460,6 @@ class UltimateDashboard:
             v_pcr  = float(self.score_details.get('pcr', 0.8)) if self.score_details.get('pcr') != '-' else 0.8
             v_cmf  = float(self.score_details.get('cmf', 0)) if self.score_details.get('cmf') != '-' else 0
             
-            # 提取暗池数据 (本程序使用 DIX 接口，DIX > 45% 等效于之前讨论的 DPSV > 50%)
-            v_dix  = float(self.smf.get('dix', 0)) if self.smf.get('dix') != '-' else 0
-
             # 判定标普大盘是否收跌 (用于 TRIN 逻辑的交叉验证)
             spy_down = False
             if 'SPY' in df.columns:
@@ -494,9 +491,7 @@ class UltimateDashboard:
             if v_pcr > 1.0: add_s += 10
             if v_cmf < -0.05: add_s += 10
 
-            # 4. 暗池(DIX)托底反转防骗
-            if v_dix > 45.0:
-                add_s -= 15 # 机构利用恐慌掩护吸筹，强制对冲表层恐慌分数
+            # DIX不再直接加减风险分，避免把场外短售量确定性解释为机构吸筹。
 
             # 5. 总分核算 (严格限制在 0-100 区间)
             self.score_details['micro_score'] = max(0, min(int(base_s + add_s), 100))

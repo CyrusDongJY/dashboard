@@ -195,9 +195,9 @@ def is_trading_day():
         logger.warning(f"日历检测异常: {e}")
         return False 
 
-# ✅ 新增：FINRA 个股暗池做空比提取
+# FINRA Consolidated NMS 场外短售成交量代理
 def get_finra_darkpool(tickers):
-    """抓取 FINRA 个股暗池做空数据"""
+    """抓取 FINRA 个股场外短售成交量；不等同于空头持仓或机构方向。"""
     for i in range(5):
         date_obj = datetime.now(NY_TZ) - timedelta(days=i)
         date_str = date_obj.strftime("%Y%m%d")
@@ -205,7 +205,7 @@ def get_finra_darkpool(tickers):
         try:
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
-                logger.info(f"✅ 成功命中 FINRA 暗池官方数据源: {date_str}")
+                logger.info(f"✅ 成功命中 FINRA Consolidated NMS 数据源: {date_str}")
                 df = pd.read_csv(io.StringIO(response.text), sep='|')
                 results = {}
                 for ticker in tickers:
@@ -273,9 +273,9 @@ def get_report():
         # 模块一：宏观数据
         report += get_gex_dix()
         
-        # ✅ 新增模块二：个股暗池做空比
+        # 个股FINRA场外短售成交量代理
         darkpool_data = get_finra_darkpool(SYMBOLS)
-        report += "\n【模块二：核心个股暗池做空比 (FINRA DPSV)】\n"
+        report += "\n【模块二：核心个股FINRA场外短售量代理 (DPSV)】\n"
         if darkpool_data:
             # FINRA 日报通常滞后 1-3 个交易日：明示数据真实日期，告警端按新鲜度降权
             finra_date_raw = next(iter(darkpool_data.values()))['Date']
@@ -285,8 +285,8 @@ def get_report():
             for sym in ['SPY', 'QQQ', 'TSLA', 'NVDA']:
                 if sym in darkpool_data:
                     dpsv = darkpool_data[sym]['DPSV_%']
-                    signal = "🔴 极高! 机构吸筹" if dpsv > 50 else ("🟢 极低! 做市商接盘" if dpsv < 40 else "⚪ 中性")
-                    report += f"   - {sym:4} 暗池做空比: {dpsv:5.2f}% ({signal})\n"
+                    zone = "高读数" if dpsv > 50 else ("低读数" if dpsv < 40 else "中性区")
+                    report += f"   - {sym:4} FINRA短售量占比: {dpsv:5.2f}% ({zone}，方向待验证)\n"
         else:
             finra_date, finra_lag = None, None
             report += "   ⚠️ 暗池数据目前暂不可用\n"

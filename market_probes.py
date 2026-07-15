@@ -5,8 +5,7 @@ import numpy as np
 # V9.0 说明：
 #   - 探针只负责"文本快照 + 粗粒度危险指数"，供 AI 叙述背景；
 #     真正的客观异常判定移交 anomaly_engine（252D 基准 + 多窗口 + 共振）。
-#   - 指标方向语义与 anomaly_engine.METRIC_REGISTRY 保持一致：
-#     DPSV 高 = 机构吸筹（托底信号，不加危险分）；DPSV 低 = 散户乐观（风险 +1）。
+#   - DPSV 仅作为FINRA场外短售成交量代理展示；方向未经回测，不加减危险分。
 #   - 微观探针改读拆分后的 stock_options_pre_market + stock_spot_post_close，
 #     旧表 stock_options_daily 作为回退，保证迁移期不断档。
 # ==========================================
@@ -40,8 +39,7 @@ def scan_macro_regime(supabase, cutoff_date):
         alert_level += 2
 
     if "🚨" in str(today.get('dix_div', '')):
-        # 机构吸筹不增加危险指数，而是作为空头陷阱提示（与异常引擎 invert_signal 口径一致）
-        report_lines.append(f"🛡️ 【空头陷阱/暗池背离】大资金抄底信号: {today['dix_div']} -> 底部支撑极强，切勿盲目追空！")
+        report_lines.append(f"ℹ️ 【DIX结构代理】{today['dix_div']} -> 仅作场外成交结构观察，方向需价格确认。")
 
     if "倒挂" in str(today.get('vix_term', '')):
         report_lines.append(f"🩸 【波动率倒挂】VIX结构崩溃 ({today.get('vix_term')})，市场进入极度恐慌！")
@@ -125,12 +123,10 @@ def scan_micro_options(supabase, cutoff_date):
         if pd.notna(dpsv):
             dpsv_src = today.get('dpsv_source_date')
             src_note = f" (FINRA日期: {dpsv_src})" if dpsv_src else ""
-            # 口径统一：机构吸筹是支撑（不加分），散户乐观是风险（+1）
             if dpsv > 50:
-                ticker_anomalies.append(f"[暗池背离] 做空比极高({dpsv:.2f}%){src_note} -> 机构掩护吸筹，下方支撑极强。")
+                ticker_anomalies.append(f"[FINRA短售代理] 读数偏高({dpsv:.2f}%){src_note}，方向需结合价格与成交验证。")
             elif dpsv < 40:
-                ticker_anomalies.append(f"[暗池异动] 做空比极低({dpsv:.2f}%){src_note} -> 散户极度乐观，警惕做市商被迫砸盘。")
-                alert_level += 1
+                ticker_anomalies.append(f"[FINRA短售代理] 读数偏低({dpsv:.2f}%){src_note}，方向需结合价格与成交验证。")
 
         zgl_today = pd.to_numeric(today.get('zgl_price', np.nan), errors='coerce')
         if last_week is not None:
