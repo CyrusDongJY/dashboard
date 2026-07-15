@@ -1,4 +1,4 @@
-# V9.0 升级说明 — 盘后多窗口异常汇总系统
+# V9.1 升级说明 — 异常矩阵 + 环境指数影子监测
 
 本次升级把系统从"探针文本战报"升级为"客观异常矩阵"：同一指标看 1D/5D/21D/63D
 观察窗口，以 252 个交易日为统计基准，跨指标做共振判定，并按数据新鲜度加权置信度。
@@ -11,6 +11,8 @@
    - `data_quality`（抓取质量审计）
    - `anomaly_events`（结构化异常矩阵，可回测）
    - `sentinel_runs`（哨兵每次评估的指纹与是否发警，用于去重防轰炸 + 回测）
+   - `metric_daily`（按 PRE/INTRADAY/EOD 分会话的每日全指标快照）
+   - `environment_daily`（环境指数影子台账，不参与正式预警）
    - 现有表补 `source_date` / `as_of_time` / `ingested_at` 三列
 
 2. **部署代码（按目录放对，否则会 ImportError）**：新增的共享模块
@@ -23,6 +25,10 @@
    |---|---|
    | `market_utils.py` | 新增（**必须**放这里） |
    | `anomaly_engine.py` | 新增（**必须**放这里） |
+   | `environment_indices.py` | 新增（影子指数，**必须**放这里） |
+   | `environment_report.py` | 新增（盘后PNG，**必须**放这里） |
+   | `backfill_history.py` | 新增（一次性历史回补） |
+   | `requirements-env-dashboard.txt` | 新增（PNG依赖清单） |
    | `market_probes.py` | 覆盖 |
    | `ultimate_dashboard.py` | 覆盖 |
    | `auto_review.py` | 覆盖 |
@@ -55,13 +61,15 @@
    ```cron
    45 16 * * 1-5 /usr/bin/python3 /home/winters_dong426/quant_bot/auto_analyst.py >> /home/winters_dong426/quant_bot/run.log 2>&1
    ```
-   其余 cron 行保持原样。**无需新装 pip 包**：三处运行环境（trading_venv 与全局
-   `/usr/bin/python3`）原本就具备 pandas / numpy / pandas_market_calendars /
-   supabase / yfinance / requests，`anomaly_engine` 未引入任何新外部库。
+   PNG 报告新增 `matplotlib` 依赖。在运行 `auto_analyst.py` 的全局环境安装：
+   ```bash
+   /usr/bin/python3 -m pip install -r /home/winters_dong426/market_dashboard/requirements-env-dashboard.txt
+   ```
+   其他依赖仍为 pandas / numpy / pandas_market_calendars / supabase / yfinance / requests。
 
    **新增两行哨兵 cron**（全局审查 + 主动预警，与抓取/日报彻底解耦）：
    ```cron
-   # 🛰️ 全局哨兵·早盘：盘前数据(08:45)落库后审查，抓早间 GEX/DPSV/Call Wall 异常
+   # 🛰️ 全局哨兵·早盘：盘前数据(08:45)落库后刷新结构快照并审查已验证指标
    55 8 * * 1-5 /usr/bin/python3 /home/winters_dong426/market_dashboard/market_sentinel.py >> /home/winters_dong426/market_dashboard/sentinel.log 2>&1
    # 🛰️ 全局哨兵·盘后：auto_review(16:30) 写完 market_history 后做跨源全局审查
    55 16 * * 1-5 /usr/bin/python3 /home/winters_dong426/market_dashboard/market_sentinel.py >> /home/winters_dong426/market_dashboard/sentinel.log 2>&1
@@ -113,11 +121,11 @@
 - **第二层 multiwindow**：当日冲击 + 5 日同向延续 + 21 日分位进入危险区 → severity 升 3。
 - **第三层 resonance**：跨资产共振主题：
   - `high_risk_selloff` 高危下跌（VIX结构 + MOVE + HYG/TLT + 广度 + 信用利差，≥3 维命中）
-  - `fake_selloff_reversal` 假摔反转（TRIN 极端 + VRP 高 + 暗池吸筹 + 广度恐慌）
+  - `fake_selloff_reversal` 反转代理观察（TRIN 极端 + VRP 高 + 广度恐慌）
   - `crowding_fragility` 抱团脆弱（Mag7-RSP 分化 + 20MA 下滑 + IVR 麻木）
 
-指标方向语义集中在 `METRIC_REGISTRY`（唯一真相源）：DPSV 高 = 机构吸筹（托底，
-不计危险分），DPSV 低 = 散户乐观（风险）——全系统口径统一。
+指标方向语义集中在 `METRIC_REGISTRY`。DPSV 仅是 FINRA 场外短售成交量代理，
+不等同于空头持仓或机构吸筹；相关方向假设只用于影子观察，必须通过回测验证。
 
 置信度 = 样本充分度 × 0.85^滞后交易日。z-score 类告警要求基准样本充分；
 绝对阈值类样本惩罚下限 0.5（数值本身有含义）。
@@ -160,7 +168,7 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 绝不"以为今天没异常"。
 
 运行节奏（cron 已配）：
-- **盘前 08:55**：抓 GEX/DPSV/Call Wall 后立即审查，morning 异常当天早上就报，
+- **盘前 08:55**：刷新 GEX/DPSV/Call Wall 曲线，并审查方向已验证的指标，
   不用干等到收盘。
 - **盘后 16:55**：`auto_review`（16:30）写完 `market_history` 后做全量跨源审查。
 
@@ -168,8 +176,33 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 
 - `ultimate_dashboard-本地.py` 是旧版本地备份，本次未动；如仍在使用请手动同步。
 - 探针读新表为空时自动回退旧表 `stock_options_daily`，因此迁移当天旧数据仍可用；
-  运行数日后新表积累起历史，个股级异常（DPSV/IVR 的 z-score）置信度会逐步上升。
+  运行数日后新表积累起历史；DPSV只积累中性代理曲线，IVR等已定义方向的指标
+  才参与异常判断。
 - 所有 Supabase 拉取改为"倒序取最近 1000 行再翻转"，规避 PostgREST 默认 1000 行
   截断丢最新数据的问题。
 - yfinance 仍是宏观行情事实源（VIX/MOVE/SKEW 等）。下一步建议：关键序列用 IB
   或官方源为主、yfinance 为 fallback（本次未改动，避免一次改动面过大）。
+
+## 七、环境指数影子模式
+
+- `auto_analyst.py` 盘后写入 `session=EOD, is_final=true`；哨兵按运行时间写入
+  `session=PRE/POST`，三个截面不再互相覆盖。
+- 指数按有效独立观测数和数据滞后加权。核心覆盖不足时状态固定为“数据不足”，
+  不会默认显示健康。
+- 五类指数与综合值全部是研究性影子输出：只进入邮件附录、PNG和数据库，明确不接入
+  `ALERT_GATE`、不改变 severity、不用于仓位。
+- `backfill_history.py` 对低频FRED序列使用原生观测计算统计量，再映射到NYSE交易日；
+  填充日保留真实 `source_date` 且不增加 `effective_obs_count`。
+- 回补前必须先执行最新版 `migrations.sql`。正式执行前建议先运行：
+  ```bash
+  /usr/bin/python3 /home/winters_dong426/market_dashboard/backfill_history.py 2y dry
+  ```
+  确认覆盖范围后去掉 `dry`。脚本不会覆盖 `is_final=true` 的EOD生产快照。
+- 默认回补FRED、yfinance以及现有DIX.csv中的DIX/GEX历史。FINRA个股DPSV需要逐日请求
+  Consolidated NMS文件，为避免默认产生数百次请求，使用显式参数：
+  ```bash
+  /usr/bin/python3 /home/winters_dong426/market_dashboard/backfill_history.py 2y finra dry
+  ```
+  先观察请求成功率和行数，再去掉 `dry`。
+- 环境指数至少影子运行一个完整季度，再以未来5D/21D回撤、波动率和误报率做走步回测；
+  未完成校准前，不得把状态标签接入正式预警。

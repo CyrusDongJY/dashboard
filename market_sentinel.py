@@ -252,11 +252,14 @@ def main():
         return
 
     report_date = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+    snapshot_session = "PRE" if datetime.now(NY_TZ).hour < 12 else "POST"
     logger.info(f"🛰️  全局哨兵启动 | {report_date} | {'DRY-RUN' if dry else '实盘'}")
 
     # ---- 跑引擎（dry 时不落库 anomaly_events）----
     try:
-        events, snapshot = run_engine(supabase, report_date=report_date, persist=not dry)
+        events, snapshot = run_engine(
+            supabase, report_date=report_date, persist=not dry,
+            session=snapshot_session, is_final=False)
     except Exception as e:
         logger.error(f"异常引擎运行失败: {e}")
         # 降级不静默：引擎崩了也要通知，避免"以为没异常"

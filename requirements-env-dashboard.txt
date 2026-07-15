@@ -1,0 +1,2 @@
+# Additional dependency for the environment shadow PNG attached by auto_analyst.py
+matplotlib>=3.7,<4

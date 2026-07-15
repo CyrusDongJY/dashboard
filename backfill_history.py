@@ -1,197 +1,292 @@
 # -*- coding: utf-8 -*-
+"""可审计的宏观历史回补。
+
+日频价格按交易日回补；低频 FRED 指标只用真实观测计算 z-score/分位，再映射到
+NYSE 交易日用于画图。填充日保留真实 source_date，且不增加 effective_obs_count。
+历史回补不会覆盖已经 finalized 的 EOD 快照。
 """
-backfill_history.py — 宏观指标历史回补（一次性运行）
-
-目的：曲线化的地基 metric_daily 只能从部署日往前积累，但宏观类指标
-（FRED 信用/流动性、yfinance 波动率/汇率/商品）在源头就有完整历史，
-可以一次性回补 2 年，让波动率面板、信用面板部署第一天就有丰满曲线。
-
-不可回补（本脚本不碰）：
-  - squeezemetrics DIX/GEX、FINRA DPSV（源头无历史）
-  - IB 手算希腊值 ZGL/Charm/Vanna/Gamma/Wall（从未存过）
-  - TradingView 广度快照（无历史）
-  这些只能靠 metric_daily 从今天起向前积累。
-
-方法：对每个可回补指标重建 2 年日频序列，然后【逐历史交易日重放
-metric_snapshot】——用与线上引擎完全相同的统计口径回算 z/分位/窗口变化，
-保证回补数据与今后每日实时写入的数据同源同口径，曲线不会有"接缝"。
-
-用法：
-  python3 backfill_history.py            # 回补并写库
-  python3 backfill_history.py dry        # 只算不写，打印每指标覆盖天数
-  python3 backfill_history.py 3y         # 自定义回补时长（默认 2y）
-"""
+import logging
+import io
 import os
+import re
 import sys
+from datetime import datetime, timezone
 
-CONFIG_DIR = os.path.expanduser('~/market_dashboard')
+import pandas as pd
+import pandas_market_calendars as mcal
+import requests
+import yfinance as yf
+
+CONFIG_DIR = os.path.expanduser("~/market_dashboard")
 if CONFIG_DIR not in sys.path:
     sys.path.append(CONFIG_DIR)
 
-os.environ["PYTHONWARNINGS"] = "ignore"
-import warnings
-warnings.filterwarnings("ignore")
-
-import logging
-from datetime import datetime, timezone
-
-import numpy as np
-import pandas as pd
-
-try:
-    import market_config as cfg
-    import requests
-    import yfinance as yf
-    from supabase import create_client, Client
-    from anomaly_engine import metric_snapshot, METRIC_REGISTRY
-    from market_utils import safe_upsert
-except ImportError as e:
-    print(f"❌ 依赖缺失 ({e})。确认在 ~/market_dashboard/ 下、且环境含 yfinance/requests/supabase。")
-    sys.exit(1)
-
-supabase: Client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
+from anomaly_engine import METRIC_REGISTRY, metric_snapshot, window_change  # noqa: E402
+from market_utils import safe_upsert  # noqa: E402
 
 logger = logging.getLogger("backfill")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
-    logger.addHandler(ch)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
-HEADERS = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
-
-# 只有引擎注册表里存在、且源头可回补的指标才回补
-YF_TICKERS = ['^VIX', '^MOVE', '^VVIX', '^VIX3M', 'DX-Y.NYB', 'HYG', 'TLT', 'HG=F', 'GC=F']
+YF_TICKERS = ["^VIX", "^MOVE", "^VVIX", "^VIX3M", "DX-Y.NYB", "HYG", "TLT"]
 FRED_MAP = {
-    'BAMLH0A0HYM2': 'credit_spread',   # 高收益债信用利差
-    'NFCI': 'nfci',                    # 芝加哥联储金融状况
-    'WALCL': 'Fed_Assets', 'WTREGEN': 'TGA', 'RRPONTSYD': 'RRP',  # 净流动性三件套
+    "BAMLH0A0HYM2": "credit_spread",
+    "NFCI": "nfci",
+    "WALCL": "Fed_Assets",
+    "WTREGEN": "TGA",
+    "RRPONTSYD": "RRP",
 }
+WINDOWS = {"chg_1d": 1, "chg_5d": 5, "chg_21d": 21, "chg_63d": 63}
+MICRO_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "ORCL"]
 
 
-def fetch_yf(period):
-    logger.info(f"拉取 yfinance {len(YF_TICKERS)} 个序列（{period}）...")
-    df = yf.download(YF_TICKERS, period=period, interval="1d", progress=False)['Close']
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
-    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-    return df.ffill()
+def parse_period_days(period):
+    match = re.fullmatch(r"(\d+)(y|mo)", period.lower())
+    if not match:
+        raise ValueError("period 必须形如 2y 或 18mo")
+    value, unit = int(match.group(1)), match.group(2)
+    return value * (365 if unit == "y" else 30)
 
 
-def fetch_fred(period_days):
-    logger.info(f"拉取 FRED {len(FRED_MAP)} 个序列...")
-    out = {}
-    sess = requests.Session()
-    for sid, col in FRED_MAP.items():
-        try:
-            url = (f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}"
-                   f"&api_key={cfg.FRED_API_KEY}&file_type=json")
-            r = sess.get(url, headers=HEADERS, timeout=30)
-            if r.status_code == 200:
-                obs = r.json().get('observations', [])
-                if obs:
-                    s = pd.DataFrame(obs)
-                    s['value'] = pd.to_numeric(s['value'], errors='coerce')
-                    s['date'] = pd.to_datetime(s['date'])
-                    out[col] = s.dropna().set_index('date')['value']
-        except Exception as e:
-            logger.warning(f"FRED {sid} 拉取失败: {e}")
-    if not out:
+def nyse_days(start, end):
+    schedule = mcal.get_calendar("NYSE").schedule(start_date=start, end_date=end)
+    return pd.DatetimeIndex(schedule.index).tz_localize(None).normalize()
+
+
+def fetch_yf(fetch_start):
+    logger.info("拉取 yfinance 日频历史，起点 %s", fetch_start.date())
+    df = yf.download(
+        YF_TICKERS, start=fetch_start.strftime("%Y-%m-%d"), interval="1d",
+        auto_adjust=False, progress=False)
+    if df.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(out).sort_index()
-    # FRED 是低频/发布滞后的，向前填充到营业日
-    bdays = pd.date_range(df.index.min(), pd.Timestamp.now().normalize(), freq='B')
-    return df.reindex(df.index.union(bdays)).ffill().reindex(bdays)
+    close = df["Adj Close"] if "Adj Close" in df else (df["Close"] if "Close" in df else df)
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
+    close.index = pd.to_datetime(close.index).tz_localize(None).normalize()
+    return close.sort_index()
 
 
-def build_metric_series(yf_df, fred_df):
-    """把原始源序列映射成引擎注册表里的 metric 名 -> 日频序列。"""
-    series = {}
-    col = lambda t: yf_df[t] if t in yf_df.columns else None
+def fetch_fred(fetch_start, api_key):
+    """只请求所需起点之后的观测，不再拉取全部历史。"""
+    logger.info("拉取 FRED 原生频率历史，起点 %s", fetch_start.date())
+    out = {}
+    session = requests.Session()
+    for series_id, name in FRED_MAP.items():
+        try:
+            response = session.get(
+                "https://api.stlouisfed.org/fred/series/observations",
+                params={
+                    "series_id": series_id,
+                    "api_key": api_key,
+                    "file_type": "json",
+                    "observation_start": fetch_start.strftime("%Y-%m-%d"),
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            obs = response.json().get("observations", [])
+            frame = pd.DataFrame(obs)
+            if frame.empty:
+                continue
+            frame["date"] = pd.to_datetime(frame["date"])
+            frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+            out[name] = frame.dropna(subset=["value"]).set_index("date")["value"]
+        except Exception as exc:
+            logger.warning("FRED %s 拉取失败: %s", series_id, exc)
+    return pd.DataFrame(out).sort_index() if out else pd.DataFrame()
 
-    if col('^VIX') is not None: series['vix'] = yf_df['^VIX']
-    if col('^MOVE') is not None: series['move'] = yf_df['^MOVE']
-    if col('^VVIX') is not None: series['vvix'] = yf_df['^VVIX']
-    if col('DX-Y.NYB') is not None: series['dxy'] = yf_df['DX-Y.NYB']
 
-    # VIX 期限结构：contango% = (VIX3M/VIX - 1)*100（与盘后口径一致：升水为正）
-    if col('^VIX') is not None and col('^VIX3M') is not None:
-        v, v3 = yf_df['^VIX'], yf_df['^VIX3M']
-        series['vix_contango_pct'] = ((v3 / v) - 1.0) * 100.0
+def fetch_squeeze_history(fetch_start):
+    """现有DIX.csv包含历史行；按日期过滤后回补DIX/GEX。"""
+    try:
+        response = requests.get(
+            "https://squeezemetrics.com/monitor/static/DIX.csv", timeout=30)
+        response.raise_for_status()
+        frame = pd.read_csv(io.StringIO(response.text))
+        frame["date"] = pd.to_datetime(frame["date"])
+        frame = frame.set_index("date").sort_index().loc[fetch_start:]
+        return frame
+    except Exception as exc:
+        logger.warning("DIX/GEX 历史拉取失败: %s", exc)
+        return pd.DataFrame()
 
-    # HYG/TLT 比值
-    if col('HYG') is not None and col('TLT') is not None:
-        series['hyg_tlt_ratio'] = yf_df['HYG'] / yf_df['TLT']
 
-    # 铜金比 z：注册表里的 cg_z 是"已 z 化"的量，这里直接给铜金比原值，
-    # metric_snapshot 会算它自己的 z——为避免二次 z 化语义混乱，回补铜金比原值到 cg_z 不合适。
-    # 因此铜金比这轮不回补为 cg_z（留待线上积累），只回补能直接对应的原值指标。
+def fetch_finra_history(days, tickers=MICRO_SYMBOLS):
+    """可选回补FINRA Consolidated NMS日文件；返回 ticker -> 原生DPSV序列。"""
+    values = {ticker: {} for ticker in tickers}
+    session = requests.Session()
+    for offset, day in enumerate(days, start=1):
+        date_token = day.strftime("%Y%m%d")
+        url = f"https://cdn.finra.org/equity/regsho/daily/CNMSshvol{date_token}.txt"
+        try:
+            response = session.get(url, timeout=20)
+            if response.status_code != 200:
+                continue
+            frame = pd.read_csv(io.StringIO(response.text), sep="|")
+            frame = frame[frame["Symbol"].isin(tickers)].copy()
+            frame["dpsv_pct"] = pd.to_numeric(frame["ShortVolume"], errors="coerce") / \
+                pd.to_numeric(frame["TotalVolume"], errors="coerce") * 100
+            for _, row in frame.dropna(subset=["dpsv_pct"]).iterrows():
+                values[row["Symbol"]][day] = float(row["dpsv_pct"])
+        except Exception as exc:
+            logger.debug("FINRA %s 跳过: %s", date_token, exc)
+        if offset % 50 == 0:
+            logger.info("FINRA 回补进度 %d/%d", offset, len(days))
+    return {ticker: pd.Series(series, dtype=float).sort_index()
+            for ticker, series in values.items() if series}
+
+
+def build_metric_series(yf_df, fred_df, squeeze_df=None):
+    """返回 metric -> {series, source_name}，序列保持数据源原生观测频率。"""
+    result = {}
+
+    def add(metric, series, source):
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+        clean = clean[~clean.index.duplicated(keep="last")].sort_index()
+        if metric in METRIC_REGISTRY and not clean.empty:
+            result[metric] = {"series": clean, "source_name": source}
+
+    if not yf_df.empty:
+        for ticker, metric in {
+            "^VIX": "vix", "^MOVE": "move", "^VVIX": "vvix", "DX-Y.NYB": "dxy"
+        }.items():
+            if ticker in yf_df:
+                add(metric, yf_df[ticker], "yfinance")
+        if {"^VIX", "^VIX3M"}.issubset(yf_df.columns):
+            add("vix_contango_pct", (yf_df["^VIX3M"] / yf_df["^VIX"] - 1) * 100,
+                "yfinance")
+        if {"HYG", "TLT"}.issubset(yf_df.columns):
+            add("hyg_tlt_ratio", yf_df["HYG"] / yf_df["TLT"], "yfinance")
 
     if not fred_df.empty:
-        if 'credit_spread' in fred_df.columns: series['credit_spread'] = fred_df['credit_spread']
-        if 'nfci' in fred_df.columns: series['nfci'] = fred_df['nfci']
-        # 真实净流动性（万亿）：Fed - TGA - RRP，单位对齐盘后（/1000 到十亿再到万亿口径按盘后）
-        if {'Fed_Assets', 'TGA', 'RRP'}.issubset(fred_df.columns):
-            series['net_liq'] = (fred_df['Fed_Assets'] / 1000) - (fred_df['TGA'] / 1000) - fred_df['RRP']
+        if "credit_spread" in fred_df:
+            add("credit_spread", fred_df["credit_spread"], "FRED:BAMLH0A0HYM2")
+        if "nfci" in fred_df:
+            add("nfci", fred_df["nfci"], "FRED:NFCI")
+        if {"Fed_Assets", "TGA", "RRP"}.issubset(fred_df.columns):
+            # 在任一组成项出现真实观测的日期重算；ffill 只用于跨频率对齐组成项。
+            aligned = fred_df[["Fed_Assets", "TGA", "RRP"]].sort_index().ffill().dropna()
+            net_liq = aligned["Fed_Assets"] / 1000 - aligned["TGA"] / 1000 - aligned["RRP"]
+            add("net_liq", net_liq, "FRED:WALCL+WTREGEN+RRPONTSYD")
+    if squeeze_df is not None and not squeeze_df.empty:
+        if "dix" in squeeze_df:
+            add("dix_pct", squeeze_df["dix"] * 100, "SqueezeMetrics:DIX.csv")
+        if "gex" in squeeze_df:
+            add("gex_billions", squeeze_df["gex"] / 1e9, "SqueezeMetrics:DIX.csv")
+    return result
 
-    # 只保留注册表里认识的指标
-    return {m: s.dropna() for m, s in series.items() if m in METRIC_REGISTRY and not s.dropna().empty}
 
-
-def replay(metric, series):
-    """逐历史交易日重放 metric_snapshot：第 i 天只用前 i 行，口径与线上完全一致。"""
+def replay(metric, series, source_name, output_start, output_end, scope="MACRO"):
+    """按NYSE交易日输出，但统计量只使用截至当日的原生有效观测。"""
+    days = nyse_days(output_start, output_end)
+    if len(days) == 0:
+        return []
+    carried = series.reindex(series.index.union(days)).sort_index().ffill().reindex(days)
     rows = []
-    idx = series.index
-    vals = series
-    n = len(vals)
-    # 从有足够样本起步（>=30，与 zscore_252 的下限一致），太早的点 z/分位为 None 但仍留 value 曲线
-    start = 0
-    for i in range(start, n):
-        window = vals.iloc[:i + 1]
-        report_date = idx[i].strftime('%Y-%m-%d')
-        row = metric_snapshot(metric, window, report_date,
-                              scope="MACRO", source_date=report_date)
-        if row:
-            rows.append(row)
+    for day in days:
+        native = series.loc[:day]
+        if native.empty or pd.isna(carried.loc[day]):
+            continue
+        source_day = native.index[-1].normalize()
+        carried_history = carried.loc[:day].dropna()
+        row = metric_snapshot(
+            metric, native, day.strftime("%Y-%m-%d"), scope=scope,
+            source_date=source_day.strftime("%Y-%m-%d"), session="EOD",
+            is_final=False, source_name=source_name,
+            is_filled=source_day != day.normalize(), effective_obs_count=len(native))
+        if not row:
+            continue
+        # 窗口变化按交易日的可见值计算；z/分位仍按原生独立观测计算。
+        for field, window in WINDOWS.items():
+            change = window_change(carried_history, window)
+            row[field] = round(change, 4) if change is not None else None
+        rows.append(row)
     return rows
 
 
+def finalized_keys(supabase, start_date, end_date):
+    try:
+        rows, offset, page_size = [], 0, 1000
+        while True:
+            result = (supabase.table("metric_daily")
+                      .select("report_date,metric,scope,session")
+                      .eq("session", "EOD")
+                      .eq("is_final", True)
+                      .gte("report_date", start_date)
+                      .lte("report_date", end_date)
+                      .order("report_date").order("metric").order("scope")
+                      .range(offset, offset + page_size - 1)
+                      .execute())
+            batch = result.data or []
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return {(str(r["report_date"]), r["metric"], r["scope"], r["session"])
+                for r in rows}
+    except Exception as exc:
+        logger.warning("读取 finalized 快照失败，为避免覆盖生产数据，本次停止写库: %s", exc)
+        return None
+
+
 def main():
-    args = [a.lower() for a in sys.argv[1:]]
-    dry = 'dry' in args
-    period = next((a for a in args if a.endswith('y') or a.endswith('mo')), '2y')
-    period_days = 730
+    args = [arg.lower() for arg in sys.argv[1:]]
+    dry = "dry" in args
+    include_finra = "finra" in args
+    period = next((arg for arg in args if arg.endswith("y") or arg.endswith("mo")), "2y")
+    period_days = parse_period_days(period)
+    output_end = pd.Timestamp.now(tz="America/New_York").tz_localize(None).normalize()
+    output_start = output_end - pd.Timedelta(days=period_days)
+    # NFCI 为周频；多取约六年用于形成最多252个原生观测的基准。
+    fetch_start = output_start - pd.Timedelta(days=6 * 365)
 
-    yf_df = fetch_yf(period)
-    fred_df = fetch_fred(period_days)
-    metric_series = build_metric_series(yf_df, fred_df)
+    try:
+        import market_config as cfg
+        from supabase import create_client
+    except ImportError as exc:
+        raise SystemExit(f"依赖缺失: {exc}")
 
-    if not metric_series:
-        logger.error("没有可回补的指标序列，退出。")
-        return
+    yf_df = fetch_yf(fetch_start)
+    fred_df = fetch_fred(fetch_start, cfg.FRED_API_KEY)
+    squeeze_df = fetch_squeeze_history(fetch_start)
+    metrics = build_metric_series(yf_df, fred_df, squeeze_df)
+    rows = []
+    for metric, payload in metrics.items():
+        metric_rows = replay(
+            metric, payload["series"], payload["source_name"], output_start, output_end)
+        rows.extend(metric_rows)
+        logger.info("%-20s 回补 %d 个NYSE交易日", metric, len(metric_rows))
 
-    logger.info(f"可回补指标：{list(metric_series.keys())}")
-    all_rows = []
-    for metric, s in metric_series.items():
-        rows = replay(metric, s)
-        all_rows += rows
-        logger.info(f"  {metric:20} 覆盖 {len(rows)} 个交易日 "
-                    f"({s.index.min().date()} → {s.index.max().date()})")
+    if include_finra:
+        output_days = nyse_days(output_start, output_end)
+        for ticker, series in fetch_finra_history(output_days).items():
+            metric_rows = replay(
+                "dpsv_pct", series, "FINRA:ConsolidatedNMS",
+                output_start, output_end, scope=ticker)
+            rows.extend(metric_rows)
+            logger.info("dpsv_pct[%s] 回补 %d 个NYSE交易日", ticker, len(metric_rows))
 
-    logger.info(f"合计 {len(all_rows)} 行 metric_daily。")
-
+    logger.info("合计生成 %d 行 metric_daily", len(rows))
     if dry:
-        logger.info("DRY-RUN：不写库。")
+        logger.info("DRY-RUN：未写入数据库")
         return
 
-    # 分批写入，(report_date, metric, scope) 唯一，重复运行覆盖不重复
-    BATCH = 500
-    for i in range(0, len(all_rows), BATCH):
-        chunk = all_rows[i:i + BATCH]
-        safe_upsert(supabase, 'metric_daily', chunk,
-                    conflict_cols='report_date,metric,scope')
-        logger.info(f"  写入 {i + len(chunk)}/{len(all_rows)}")
-    logger.info("✅ 历史回补完成。波动率/信用/流动性面板现在应有丰满曲线。")
+    supabase = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
+    protected = finalized_keys(
+        supabase, output_start.strftime("%Y-%m-%d"), output_end.strftime("%Y-%m-%d"))
+    if protected is None:
+        return
+    rows = [row for row in rows if (
+        row["report_date"], row["metric"], row["scope"], row["session"]) not in protected]
+    logger.info("排除 finalized 生产快照后待写 %d 行", len(rows))
+    for offset in range(0, len(rows), 500):
+        chunk = rows[offset:offset + 500]
+        result = safe_upsert(
+            supabase, "metric_daily", chunk,
+            conflict_cols="report_date,metric,scope,session")
+        if result is None:
+            raise RuntimeError(f"回补写入失败，批次起点 {offset}")
+    logger.info("历史回补完成；填充点保留真实 source_date，未覆盖 finalized 数据")
 
 
 if __name__ == "__main__":

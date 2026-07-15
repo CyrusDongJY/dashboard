@@ -16,11 +16,14 @@ anomaly_engine.py — 盘后多窗口异常矩阵引擎
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Optional
+import logging
 
 import numpy as np
 import pandas as pd
 
 from market_utils import trading_days_back, lag_trading_days
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # 指标注册表：唯一的"方向语义"真相源
@@ -28,8 +31,7 @@ from market_utils import trading_days_back, lag_trading_days
 #   bad_dir = -1  表示"数值越低越危险"（如 vix_contango、breadth、hyg_tlt_ratio）
 #   abs_alert     绝对阈值触发 (op, threshold, severity)，可为 None
 #   z_alert       z-score 阈值 (severity2, severity3)，作用于 bad 方向
-#   invert_signal 该指标极值可能是反向信号（如 DPSV 高=机构吸筹=利好），
-#                 用于共振层区分"风险"与"托底"
+#   bad_dir = 0  表示方向尚未验证，只积累曲线，不参与正式异常和共振。
 # ============================================================
 METRIC_REGISTRY = {
     # 波动率结构
@@ -44,6 +46,10 @@ METRIC_REGISTRY = {
                           "abs": [(">", 10, 1)], "z": (2.0, 3.0)},
     "vix_term_ratio":  {"cn": "VIX/VIX3M", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">=", 1.0, 2)], "z": (2.0, 3.0)},
+    "dix_pct":         {"cn": "DIX场外短售代理", "bad_dir": -1, "scope": "MACRO",
+                          "abs": None, "z": (2.0, 3.0)},
+    "gex_billions":    {"cn": "GEX做市商Gamma代理", "bad_dir": -1, "scope": "MACRO",
+                          "abs": None, "z": (2.0, 3.0)},
     # 信用与流动性
     "credit_spread":   {"cn": "高收益债信用利差", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 5.0, 2)], "z": (2.0, 3.0)},
@@ -68,15 +74,26 @@ METRIC_REGISTRY = {
     "tqqq_drag_pct":   {"cn": "TQQQ损耗", "bad_dir": -1, "scope": "MACRO",
                           "abs": [("<", -2.0, 1)], "z": (2.0, 3.0)},
     # 微观（个股，反向信号指标）
-    "dpsv_pct":        {"cn": "暗池做空比", "bad_dir": -1, "scope": "STOCK",
-                          "abs": [("<", 40, 1)], "z": (2.0, 3.0), "invert_signal": True},
+    "dpsv_pct":        {"cn": "FINRA场外短售量代理", "bad_dir": 0, "scope": "STOCK",
+                          "abs": None, "z": (2.0, 3.0)},
     "ivr_pct":         {"cn": "IVR波动率百分位", "bad_dir": -1, "scope": "STOCK",
                           "abs": [("<", 10, 1)], "z": (2.0, 3.0)},
+    "expected_move_pct":{"cn": "预期波幅", "bad_dir": +1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "short_gamma_m":   {"cn": "短期期限净Gamma", "bad_dir": -1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "oi_pcr":          {"cn": "期权持仓PCR", "bad_dir": +1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    # 下列结构值先只积累曲线。方向依赖价格位置、到期结构和符号约定，不直接进入风险评分。
+    "zgl_price":       {"cn": "零Gamma分水岭", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "call_wall":       {"cn": "Call Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "put_wall":        {"cn": "Put Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "vanna_m":         {"cn": "Vanna", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "charm_m":         {"cn": "Charm", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "long_gamma_m":    {"cn": "中长期限净Gamma", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "iv_skew":         {"cn": "IV偏斜", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
 }
 
 WINDOWS = {"1D": 1, "5D": 5, "21D": 21, "63D": 63}
 BASELINE = 252  # 统计基准窗口（交易日）
+CALC_VERSION = "env_v2"
 
 
 @dataclass
@@ -103,6 +120,7 @@ class AnomalyEvent:
         d = asdict(self)
         # DB 列名用 window_scope（window 是 PostgreSQL 保留字）
         d['window_scope'] = d.pop('window')
+        d['resonance_key'] = d.get('resonance_key') or ''
         return d
 
 
@@ -268,7 +286,9 @@ def _days_in_risk(series, reg):
     return count
 
 
-def metric_snapshot(metric, series, report_date, scope=None, source_date=None):
+def metric_snapshot(metric, series, report_date, scope=None, source_date=None,
+                    session="EOD", is_final=False, source_name=None,
+                    is_filled=False, effective_obs_count=None):
     """输出单指标的每日派生向量（dict），供 metric_daily 落库画曲线。
     与 scan_metric 用同一套统计口径，但无条件产出（不依赖是否越线）。"""
     reg = METRIC_REGISTRY.get(metric)
@@ -296,10 +316,12 @@ def metric_snapshot(metric, series, report_date, scope=None, source_date=None):
         s2, s3 = reg["z"]
         sev = max(sev, 3 if z_dir >= s3 else (2 if z_dir >= s2 else 0))
 
+    effective_n = int(effective_obs_count) if effective_obs_count is not None else n
     return {
         "report_date": report_date,
         "metric": metric,
         "scope": scope,
+        "session": session,
         "cn_name": reg["cn"],
         "value": round(cur, 4),
         "chg_1d": round(chg["1D"], 4) if chg["1D"] is not None else None,
@@ -312,8 +334,13 @@ def metric_snapshot(metric, series, report_date, scope=None, source_date=None):
         "dist_to_thr": _dist_to_threshold(reg, cur),
         "days_in_risk": _days_in_risk(s, reg),
         "sample_len": n,
+        "effective_obs_count": effective_n,
         "source_date": source_date,
+        "source_name": source_name,
+        "is_filled": bool(is_filled),
+        "is_final": bool(is_final),
         "lag_days": lag,
+        "calc_version": CALC_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -337,7 +364,6 @@ RESONANCE_THEMES = {
         "conditions": {
             "trin": lambda v: v is not None and v > 2.0,
             "vrp_num": lambda v: v is not None and v > 10,
-            "dpsv_high": lambda v: v is not None and v > 50,       # 机构暗池吸筹
             "pct_20ma": lambda v: v is not None and v < 15,        # 广度恐慌
         },
     },
@@ -353,7 +379,7 @@ RESONANCE_THEMES = {
 }
 
 def scan_resonance(report_date, snapshot):
-    """snapshot: dict of 已计算好的指标值（含派生量 hyg_tlt_ratio_roc / dpsv_high / ivr_low）。
+    """snapshot: dict of 已计算好的指标值（含派生量 hyg_tlt_ratio_roc / ivr_low）。
     返回共振 AnomalyEvent 列表。"""
     events = []
     for key, theme in RESONANCE_THEMES.items():
@@ -384,12 +410,14 @@ def scan_resonance(report_date, snapshot):
 # ============================================================
 MICRO_SYMBOLS = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'ORCL']
 
-def _fetch_history(supabase, table, date_col, days=400, ticker=None):
+def _fetch_history(supabase, table, date_col, days=400, ticker=None, end_date=None):
     """倒序取最近 N 行再翻转为升序。
     PostgREST 默认单次最多返回 1000 行，升序查询被截断时丢的是【最新】数据，
     倒序保证截断只影响最旧的历史。"""
-    cutoff = trading_days_back(days)
+    cutoff = trading_days_back(days, end_date=end_date)
     q = supabase.table(table).select("*").gte(date_col, cutoff)
+    if end_date is not None:
+        q = q.lte(date_col, end_date)
     if ticker is not None:
         q = q.eq('ticker', ticker)
     res = q.order(date_col, desc=True).limit(1000).execute()
@@ -397,7 +425,58 @@ def _fetch_history(supabase, table, date_col, days=400, ticker=None):
         return pd.DataFrame()
     return pd.DataFrame(res.data).sort_values(date_col).reset_index(drop=True)
 
-def run_engine(supabase, report_date=None, persist=True):
+
+def _metric_source_date(df, metric, date_col, preferred_source_cols=()):
+    """返回该指标最后一个有效值自己的日期，避免整表共用最新行日期。"""
+    if metric not in df.columns:
+        return None
+    valid = pd.to_numeric(df[metric], errors='coerce').notna()
+    if not valid.any():
+        return None
+    row = df.loc[valid].iloc[-1]
+    for col in preferred_source_cols:
+        value = row.get(col)
+        if value is not None and not pd.isna(value):
+            return str(value)
+    value = row.get(date_col)
+    return str(value) if value is not None and not pd.isna(value) else None
+
+
+def _event_identity(row):
+    return tuple(str(row.get(key) or "") for key in
+                 ("metric", "scope", "window_scope", "layer", "resonance_key"))
+
+
+def _sync_anomaly_events(supabase, report_date, rows):
+    """先写入本次事件，再删除同日已不再触发的旧事件，避免重跑残留。"""
+    from market_utils import safe_upsert
+    try:
+        existing = (supabase.table("anomaly_events")
+                    .select("id,metric,scope,window_scope,layer,resonance_key")
+                    .eq("report_date", report_date)
+                    .execute())
+        existing_rows = existing.data or []
+    except Exception as exc:
+        logger.warning("读取旧异常事件失败，跳过残留清理: %s", exc)
+        existing_rows = []
+
+    if rows:
+        written = safe_upsert(
+            supabase, "anomaly_events", rows,
+            conflict_cols="report_date,metric,scope,window_scope,layer,resonance_key")
+        if written is None:
+            return
+
+    active = {_event_identity(row) for row in rows}
+    stale_ids = [row.get("id") for row in existing_rows
+                 if row.get("id") is not None and _event_identity(row) not in active]
+    if stale_ids:
+        try:
+            supabase.table("anomaly_events").delete().in_("id", stale_ids).execute()
+        except Exception as exc:
+            logger.warning("清理旧异常事件失败: %s", exc)
+
+def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final=False):
     """主入口：扫描 market_history / macro_spot_daily / 个股表，产出异常矩阵。
     返回 (events: list[AnomalyEvent], snapshot: dict)。"""
     report_date = report_date or datetime.now().strftime('%Y-%m-%d')
@@ -406,19 +485,21 @@ def run_engine(supabase, report_date=None, persist=True):
     snap_rows = []   # metric_daily：每日无条件全指标派生向量（不论越没越线）
 
     # ---- 宏观：market_history ----
-    mh = _fetch_history(supabase, 'market_history', 'record_date')
+    mh = _fetch_history(supabase, 'market_history', 'record_date', end_date=report_date)
     if not mh.empty:
-        latest = mh.iloc[-1]
-        src = latest.get('source_date') or latest.get('record_date')
         macro_metrics = ['vix', 'move', 'vvix', 'credit_spread', 'credit_z', 'nfci',
                          'hyg_tlt_ratio', 'net_liq', 'pct_200ma', 'pct_20ma', 'trin',
                          'dxy', 'cg_z']
         for m in macro_metrics:
             if m in mh.columns:
+                src = _metric_source_date(mh, m, 'record_date', ('source_date',))
                 events += scan_metric(m, mh[m], report_date, scope="MACRO", source_date=src)
-                row = metric_snapshot(m, mh[m], report_date, scope="MACRO", source_date=src)
+                row = metric_snapshot(
+                    m, mh[m], report_date, scope="MACRO", source_date=src,
+                    session=session, is_final=is_final, source_name="market_history")
                 if row: snap_rows.append(row)
-                snapshot[m] = pd.to_numeric(latest.get(m), errors='coerce')
+                clean = _clean(mh[m])
+                snapshot[m] = float(clean.iloc[-1]) if not clean.empty else None
         # 派生量：hyg_tlt 21日 ROC
         if 'hyg_tlt_ratio' in mh.columns:
             s = _clean(mh['hyg_tlt_ratio'])
@@ -426,45 +507,72 @@ def run_engine(supabase, report_date=None, persist=True):
                 snapshot['hyg_tlt_ratio_roc'] = float((s.iloc[-1] / s.iloc[-22] - 1) * 100)
 
     # ---- 现货波动率：macro_spot_daily ----
-    ms = _fetch_history(supabase, 'macro_spot_daily', 'date')
+    ms = _fetch_history(supabase, 'macro_spot_daily', 'date', end_date=report_date)
     if not ms.empty:
-        latest = ms.iloc[-1]
-        src = latest.get('source_date') or latest.get('date')
         for m in ['vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct']:
             if m in ms.columns:
+                src = _metric_source_date(ms, m, 'date', ('source_date',))
                 events += scan_metric(m, ms[m], report_date, scope="MACRO", source_date=src)
-                row = metric_snapshot(m, ms[m], report_date, scope="MACRO", source_date=src)
+                row = metric_snapshot(
+                    m, ms[m], report_date, scope="MACRO", source_date=src,
+                    session=session, is_final=is_final, source_name="macro_spot_daily")
                 if row: snap_rows.append(row)
-                snapshot[m] = pd.to_numeric(latest.get(m), errors='coerce')
+                clean = _clean(ms[m])
+                snapshot[m] = float(clean.iloc[-1]) if not clean.empty else None
+
+    # ---- 隔夜资金代理：DIX / GEX ----
+    mo = _fetch_history(supabase, 'macro_options_daily', 'date', end_date=report_date)
+    if not mo.empty:
+        for m in ['dix_pct', 'gex_billions']:
+            if m in mo.columns:
+                src = _metric_source_date(mo, m, 'date', ('source_date',))
+                events += scan_metric(m, mo[m], report_date, scope="MACRO", source_date=src)
+                row = metric_snapshot(
+                    m, mo[m], report_date, scope="MACRO", source_date=src,
+                    session=session, is_final=is_final, source_name="macro_options_daily")
+                if row: snap_rows.append(row)
+                clean = _clean(mo[m])
+                snapshot[m] = float(clean.iloc[-1]) if not clean.empty else None
 
     # ---- 个股微观：盘前 DPSV + 盘后 IVR（逐标的拉取，规避1000行截断）----
-    dpsv_vals, ivr_vals = [], []
+    ivr_vals = []
     for tkr in MICRO_SYMBOLS:
         try:
-            g = _fetch_history(supabase, 'stock_options_pre_market', 'date', ticker=tkr)
-            if not g.empty and 'dpsv_pct' in g.columns:
-                src = g.iloc[-1].get('dpsv_source_date') or g.iloc[-1].get('source_date') or g.iloc[-1].get('date')
-                events += scan_metric('dpsv_pct', g['dpsv_pct'], report_date, scope=tkr, source_date=src)
-                row = metric_snapshot('dpsv_pct', g['dpsv_pct'], report_date, scope=tkr, source_date=src)
-                if row: snap_rows.append(row)
-                dv = pd.to_numeric(g.iloc[-1].get('dpsv_pct'), errors='coerce')
-                if pd.notna(dv): dpsv_vals.append(dv)
+            g = _fetch_history(
+                supabase, 'stock_options_pre_market', 'date', ticker=tkr, end_date=report_date)
+            if not g.empty:
+                pre_metrics = ['dpsv_pct', 'expected_move_pct', 'short_gamma_m', 'long_gamma_m',
+                               'zgl_price', 'call_wall', 'put_wall', 'vanna_m', 'charm_m',
+                               'iv_skew', 'oi_pcr']
+                for m in pre_metrics:
+                    if m not in g.columns:
+                        continue
+                    source_cols = ('dpsv_source_date', 'source_date') if m == 'dpsv_pct' else ('source_date',)
+                    src = _metric_source_date(g, m, 'date', source_cols)
+                    events += scan_metric(m, g[m], report_date, scope=tkr, source_date=src)
+                    row = metric_snapshot(
+                        m, g[m], report_date, scope=tkr, source_date=src,
+                        session=session, is_final=is_final,
+                        source_name="stock_options_pre_market")
+                    if row: snap_rows.append(row)
         except Exception:
             pass
         try:
-            g = _fetch_history(supabase, 'stock_spot_post_close', 'date', ticker=tkr)
+            g = _fetch_history(
+                supabase, 'stock_spot_post_close', 'date', ticker=tkr, end_date=report_date)
             if not g.empty and 'ivr_pct' in g.columns:
-                src = g.iloc[-1].get('source_date') or g.iloc[-1].get('date')
+                src = _metric_source_date(g, 'ivr_pct', 'date', ('source_date',))
                 events += scan_metric('ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src)
-                row = metric_snapshot('ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src)
+                row = metric_snapshot(
+                    'ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src,
+                    session=session, is_final=is_final, source_name="stock_spot_post_close")
                 if row: snap_rows.append(row)
-                iv = pd.to_numeric(g.iloc[-1].get('ivr_pct'), errors='coerce')
-                if pd.notna(iv): ivr_vals.append(iv)
+                clean = _clean(g['ivr_pct'])
+                if not clean.empty: ivr_vals.append(float(clean.iloc[-1]))
         except Exception:
             pass
 
     # 共振派生量
-    snapshot['dpsv_high'] = max(dpsv_vals) if dpsv_vals else None
     snapshot['ivr_low'] = min(ivr_vals) if ivr_vals else None
 
     # ---- 第三层共振 ----
@@ -475,15 +583,14 @@ def run_engine(supabase, report_date=None, persist=True):
 
     if persist:
         from market_utils import safe_upsert
-        if events:
-            rows = [e.to_row() for e in events]
-            # 唯一键 (report_date, metric, scope, window, layer)，重复运行覆盖
-            safe_upsert(supabase, 'anomaly_events', rows,
-                        conflict_cols='report_date,metric,scope,window_scope,layer')
+        rows = [e.to_row() for e in events]
+        # 有有效快照才同步事件；上游全空时保留旧记录并由哨兵报告数据故障。
+        if snapshot:
+            _sync_anomaly_events(supabase, report_date, rows)
         # 每日全量快照：不管越不越线都落库，供曲线/环境评估（唯一键去当日重复）
         if snap_rows:
             safe_upsert(supabase, 'metric_daily', snap_rows,
-                        conflict_cols='report_date,metric,scope')
+                        conflict_cols='report_date,metric,scope,session')
 
     return events, snapshot
 

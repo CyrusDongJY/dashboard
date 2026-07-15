@@ -7,6 +7,7 @@ import smtplib
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from email.header import Header
 
 import pytz
@@ -23,6 +24,8 @@ try:
     from market_probes import scan_macro_regime, scan_micro_options, scan_volatility_spot
     from market_utils import trading_days_back, log_data_quality
     from anomaly_engine import run_engine, format_matrix
+    from environment_indices import compute_indices, format_env_summary
+    from environment_report import generate_environment_chart
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -119,7 +122,7 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
         details = []
         if stock.get('current_price'): details.append(f"现价 ${stock['current_price']:.2f}")
         if stock.get('poc_price'): details.append(f"POC ${stock['poc_price']:.2f}")
-        if stock.get('dpsv_pct'): details.append(f"暗池做空比 {stock['dpsv_pct']}%")
+        if stock.get('dpsv_pct'): details.append(f"FINRA短售量代理 {stock['dpsv_pct']}%")
         if stock.get('ivr_pct'): details.append(f"IVR {stock['ivr_pct']}%")
         if stock.get('zgl_price'): details.append(f"ZGL分水岭 ${stock['zgl_price']:.2f}")
         if stock.get('charm_m'): details.append(f"Charm推力 {stock['charm_m']}M")
@@ -127,7 +130,7 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
         
     return appendix
 
-def send_email(subject, ai_report, raw_data_feed, raw_appendix):
+def send_email(subject, ai_report, raw_data_feed, raw_appendix, image_path=None):
     msg = MIMEMultipart()
     msg['From'] = cfg.SENDER_EMAIL
     msg['To'] = cfg.RECEIVER_EMAIL
@@ -135,6 +138,12 @@ def send_email(subject, ai_report, raw_data_feed, raw_appendix):
     
     full_content = f"{ai_report}\n\n" + "="*50 + f"\n\n【机密附件一：探针异常报警清单】\n{raw_data_feed}\n\n" + "="*50 + f"\n\n{raw_appendix}"
     msg.attach(MIMEText(full_content, 'plain', 'utf-8'))
+    if image_path and os.path.exists(image_path):
+        with open(image_path, 'rb') as image_file:
+            image = MIMEImage(image_file.read(), _subtype='png')
+        image.add_header('Content-Disposition', 'attachment',
+                         filename=os.path.basename(image_path))
+        msg.attach(image)
     
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15)
@@ -146,7 +155,7 @@ def send_email(subject, ai_report, raw_data_feed, raw_appendix):
         logging.error(f"❌ 邮件发送失败: {e}")
 
 if __name__ == "__main__":
-    logging.info(">>> 启动 V9.0 全域量化盘后复盘流水线 (多窗口异常矩阵) <<<")
+    logging.info(">>> 启动 V9.1 全域量化盘后复盘流水线 (异常矩阵 + 环境影子图) <<<")
     
     if not is_trading_day():
         logging.info("🛑 今天是美股休市日，Auto Analyst 进入法定休眠。")
@@ -160,7 +169,8 @@ if __name__ == "__main__":
         logging.error(f"❌ 数据库连接致命错误: {e}")
         sys.exit(1)
         
-    current_time = datetime.now()
+    current_time = datetime.now(NY_TZ)
+    report_date = current_time.strftime('%Y-%m-%d')
     # ✅ V9.0：数据拉取范围按交易日计（280个交易日，覆盖252D统计基准）。
     #    1D/5D/21D 只是观察窗口，由异常引擎与探针内部各自截取，不再用自然日 timedelta。
     cutoff_date = trading_days_back(280)
@@ -169,7 +179,9 @@ if __name__ == "__main__":
 
     logging.info("🧮 运行多窗口异常矩阵引擎 (252D基准 / 1D-5D-21D观察 / 跨资产共振)...")
     try:
-        anomaly_events, snapshot = run_engine(supabase, persist=True)
+        anomaly_events, snapshot = run_engine(
+            supabase, report_date=report_date, persist=True,
+            session="EOD", is_final=True)
         anomaly_matrix_text = format_matrix(anomaly_events)
         max_sev = max([e.severity for e in anomaly_events], default=0)
         log_data_quality(supabase, job_name='auto_analyst', table_name='anomaly_events',
@@ -180,6 +192,20 @@ if __name__ == "__main__":
     except Exception as e:
         anomaly_matrix_text = f"⚠️ 异常矩阵引擎运行失败: {e}（本报告降级为纯探针模式）"
         logging.error(anomaly_matrix_text)
+        anomaly_events = []
+
+    # 环境指数严格处于影子模式：只进入文本附录和PNG，不接入告警门控或AI判定。
+    environment_text = "=== 环境指数（影子观察） ===\n本日计算失败或数据不足。"
+    environment_chart = None
+    try:
+        environment = compute_indices(
+            supabase, report_date=report_date, persist=True,
+            events=anomaly_events, session="EOD")
+        environment_text = format_env_summary(environment)
+        environment_chart = generate_environment_chart(supabase, report_date)
+        logging.info("✅ 环境影子报告生成完成（不参与预警）")
+    except Exception as e:
+        logging.warning(f"环境影子报告降级为无图模式: {e}")
 
     logging.info("📡 唤醒三大联邦探针...")
     macro_text, macro_alert, macro_raw = scan_macro_regime(supabase, cutoff_date)
@@ -195,7 +221,9 @@ if __name__ == "__main__":
     
     logging.info("🗄️ 正在组装全息数据附录...")
     raw_appendix = format_raw_appendix(macro_raw, vol_raw, micro_raw_list)
+    raw_appendix = f"{environment_text}\n\n" + "="*50 + f"\n\n{raw_appendix}"
     
     logging.info("🚀 推送最终战报...")
-    send_email(f"🚨 机构级全域交叉复盘 (异常矩阵 V9.0) [{current_time.strftime('%Y-%m-%d')}]", ai_report, raw_data_feed, raw_appendix)
+    send_email(f"🚨 机构级全域交叉复盘 (V9.1 影子环境监测) [{report_date}]",
+               ai_report, raw_data_feed, raw_appendix, image_path=environment_chart)
     logging.info(">>> 流水线执行完毕，司令部休眠 <<<")
