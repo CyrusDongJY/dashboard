@@ -48,6 +48,74 @@ CREATE TABLE IF NOT EXISTS stock_options_pre_market (
     PRIMARY KEY (date, ticker)
 );
 
+-- V9.2 盘前价格与Gamma口径：旧 current_price 仅保留兼容，禁止再解释为实时价。
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS previous_close numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS previous_close_date date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS premarket_last numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS premarket_bid numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS premarket_ask numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS premarket_mid numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS premarket_reference_price numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS premarket_price_source text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS market_data_type smallint;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS quote_as_of timestamptz;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS futures_symbol text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS futures_reference_price numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS futures_as_of timestamptz;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS distance_to_call_wall_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS distance_to_put_wall_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS distance_to_zgl_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS pin_strike numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS pin_state text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_value numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_source text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_dte numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_quality text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS max_oi_expiry date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS max_oi_count bigint;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS max_oi_delta numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS max_oi_gamma_dollar_m numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS max_oi_distance_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_0dte_m numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_1_7d_m numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_8_30d_m numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_31_60d_m numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_all_m numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_0dte numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_1_7d numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_8_30d numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_31_60d numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_all numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_previous_flip numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_change_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_roll_changed boolean;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_quality text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_zeroes jsonb;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_expirations jsonb;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_sign_model text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS oi_source_date date;
+
+CREATE TABLE IF NOT EXISTS option_gamma_buckets (
+    date                date        NOT NULL,
+    ticker              text        NOT NULL,
+    bucket              text        NOT NULL
+                                    CHECK (bucket IN ('0DTE','1-7D','8-30D','31-60D','ALL')),
+    spot_reference      numeric,
+    net_gamma_m         numeric,
+    primary_flip        numeric,
+    zero_points         jsonb,
+    expirations         jsonb,
+    contract_count      int         DEFAULT 0,
+    expiration_count    int         DEFAULT 0,
+    sign_model          text,
+    source_date         date,
+    as_of_time          timestamptz,
+    ingested_at         timestamptz,
+    PRIMARY KEY (date, ticker, bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_option_gamma_buckets_ticker_date
+    ON option_gamma_buckets (ticker, date DESC);
+
 CREATE TABLE IF NOT EXISTS stock_spot_post_close (
     date            date        NOT NULL,
     ticker          text        NOT NULL,
@@ -91,7 +159,53 @@ SELECT
     pre.oi_pcr,
     pre.dpsv_pct,
     pre.dpsv_source_date,
-    pre.as_of_time      AS pre_as_of_time
+    pre.as_of_time      AS pre_as_of_time,
+    -- V9.2 明确盘前价格、报价质量和结构指标
+    pre.previous_close,
+    pre.previous_close_date,
+    pre.premarket_last,
+    pre.premarket_bid,
+    pre.premarket_ask,
+    pre.premarket_mid,
+    pre.premarket_reference_price,
+    pre.premarket_price_source,
+    pre.market_data_type,
+    pre.quote_as_of,
+    pre.futures_symbol,
+    pre.futures_reference_price,
+    pre.futures_as_of,
+    pre.distance_to_call_wall_pct,
+    pre.distance_to_put_wall_pct,
+    pre.distance_to_zgl_pct,
+    pre.pin_strike,
+    pre.pin_state,
+    pre.expected_move_value,
+    pre.expected_move_source,
+    pre.expected_move_dte,
+    pre.expected_move_quality,
+    pre.max_oi_expiry,
+    pre.max_oi_count,
+    pre.max_oi_delta,
+    pre.max_oi_gamma_dollar_m,
+    pre.max_oi_distance_pct,
+    pre.gamma_0dte_m,
+    pre.gamma_1_7d_m,
+    pre.gamma_8_30d_m,
+    pre.gamma_31_60d_m,
+    pre.gamma_all_m,
+    pre.gamma_flip_0dte,
+    pre.gamma_flip_1_7d,
+    pre.gamma_flip_8_30d,
+    pre.gamma_flip_31_60d,
+    pre.gamma_flip_all,
+    pre.gamma_previous_flip,
+    pre.gamma_flip_change_pct,
+    pre.gamma_roll_changed,
+    pre.gamma_flip_quality,
+    pre.gamma_zeroes,
+    pre.gamma_expirations,
+    pre.gamma_sign_model,
+    pre.oi_source_date
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
@@ -261,3 +375,36 @@ CREATE INDEX IF NOT EXISTS idx_environment_report_date ON environment_daily (rep
 ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS shadow_mode boolean NOT NULL DEFAULT true;
 ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS calc_version text NOT NULL DEFAULT 'env_v2';
 ALTER TABLE environment_daily ALTER COLUMN calc_version SET DEFAULT 'env_v2';
+
+
+-- ------------------------------------------------------------
+-- 9. 市场流动性水位仪：六维影子评分 + 数据覆盖 + 可解释明细。
+--    分值越高表示流动性支持越强；V2仍只用于观察，不接入 ALERT_GATE。
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS liquidity_daily (
+    report_date          date        PRIMARY KEY,
+    water_stock          numeric,
+    flow_pulse           numeric,
+    funding_health       numeric,
+    credit_transmission  numeric,
+    market_distribution  numeric,
+    tail_resilience      numeric,
+    composite            numeric,
+    coverage             numeric,
+    state                text,
+    state_detail         text,
+    supports             text,
+    drags                text,
+    warnings             text,
+    details              jsonb,
+    shadow_mode          boolean     NOT NULL DEFAULT true,
+    calc_version         text        NOT NULL DEFAULT 'liquidity_v2',
+    created_at           timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_liquidity_report_date
+    ON liquidity_daily (report_date DESC);
+ALTER TABLE liquidity_daily
+    ADD COLUMN IF NOT EXISTS shadow_mode boolean NOT NULL DEFAULT true;
+ALTER TABLE liquidity_daily
+    ADD COLUMN IF NOT EXISTS calc_version text NOT NULL DEFAULT 'liquidity_v2';
+ALTER TABLE liquidity_daily ALTER COLUMN calc_version SET DEFAULT 'liquidity_v2';

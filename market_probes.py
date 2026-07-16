@@ -128,12 +128,25 @@ def scan_micro_options(supabase, cutoff_date):
             elif dpsv < 40:
                 ticker_anomalies.append(f"[FINRA短售代理] 读数偏低({dpsv:.2f}%){src_note}，方向需结合价格与成交验证。")
 
-        zgl_today = pd.to_numeric(today.get('zgl_price', np.nan), errors='coerce')
+        zgl_today = pd.to_numeric(
+            today.get('gamma_flip_all', today.get('zgl_price', np.nan)),
+            errors='coerce')
         if last_week is not None:
-            zgl_lw = pd.to_numeric(last_week.get('zgl_price', np.nan), errors='coerce')
+            zgl_lw = pd.to_numeric(
+                last_week.get('gamma_flip_all', last_week.get('zgl_price', np.nan)),
+                errors='coerce')
             if pd.notna(zgl_today) and pd.notna(zgl_lw) and zgl_today != zgl_lw:
                 direction = "上移 🔼" if zgl_today > zgl_lw else "下移 🔽"
-                ticker_anomalies.append(f"[ZGL防线-WoW] 支撑位{direction} (上周: {zgl_lw} -> 今日: {zgl_today})")
+                ticker_anomalies.append(
+                    f"[Gamma Flip观察-WoW] 主零点{direction} "
+                    f"(上周: {zgl_lw} -> 今日: {zgl_today})；"
+                    "到期滚动和采样变化可能造成跳变。")
+
+        pin_strike = pd.to_numeric(today.get('pin_strike', np.nan), errors='coerce')
+        pin_state = today.get('pin_state')
+        if pd.notna(pin_strike) and pin_state:
+            label = "Pin候选位" if pin_state == "PIN_CANDIDATE" else "突破枢轴"
+            ticker_anomalies.append(f"[双边Gamma集中] {label} ${pin_strike:.2f}。")
 
         charm_t0, charm_t1 = pd.to_numeric(today.get('charm_m', np.nan), errors='coerce'), pd.to_numeric(yday.get('charm_m', np.nan), errors='coerce')
         if pd.notna(charm_t0) and pd.notna(charm_t1):

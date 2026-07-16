@@ -80,11 +80,19 @@ METRIC_REGISTRY = {
                           "abs": [("<", 10, 1)], "z": (2.0, 3.0)},
     "expected_move_pct":{"cn": "预期波幅", "bad_dir": +1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "short_gamma_m":   {"cn": "短期期限净Gamma", "bad_dir": -1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
-    "oi_pcr":          {"cn": "期权持仓PCR", "bad_dir": +1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "oi_pcr":          {"cn": "Put/Call持仓结构比", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     # 下列结构值先只积累曲线。方向依赖价格位置、到期结构和符号约定，不直接进入风险评分。
-    "zgl_price":       {"cn": "零Gamma分水岭", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
-    "call_wall":       {"cn": "Call Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
-    "put_wall":        {"cn": "Put Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "zgl_price":       {"cn": "全采样期限主Gamma Flip", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "call_wall":       {"cn": "Gamma加权Call Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "put_wall":        {"cn": "Gamma加权Put Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "distance_to_call_wall_pct":{"cn": "距Call墙百分比", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "distance_to_put_wall_pct":{"cn": "距Put墙百分比", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "distance_to_zgl_pct":{"cn": "距主Gamma Flip百分比", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "gamma_0dte_m":    {"cn": "0DTE净Gamma代理", "bad_dir": -1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "gamma_1_7d_m":    {"cn": "1—7日净Gamma代理", "bad_dir": -1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "gamma_8_30d_m":   {"cn": "8—30日净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "gamma_31_60d_m":  {"cn": "31—60日净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "gamma_all_m":     {"cn": "全采样期限净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "vanna_m":         {"cn": "Vanna", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "charm_m":         {"cn": "Charm", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "long_gamma_m":    {"cn": "中长期限净Gamma", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
@@ -541,9 +549,14 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
             g = _fetch_history(
                 supabase, 'stock_options_pre_market', 'date', ticker=tkr, end_date=report_date)
             if not g.empty:
-                pre_metrics = ['dpsv_pct', 'expected_move_pct', 'short_gamma_m', 'long_gamma_m',
-                               'zgl_price', 'call_wall', 'put_wall', 'vanna_m', 'charm_m',
-                               'iv_skew', 'oi_pcr']
+                pre_metrics = [
+                    'dpsv_pct', 'expected_move_pct', 'short_gamma_m', 'long_gamma_m',
+                    'gamma_0dte_m', 'gamma_1_7d_m', 'gamma_8_30d_m',
+                    'gamma_31_60d_m', 'gamma_all_m',
+                    'zgl_price', 'call_wall', 'put_wall',
+                    'distance_to_call_wall_pct', 'distance_to_put_wall_pct',
+                    'distance_to_zgl_pct', 'vanna_m', 'charm_m', 'iv_skew', 'oi_pcr',
+                ]
                 for m in pre_metrics:
                     if m not in g.columns:
                         continue

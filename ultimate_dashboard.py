@@ -47,6 +47,7 @@ class UltimateDashboard:
         self.sector_rs, self.risk_scissors, self.vol_metrics = {}, {}, {}
         # 结构化数值缓存：与展示字符串平行存储原始数值，供直接落库（替代正则解析文本）
         self.num = {}
+        self.fred_source_dates = {}
 
     def log(self, msg):
         print(msg)
@@ -93,7 +94,7 @@ class UltimateDashboard:
             'BAMLH0A0HYM2': 'Credit_Spread', 'BAMLC0A0CM': 'IG_Spread',
             'M2SL': 'M2_Money_Supply', 'T10Y2Y': 'Spread_10Y2Y',
             'NFCI': 'NFCI', 'DGS10': 'US10Y', 'DFII10': 'TIPS10Y', 
-            'SOFR': 'SOFR', 'TOTRESNS': 'Reserves', 'ECBASSETSW': 'ECB_Assets', 
+            'SOFR': 'SOFR', 'WRESBAL': 'Reserves', 'ECBASSETSW': 'ECB_Assets',
             'JPNASSETS': 'BOJ_Assets', 'DEXUSEU': 'EUR_USD', 'DEXJPUS': 'USD_JPY'
         }
         
@@ -118,7 +119,10 @@ class UltimateDashboard:
                         s = pd.DataFrame(data)
                         s['value'] = pd.to_numeric(s['value'], errors='coerce')
                         s['date'] = pd.to_datetime(s['date'])
-                        series_dict[col_name] = s.dropna().set_index('date')['value']
+                        native = s.dropna().set_index('date')['value']
+                        series_dict[col_name] = native
+                        if not native.empty:
+                            self.fred_source_dates[col_name] = native.index.max().strftime('%Y-%m-%d')
             except: continue
                 
         if series_dict:
@@ -138,7 +142,8 @@ class UltimateDashboard:
                 'sofr': round(latest.get('SOFR', 0), 2) if pd.notna(latest.get('SOFR')) else '-',
                 'y10': round(latest.get('US10Y', 0), 2) if pd.notna(latest.get('US10Y')) else '-',
                 'tips': round(latest.get('TIPS10Y', 0), 2) if pd.notna(latest.get('TIPS10Y')) else '-',
-                'reserves': round(latest.get('Reserves', 0)/1000, 2) if pd.notna(latest.get('Reserves')) else '-'
+                # WRESBAL单位为百万美元，转成万亿美元。
+                'reserves': round(latest.get('Reserves', 0)/1_000_000, 3) if pd.notna(latest.get('Reserves')) else '-'
             })
             
             if self.liquidity['assets'] != '-' and self.liquidity['tga'] != '-' and self.liquidity['rrp'] != '-':
@@ -525,7 +530,10 @@ class UltimateDashboard:
                 curr_px = spy_c.iloc[-1]
                 dix_val = float(self.smf['dix'])
                 if curr_px < min_20d and dix_val > 45.0:
-                    dix_div_alert = f"🚨【暗池背离吸筹】现价跌破20日低点, 且机构在暗池极端吸筹({dix_val}%)"
+                    dix_div_alert = (
+                        f"⚠️【DIX价格背离观察】现价跌破20日低点，DIX为{dix_val}%；"
+                        "DIX仅是FINRA短售量代理，不能据此归因为机构吸筹"
+                    )
         self.score_details['dix_divergence'] = dix_div_alert
 
         self.heatmap_df, self.current_prices = pd.DataFrame(), {}
@@ -558,8 +566,8 @@ class UltimateDashboard:
 [TGA账户余额]: {self.liquidity.get('tga', '-')}
 [隔夜逆回购RRP]: {self.liquidity.get('rrp', '-')}
 [银行准备金]: {self.liquidity.get('reserves', '-')}
-[SOFR尾部利差]: {self.liquidity.get('sofr', '-')}
-[OFR金融压力指数]: {self.liquidity.get('nfci', '-')}
+[SOFR利率]: {self.liquidity.get('sofr', '-')}
+[Chicago Fed NFCI]: {self.liquidity.get('nfci', '-')}
 
 ==== 📈 利率收益率结构 ====
 [10年期美债]: {self.liquidity.get('y10', '-')}
@@ -710,6 +718,7 @@ class UltimateDashboard:
             "vix_term_ratio": num.get('vix_term_ratio'),
             "hyg_tlt_roc21": num.get('hyg_tlt_roc21'),
             "breadth_sample": "top500_by_mktcap",
+            "fred_source_dates": self.fred_source_dates,
         }
 
         # 本地 CSV 备份用的中文表头行（保持既有格式）
@@ -729,7 +738,7 @@ class UltimateDashboard:
             '[流动性]G3净流动(B)': payload['g3_liq'], '[流动性]美联储资产(B)': payload['fed_assets'],
             '[流动性]真实净流动(B)': payload['net_liq'], '[流动性]TGA(B)': payload['tga'],
             '[流动性]逆回购(B)': payload['rrp'], '[流动性]准备金(T)': payload['reserves'],
-            '[流动性]SOFR利差(%)': payload['sofr'], '[流动性]OFR压力指数': payload['nfci'],
+            '[流动性]SOFR利率(%)': payload['sofr'], '[流动性]Chicago Fed NFCI': payload['nfci'],
             '[利率]10Y美债(%)': payload['us10y'], '[利率]TIPS(%)': payload['tips'],
             '[利率]10Y-2Y利差(bps)': payload['spread_10y2y'], '[利率]投资级利差(%)': payload['ig_spread'],
             '[利率]信用利差(%)': payload['credit_spread'], '[利率]垃圾债流向(M)': payload['junk_flow'],

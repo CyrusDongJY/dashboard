@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """生成环境指数影子模式PNG报告。"""
 import os
-import tempfile
 
 import pandas as pd
 
@@ -42,7 +41,7 @@ def build_history(df):
 
 
 def generate_environment_chart(supabase, report_date, lookback_days=252, output_path=None):
-    """返回PNG路径；无可用数据时返回 None。"""
+    """生成并持久化环境影子图；无可用数据时返回 None。"""
     start_date = trading_days_back(lookback_days, end_date=report_date)
     history = build_history(_fetch_metric_rows(supabase, start_date, report_date))
     if history.empty:
@@ -83,7 +82,12 @@ def generate_environment_chart(supabase, report_date, lookback_days=252, output_
     fig.tight_layout(rect=(0, 0, 1, 0.94))
 
     path = output_path or os.path.join(
-        tempfile.gettempdir(), f"environment_shadow_{report_date}.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+        os.path.dirname(os.path.abspath(__file__)), "reports",
+        f"environment_shadow_{report_date}.png")
+    path = os.path.abspath(os.path.expanduser(path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     return path
