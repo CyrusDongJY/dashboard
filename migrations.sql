@@ -261,3 +261,36 @@ CREATE INDEX IF NOT EXISTS idx_environment_report_date ON environment_daily (rep
 ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS shadow_mode boolean NOT NULL DEFAULT true;
 ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS calc_version text NOT NULL DEFAULT 'env_v2';
 ALTER TABLE environment_daily ALTER COLUMN calc_version SET DEFAULT 'env_v2';
+
+
+-- ------------------------------------------------------------
+-- 9. 市场流动性水位仪：六维影子评分 + 数据覆盖 + 可解释明细。
+--    分值越高表示流动性支持越强；V2仍只用于观察，不接入 ALERT_GATE。
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS liquidity_daily (
+    report_date          date        PRIMARY KEY,
+    water_stock          numeric,
+    flow_pulse           numeric,
+    funding_health       numeric,
+    credit_transmission  numeric,
+    market_distribution  numeric,
+    tail_resilience      numeric,
+    composite            numeric,
+    coverage             numeric,
+    state                text,
+    state_detail         text,
+    supports             text,
+    drags                text,
+    warnings             text,
+    details              jsonb,
+    shadow_mode          boolean     NOT NULL DEFAULT true,
+    calc_version         text        NOT NULL DEFAULT 'liquidity_v2',
+    created_at           timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_liquidity_report_date
+    ON liquidity_daily (report_date DESC);
+ALTER TABLE liquidity_daily
+    ADD COLUMN IF NOT EXISTS shadow_mode boolean NOT NULL DEFAULT true;
+ALTER TABLE liquidity_daily
+    ADD COLUMN IF NOT EXISTS calc_version text NOT NULL DEFAULT 'liquidity_v2';
+ALTER TABLE liquidity_daily ALTER COLUMN calc_version SET DEFAULT 'liquidity_v2';

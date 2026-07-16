@@ -23,10 +23,6 @@ yfinance_module = types.ModuleType("yfinance")
 yfinance_module.download = lambda *args, **kwargs: pd.DataFrame()
 sys.modules.setdefault("yfinance", yfinance_module)
 
-requests_module = types.ModuleType("requests")
-requests_module.Session = object
-sys.modules.setdefault("requests", requests_module)
-
 from anomaly_engine import AnomalyEvent, metric_snapshot, scan_metric  # noqa: E402
 from backfill_history import parse_period_days, replay  # noqa: E402
 from environment_indices import (  # noqa: E402

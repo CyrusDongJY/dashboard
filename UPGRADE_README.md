@@ -1,4 +1,4 @@
-# V9.1 升级说明 — 异常矩阵 + 环境指数影子监测
+# V9.2 升级说明 — 异常矩阵 + 环境指数 + 流动性水位仪
 
 本次升级把系统从"探针文本战报"升级为"客观异常矩阵"：同一指标看 1D/5D/21D/63D
 观察窗口，以 252 个交易日为统计基准，跨指标做共振判定，并按数据新鲜度加权置信度。
@@ -13,6 +13,7 @@
    - `sentinel_runs`（哨兵每次评估的指纹与是否发警，用于去重防轰炸 + 回测）
    - `metric_daily`（按 PRE/INTRADAY/EOD 分会话的每日全指标快照）
    - `environment_daily`（环境指数影子台账，不参与正式预警）
+   - `liquidity_daily`（六柱流动性水位、覆盖率、状态和可解释明细）
    - 现有表补 `source_date` / `as_of_time` / `ingested_at` 三列
 
 2. **部署代码（按目录放对，否则会 ImportError）**：新增的共享模块
@@ -27,6 +28,9 @@
    | `anomaly_engine.py` | 新增（**必须**放这里） |
    | `environment_indices.py` | 新增（影子指数，**必须**放这里） |
    | `environment_report.py` | 新增（盘后PNG，**必须**放这里） |
+   | `liquidity_sources.py` | 新增（官方数据源适配，**必须**放这里） |
+   | `liquidity_monitor.py` | 新增（六柱评分与状态机，**必须**放这里） |
+   | `liquidity_report.py` | 新增（盘后水位仪PNG，**必须**放这里） |
    | `backfill_history.py` | 新增（一次性历史回补） |
    | `requirements-env-dashboard.txt` | 新增（PNG依赖清单） |
    | `market_probes.py` | 覆盖 |
@@ -206,3 +210,56 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
   先观察请求成功率和行数，再去掉 `dry`。
 - 环境指数至少影子运行一个完整季度，再以未来5D/21D回撤、波动率和误报率做走步回测；
   未完成校准前，不得把状态标签接入正式预警。
+
+
+## 八、市场流动性水位仪（V9.2影子模式）
+
+- 新增 liquidity_sources.py：从官方源读取日度TGA、H.4.1准备金、FRED宏观序列，
+  以及纽约联储SOFR/TGCR/EFFR分位与成交量。所有序列保留真实观测日期。
+- 新增 liquidity_monitor.py：分为基础水量、边际水流、融资管道、信用传导、
+  市场分配和尾部韧性六维。分值越高表示流动性支持越强，同时输出质量覆盖率。
+- 新增 liquidity_report.py：盘后生成PNG，显示六维水位、流量四象限、历史轨迹、
+  主要支撑/拖累与结构提示，并作为第二张附件挂入 auto_analyst.py。
+- SOFR原值只标为“SOFR利率”，不再冒充尾部利差；NFCI明确标为Chicago Fed NFCI，
+  不再与OFR FSI混称。DIX、FINRA短售量和GEX仅作上下文，不直接改变水位分。
+- 执行新版 migrations.sql 创建 liquidity_daily 后，再部署三个新增模块和
+  auto_analyst.py。第一版保持 shadow_mode=true，不接入 ALERT_GATE 或仓位。
+
+### V2口径与可靠性修正
+
+- `calc_version=liquidity_v2`。VIX期货M2/M1升贴水与现货VIX/VIX3M比率分列保存、
+  分别计算分位，禁止在同一历史序列中混用。数据库中的V1记录保留，可按版本追溯。
+- 净流动性20日变化改用美元金额变化，不再对可能接近零的净值计算百分比。
+- “融资管道承压”和“信用收缩”头条状态必须同时满足历史分位异常和绝对压力护栏；
+  只有相对异常时降级为结构提示，避免平静样本内的正常波动触发强状态。
+- 历史合并使用各数据表日期索引的并集，宏观表独有交易日不再被静默丢弃；TGA五日
+  变化严格按工作日回看，不再按数据行位置近似。
+- 官方HTTP源增加指数退避重试，财政部DTS接口支持分页；数据库写入失败会出现在
+  邮件摘要和数据质量日志中。图表缺少核心数据时明确显示“数据不足”，不再把点画在
+  中性位置。
+- V2仍为研究性影子输出。部署后至少观察3至5个完整交易日，重点检查官方源覆盖率、
+  融资/信用护栏触发率、缺日合并和PNG附件，再决定是否调整绝对阈值；不得直接接入
+  告警或仓位决策。
+
+### 云端验证
+
+水位仪复用现有 `16:45 auto_analyst.py`，不新增 cron。部署后先确认依赖和导入：
+
+```bash
+/usr/bin/python3 -m pip install -r /home/winters_dong426/market_dashboard/requirements-env-dashboard.txt
+cd /home/winters_dong426/market_dashboard
+/usr/bin/python3 -m py_compile liquidity_sources.py liquidity_monitor.py liquidity_report.py
+```
+
+下一交易日运行后，在 Supabase SQL Editor 检查：
+
+```sql
+SELECT report_date, composite, coverage, state, shadow_mode, calc_version
+FROM public.liquidity_daily
+ORDER BY report_date DESC
+LIMIT 5;
+```
+
+邮件应包含环境图和 `liquidity_waterline_YYYY-MM-DD.png` 两个 PNG 附件；日志应出现
+`流动性水位仪生成完成`。没有异常也会生成水位仪，因为它是每日影子报告，不受
+`market_sentinel.py` 的告警门槛控制。

@@ -26,6 +26,9 @@ try:
     from anomaly_engine import run_engine, format_matrix
     from environment_indices import compute_indices, format_env_summary
     from environment_report import generate_environment_chart
+    from liquidity_monitor import compute_liquidity_monitor, format_liquidity_summary
+    from liquidity_report import build_liquidity_history, generate_liquidity_chart
+    from liquidity_sources import OfficialLiquiditySources
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -130,7 +133,8 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
         
     return appendix
 
-def send_email(subject, ai_report, raw_data_feed, raw_appendix, image_path=None):
+def send_email(subject, ai_report, raw_data_feed, raw_appendix,
+               image_path=None, image_paths=None):
     msg = MIMEMultipart()
     msg['From'] = cfg.SENDER_EMAIL
     msg['To'] = cfg.RECEIVER_EMAIL
@@ -138,18 +142,26 @@ def send_email(subject, ai_report, raw_data_feed, raw_appendix, image_path=None)
     
     full_content = f"{ai_report}\n\n" + "="*50 + f"\n\n【机密附件一：探针异常报警清单】\n{raw_data_feed}\n\n" + "="*50 + f"\n\n{raw_appendix}"
     msg.attach(MIMEText(full_content, 'plain', 'utf-8'))
+    attachments = []
     if image_path:
-        if os.path.isfile(image_path) and os.path.getsize(image_path) > 0:
-            with open(image_path, 'rb') as image_file:
+        attachments.append(image_path)
+    attachments.extend(image_paths or [])
+    seen = set()
+    for path in attachments:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            with open(path, 'rb') as image_file:
                 image = MIMEImage(image_file.read(), _subtype='png')
             image.add_header('Content-Disposition', 'attachment',
-                             filename=os.path.basename(image_path))
+                             filename=os.path.basename(path))
             msg.attach(image)
             logging.info(
-                f"📎 环境影子图已加入邮件附件: {image_path} "
-                f"({os.path.getsize(image_path) / 1024:.1f} KB)")
+                f"📎 PNG报告已加入邮件附件: {path} "
+                f"({os.path.getsize(path) / 1024:.1f} KB)")
         else:
-            logging.warning(f"⚠️ 环境影子图附件不存在或为空，邮件将无图发送: {image_path}")
+            logging.warning(f"⚠️ PNG附件不存在或为空，将跳过该附件: {path}")
     
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15)
@@ -163,7 +175,7 @@ def send_email(subject, ai_report, raw_data_feed, raw_appendix, image_path=None)
         return False
 
 if __name__ == "__main__":
-    logging.info(">>> 启动 V9.1 全域量化盘后复盘流水线 (异常矩阵 + 环境影子图) <<<")
+    logging.info(">>> 启动 V9.2 全域量化盘后复盘流水线 (环境 + 流动性影子监测) <<<")
     
     if not is_trading_day():
         logging.info("🛑 今天是美股休市日，Auto Analyst 进入法定休眠。")
@@ -231,6 +243,38 @@ if __name__ == "__main__":
         environment_chart = None
         logging.warning(f"⚠️ 环境影子图生成失败，邮件降级为无图模式: {e}")
 
+    # 流动性水位仪同样处于影子模式：官方源优先；失败时只接受带原生来源日期的
+    # 数据库历史，旧行缺少来源日期则主动降低覆盖率。
+    liquidity_text = "=== 市场流动性水位仪（影子观察） ===\n本日计算失败或数据不足。"
+    liquidity_chart = None
+    liquidity_output_path = os.path.join(
+        report_dir, f"liquidity_waterline_{report_date}.png")
+    try:
+        source = OfficialLiquiditySources(cfg.FRED_API_KEY)
+        official_frame = source.build_frame(
+            (current_time - timedelta(days=1200)).strftime('%Y-%m-%d'),
+            report_date,
+        )
+        liquidity, liquidity_frame = compute_liquidity_monitor(
+            supabase, report_date=report_date,
+            official_frame=official_frame, persist=True,
+        )
+        liquidity_text = format_liquidity_summary(liquidity)
+        liquidity_history = build_liquidity_history(liquidity_frame)
+        liquidity_chart = generate_liquidity_chart(
+            liquidity, liquidity_history, output_path=liquidity_output_path)
+        if liquidity_chart and os.path.isfile(liquidity_chart):
+            logging.info(
+                f"✅ 流动性水位仪生成完成: {liquidity.state}, "
+                f"覆盖 {liquidity.coverage:.0%}, {liquidity_chart} "
+                f"({os.path.getsize(liquidity_chart) / 1024:.1f} KB)")
+        else:
+            liquidity_chart = None
+            logging.warning("⚠️ 流动性水位仪未生成：有效数据覆盖不足")
+    except Exception as e:
+        liquidity_chart = None
+        logging.warning(f"流动性水位仪降级为无图模式: {e}")
+
     logging.info("📡 唤醒三大联邦探针...")
     macro_text, macro_alert, macro_raw = scan_macro_regime(supabase, cutoff_date)
     vol_text, vol_alert, vol_raw = scan_volatility_spot(supabase, cutoff_date)
@@ -245,12 +289,16 @@ if __name__ == "__main__":
     
     logging.info("🗄️ 正在组装全息数据附录...")
     raw_appendix = format_raw_appendix(macro_raw, vol_raw, micro_raw_list)
-    raw_appendix = f"{environment_text}\n\n" + "="*50 + f"\n\n{raw_appendix}"
+    raw_appendix = (
+        f"{environment_text}\n\n" + "="*50 +
+        f"\n\n{liquidity_text}\n\n" + "="*50 + f"\n\n{raw_appendix}"
+    )
     
     logging.info("🚀 推送最终战报...")
     email_sent = send_email(
-        f"🚨 机构级全域交叉复盘 (V9.1 影子环境监测) [{report_date}]",
-        ai_report, raw_data_feed, raw_appendix, image_path=environment_chart)
+        f"🚨 机构级全域交叉复盘 (V9.2 环境与流动性影子监测) [{report_date}]",
+        ai_report, raw_data_feed, raw_appendix,
+        image_paths=[environment_chart, liquidity_chart])
     if not email_sent:
         logging.warning("⚠️ 复盘数据已完成入库，但邮件投递失败，请检查SMTP日志。")
     logging.info(">>> 流水线执行完毕，司令部休眠 <<<")
