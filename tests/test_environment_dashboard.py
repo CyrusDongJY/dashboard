@@ -156,7 +156,9 @@ class ChartTests(unittest.TestCase):
             metric_row("vix", 95), metric_row("vvix", 90),
             metric_row("move", 92), metric_row("vix_contango_pct", 5),
         ]
-        path = os.path.join(tempfile.gettempdir(), "environment_chart_test.png")
+        path = os.path.join(
+            tempfile.gettempdir(), "environment_chart_test", "nested",
+            "environment_chart_test.png")
         generated = generate_environment_chart(
             _Supabase(rows), "2026-07-14", output_path=path)
         self.assertEqual(generated, path)
@@ -167,6 +169,12 @@ class ChartTests(unittest.TestCase):
         image = Image.open(path).convert("RGB")
         extrema = image.getextrema()
         self.assertTrue(any(low < high for low, high in extrema), "PNG must not be blank")
+
+    def test_empty_history_does_not_claim_a_chart(self):
+        generated = generate_environment_chart(
+            _Supabase([]), "2026-07-14",
+            output_path=os.path.join(tempfile.gettempdir(), "should_not_exist.png"))
+        self.assertIsNone(generated)
 
 
 if __name__ == "__main__":

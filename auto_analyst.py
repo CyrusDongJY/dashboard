@@ -138,12 +138,18 @@ def send_email(subject, ai_report, raw_data_feed, raw_appendix, image_path=None)
     
     full_content = f"{ai_report}\n\n" + "="*50 + f"\n\n【机密附件一：探针异常报警清单】\n{raw_data_feed}\n\n" + "="*50 + f"\n\n{raw_appendix}"
     msg.attach(MIMEText(full_content, 'plain', 'utf-8'))
-    if image_path and os.path.exists(image_path):
-        with open(image_path, 'rb') as image_file:
-            image = MIMEImage(image_file.read(), _subtype='png')
-        image.add_header('Content-Disposition', 'attachment',
-                         filename=os.path.basename(image_path))
-        msg.attach(image)
+    if image_path:
+        if os.path.isfile(image_path) and os.path.getsize(image_path) > 0:
+            with open(image_path, 'rb') as image_file:
+                image = MIMEImage(image_file.read(), _subtype='png')
+            image.add_header('Content-Disposition', 'attachment',
+                             filename=os.path.basename(image_path))
+            msg.attach(image)
+            logging.info(
+                f"📎 环境影子图已加入邮件附件: {image_path} "
+                f"({os.path.getsize(image_path) / 1024:.1f} KB)")
+        else:
+            logging.warning(f"⚠️ 环境影子图附件不存在或为空，邮件将无图发送: {image_path}")
     
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15)
@@ -151,8 +157,10 @@ def send_email(subject, ai_report, raw_data_feed, raw_appendix, image_path=None)
         server.sendmail(cfg.SENDER_EMAIL, [cfg.RECEIVER_EMAIL], msg.as_string())
         server.quit()
         logging.info("✅ 终极复盘战报(带全息附录)已送达！")
+        return True
     except Exception as e:
         logging.error(f"❌ 邮件发送失败: {e}")
+        return False
 
 if __name__ == "__main__":
     logging.info(">>> 启动 V9.1 全域量化盘后复盘流水线 (异常矩阵 + 环境影子图) <<<")
@@ -196,16 +204,32 @@ if __name__ == "__main__":
 
     # 环境指数严格处于影子模式：只进入文本附录和PNG，不接入告警门控或AI判定。
     environment_text = "=== 环境指数（影子观察） ===\n本日计算失败或数据不足。"
-    environment_chart = None
     try:
         environment = compute_indices(
             supabase, report_date=report_date, persist=True,
             events=anomaly_events, session="EOD")
         environment_text = format_env_summary(environment)
-        environment_chart = generate_environment_chart(supabase, report_date)
-        logging.info("✅ 环境影子报告生成完成（不参与预警）")
     except Exception as e:
-        logging.warning(f"环境影子报告降级为无图模式: {e}")
+        logging.warning(f"⚠️ 环境指数计算失败，文本摘要降级: {e}")
+
+    environment_chart = None
+    report_dir = os.path.expanduser(
+        getattr(cfg, "REPORT_DIR", os.path.join(CONFIG_DIR, "reports")))
+    chart_output_path = os.path.join(
+        report_dir, f"environment_shadow_{report_date}.png")
+    try:
+        environment_chart = generate_environment_chart(
+            supabase, report_date, output_path=chart_output_path)
+        if environment_chart and os.path.isfile(environment_chart):
+            logging.info(
+                f"✅ 环境影子图已生成并持久化: {environment_chart} "
+                f"({os.path.getsize(environment_chart) / 1024:.1f} KB，不参与预警)")
+        else:
+            environment_chart = None
+            logging.warning("⚠️ 环境影子图未生成：metric_daily 历史数据为空")
+    except Exception as e:
+        environment_chart = None
+        logging.warning(f"⚠️ 环境影子图生成失败，邮件降级为无图模式: {e}")
 
     logging.info("📡 唤醒三大联邦探针...")
     macro_text, macro_alert, macro_raw = scan_macro_regime(supabase, cutoff_date)
@@ -224,6 +248,9 @@ if __name__ == "__main__":
     raw_appendix = f"{environment_text}\n\n" + "="*50 + f"\n\n{raw_appendix}"
     
     logging.info("🚀 推送最终战报...")
-    send_email(f"🚨 机构级全域交叉复盘 (V9.1 影子环境监测) [{report_date}]",
-               ai_report, raw_data_feed, raw_appendix, image_path=environment_chart)
+    email_sent = send_email(
+        f"🚨 机构级全域交叉复盘 (V9.1 影子环境监测) [{report_date}]",
+        ai_report, raw_data_feed, raw_appendix, image_path=environment_chart)
+    if not email_sent:
+        logging.warning("⚠️ 复盘数据已完成入库，但邮件投递失败，请检查SMTP日志。")
     logging.info(">>> 流水线执行完毕，司令部休眠 <<<")
