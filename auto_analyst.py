@@ -123,11 +123,18 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
         sym = stock.get('ticker', 'UNKNOWN')
         appendix += f"[{sym}]: "
         details = []
-        if stock.get('current_price'): details.append(f"现价 ${stock['current_price']:.2f}")
+        pre_ref = stock.get('premarket_reference_price', stock.get('current_price'))
+        if pre_ref:
+            source = stock.get('premarket_price_source', '兼容字段')
+            details.append(f"盘前参考价 ${pre_ref:.2f} ({source})")
+        if stock.get('previous_close'):
+            details.append(f"昨收 ${stock['previous_close']:.2f}")
         if stock.get('poc_price'): details.append(f"POC ${stock['poc_price']:.2f}")
         if stock.get('dpsv_pct'): details.append(f"FINRA短售量代理 {stock['dpsv_pct']}%")
         if stock.get('ivr_pct'): details.append(f"IVR {stock['ivr_pct']}%")
-        if stock.get('zgl_price'): details.append(f"ZGL分水岭 ${stock['zgl_price']:.2f}")
+        gamma_flip = stock.get('gamma_flip_all', stock.get('zgl_price'))
+        if gamma_flip:
+            details.append(f"主Gamma Flip观察位 ${gamma_flip:.2f}")
         if stock.get('charm_m'): details.append(f"Charm推力 {stock['charm_m']}M")
         appendix += " | ".join(details) + "\n"
         

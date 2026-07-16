@@ -3,6 +3,18 @@
 本次升级把系统从"探针文本战报"升级为"客观异常矩阵"：同一指标看 1D/5D/21D/63D
 观察窗口，以 252 个交易日为统计基准，跨指标做共振判定，并按数据新鲜度加权置信度。
 
+盘前期权模块同时升级为明确的数据契约：
+
+- 昨收、盘前成交、Bid/Ask/Mid、期货映射参考价分别存储，禁止混称"当前现价"；
+- Expected Move 优先ATM跨式双边中间价，回退ATM IV公式，失败写NULL并登记质量告警；
+- Gamma按0DTE、1—7日、8—30日、31—60日和全采样期限分别计算；
+  为满足IBKR行情订阅节流，每个桶选择代表性到期日和现价附近31档，
+  报告与数据库会保存真实采样到期日/合约数，不把采样结果冒充完整全链；
+- Gamma Flip来自现货情景网格的真实零交叉，不再用单执行价差额最小点冒充；
+- 最大OI附到期日、OI、Delta、美元Gamma和距参考价百分比；
+- 同一Call/Put墙改为Pin候选位或负Gamma突破枢轴；
+- OI PCR统一命名为"Put/Call持仓结构比"，不再解释为真实多空。
+
 ## 一、部署步骤（按顺序）
 
 1. **执行数据库迁移**：在 Supabase SQL Editor 中运行 [migrations.sql](migrations.sql)。
@@ -14,6 +26,7 @@
    - `metric_daily`（按 PRE/INTRADAY/EOD 分会话的每日全指标快照）
    - `environment_daily`（环境指数影子台账，不参与正式预警）
    - `liquidity_daily`（六柱流动性水位、覆盖率、状态和可解释明细）
+   - `option_gamma_buckets`（盘前Gamma分期限净值、全部零点与实际采样到期日）
    - 现有表补 `source_date` / `as_of_time` / `ingested_at` 三列
 
 2. **部署代码（按目录放对，否则会 ImportError）**：新增的共享模块
@@ -25,6 +38,7 @@
    | 文件 | 动作 |
    |---|---|
    | `market_utils.py` | 新增（**必须**放这里） |
+   | `pre_market_metrics.py` | 新增（盘前纯计算引擎，**必须**放这里） |
    | `anomaly_engine.py` | 新增（**必须**放这里） |
    | `environment_indices.py` | 新增（影子指数，**必须**放这里） |
    | `environment_report.py` | 新增（盘后PNG，**必须**放这里） |
@@ -48,7 +62,7 @@
    **📁 `~/TradingRadar/`**
    | 文件 | 动作 |
    |---|---|
-   | `ib_intraday_sniper.py` | 覆盖 —— 仅改查询表名，无新依赖 |
+   | `ib_intraday_sniper.py` | 覆盖 —— 读取明确盘前字段，Gamma Flip默认仅观察，无新依赖 |
 
    新增哨兵 `market_sentinel.py` 放 **`~/market_dashboard/`**（它 import
    `anomaly_engine` / `market_utils`，与共享模块同目录最省事）。
@@ -56,7 +70,7 @@
    ⚠️ **最易犯的错**：把 `market_utils.py` / `anomaly_engine.py` 复制到了 `quant_bot`
    或 `TradingRadar`。那样 `auto_analyst` 可能侥幸能跑（同目录），但
    `daily_pre_market` / `daily_post_close` 会 `ModuleNotFoundError`。
-   **这两个新模块只保留 `~/market_dashboard/` 一份。**
+   `pre_market_metrics.py` 同样只保留在 `~/market_dashboard/`。
 
 3. **cron 调整**：时间/路径/参数基本不变，只建议一处——
    把 `auto_analyst` 从 `16:35` 挪到 `16:45`。原因：升级后 `auto_review`（16:30）
@@ -86,6 +100,10 @@
    # ① 先在 Supabase SQL Editor 执行 migrations.sql
 
    # ② 盘前脚本（trading_venv）
+   PYTHONPATH=/home/winters_dong426/market_dashboard \
+       /home/winters_dong426/trading_venv/bin/python3 \
+       /home/winters_dong426/market_dashboard/tests/test_pre_market_metrics.py -v
+
    /home/winters_dong426/trading_venv/bin/python3 \
        /home/winters_dong426/market_dashboard/daily_pre_market.py now
 

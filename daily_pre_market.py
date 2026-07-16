@@ -19,7 +19,22 @@ import pandas_market_calendars as mcal
 
 from market_utils import (
     attach_metadata, safe_upsert, log_data_quality,
-    find_missing_fields, lag_trading_days,
+    lag_trading_days,
+)
+from pre_market_metrics import (
+    GAMMA_BUCKETS,
+    calc_delta_gamma,
+    calc_vanna_charm,
+    distance_pct,
+    expected_move_metrics,
+    finite_number,
+    gamma_structure,
+    implied_volatility,
+    max_oi_metrics,
+    put_call_oi_ratio,
+    quote_midpoint,
+    select_expirations,
+    time_to_expiry_years,
 )
 
 # ================= 🔐 安全挂载全局金库 =================
@@ -37,8 +52,14 @@ except ImportError:
 NY_TZ = pytz.timezone('America/New_York')
 BATCH_SIZE = 50
 SLEEP_SHORT = 2
-SLEEP_LONG = 6
+SLEEP_LONG = 4
 DB_MAX_RETRIES = 3 # 数据库最大重试次数
+MAX_GAMMA_DTE = int(getattr(cfg, "MAX_GAMMA_DTE", 60))
+MAX_STRIKES = 31
+FUTURES_MAP = {
+    'SPY': ('ES', 'CME'),
+    'QQQ': ('NQ', 'CME'),
+}
 
 SYMBOLS = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'ORCL']
 
@@ -105,59 +126,216 @@ def _safe_market_price(ticker):
     except Exception:
         return None
 
-# ================= 华尔街级手搓期权核算引擎 (Black-Scholes) =================
-def norm_cdf(x):
-    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-def norm_pdf(x):
-    return math.exp(-x**2 / 2.0) / math.sqrt(2 * math.pi)
+def _bar_timestamp(value):
+    try:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            return timestamp.tz_localize(NY_TZ)
+        return timestamp.tz_convert(NY_TZ)
+    except Exception:
+        return None
 
-def bs_price(S, K, T, r, sigma, opt_type):
-    if T <= 0 or sigma <= 0: return 0.0
-    d1 = (math.log(S / K) + (r + sigma**2 / 2.0) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    if opt_type == 'C': return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
-    else: return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
 
-def bs_vega(S, K, T, r, sigma):
-    if T <= 0 or sigma <= 0: return 0.0
-    d1 = (math.log(S / K) + (r + sigma**2 / 2.0) * T) / (sigma * math.sqrt(T))
-    return S * norm_pdf(d1) * math.sqrt(T)
+def _historical_price_snapshot(contract, ny_now):
+    previous_close = None
+    previous_close_date = None
+    premarket_last = None
+    premarket_last_time = None
+    try:
+        daily_bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='5 D', barSizeSetting='1 day',
+            whatToShow='TRADES', useRTH=True, formatDate=2)
+        for bar in reversed(daily_bars or []):
+            timestamp = _bar_timestamp(bar.date)
+            if timestamp is not None and timestamp.date() < ny_now.date():
+                previous_close = finite_number(bar.close, positive=True)
+                previous_close_date = timestamp.date().isoformat()
+                break
+    except Exception as e:
+        logger.warning(f"{contract.symbol} 昨收获取失败: {e}")
 
-def implied_volatility(target_price, S, K, T, r, opt_type):
-    if target_price <= 0: return 0.001
-    if opt_type == 'C' and target_price < (S - K * math.exp(-r*T)): return 0.001
-    if opt_type == 'P' and target_price < (K * math.exp(-r*T) - S): return 0.001
+    try:
+        intraday_bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='1 D', barSizeSetting='1 min',
+            whatToShow='TRADES', useRTH=False, formatDate=2)
+        candidates = []
+        for bar in intraday_bars or []:
+            timestamp = _bar_timestamp(bar.date)
+            if (
+                timestamp is not None
+                and timestamp.date() == ny_now.date()
+                and timestamp.time() < datetime.strptime("09:30", "%H:%M").time()
+            ):
+                candidates.append((timestamp, finite_number(bar.close, positive=True)))
+        candidates = [item for item in candidates if item[1] is not None]
+        if candidates:
+            premarket_last_time, premarket_last = candidates[-1]
+    except Exception as e:
+        logger.warning(f"{contract.symbol} 盘前成交获取失败: {e}")
+    return {
+        "previous_close": previous_close,
+        "previous_close_date": previous_close_date,
+        "premarket_last": premarket_last,
+        "premarket_last_time": (
+            premarket_last_time.astimezone(timezone.utc).isoformat()
+            if premarket_last_time is not None else None
+        ),
+    }
 
-    sigma = 0.5 
-    for _ in range(50): 
-        price = bs_price(S, K, T, r, sigma, opt_type)
-        diff = price - target_price
-        if abs(diff) < 1e-4: return sigma
-        vega = bs_vega(S, K, T, r, sigma)
-        if vega < 1e-6: 
-            sigma = 0.001 if diff > 0 else 2.0
-            break
-        sigma -= diff / vega
-        if sigma < 0.001: sigma = 0.001
-        if sigma > 3.0: sigma = 3.0
-    return sigma
 
-def calc_delta_gamma(S, K, T, r, sigma, opt_type):
-    if T <= 0 or sigma <= 0: return 0.0, 0.0
-    d1 = (math.log(S / K) + (r + sigma**2 / 2.0) * T) / (sigma * math.sqrt(T))
-    gamma = norm_pdf(d1) / (S * sigma * math.sqrt(T))
-    delta = norm_cdf(d1) if opt_type == 'C' else norm_cdf(d1) - 1.0
-    return delta, gamma
+def _streaming_quote(contract):
+    preferred = int(getattr(cfg, "IB_MARKET_DATA_TYPE", 1))
+    result = {
+        "bid": None, "ask": None, "last": None,
+        "market_data_type": None, "quote_as_of": None,
+    }
+    # Always try a current quote before delayed/frozen fallbacks, even if an old
+    # deployment still has IB_MARKET_DATA_TYPE=4 in its configuration.
+    for requested_type in dict.fromkeys((1, 3, preferred, 4)):
+        ticker = None
+        try:
+            ib.reqMarketDataType(requested_type)
+            ticker = ib.reqMktData(contract, '233', False, False)
+            ib.sleep(SLEEP_SHORT)
+            actual_type = int(
+                finite_number(getattr(ticker, "marketDataType", requested_type))
+                or requested_type)
+            bid = finite_number(getattr(ticker, "bid", None), positive=True)
+            ask = finite_number(getattr(ticker, "ask", None), positive=True)
+            last = finite_number(getattr(ticker, "last", None), positive=True)
+            result.update({
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "market_data_type": actual_type,
+                "quote_as_of": datetime.now(timezone.utc).isoformat(),
+            })
+            if bid is not None or ask is not None or (
+                last is not None and actual_type in (1, 3)
+            ):
+                break
+        except Exception as e:
+            logger.debug(f"{contract.symbol} 行情类型{requested_type}不可用: {e}")
+        finally:
+            if ticker is not None:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:
+                    pass
+    return result
 
-def calc_vanna_charm(S, K, T, r, sigma):
-    if T <= 0 or sigma <= 0.001 or S <= 0 or K <= 0: return 0, 0
-    d1 = (math.log(S / K) + (r + sigma**2 / 2.0) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    pdf_d1 = norm_pdf(d1)
-    vanna = -pdf_d1 * (d2 / sigma)
-    charm = -pdf_d1 * ((r / (sigma * math.sqrt(T))) - (d2 / (2 * T)))
-    return vanna, charm
+
+def get_price_snapshot(contract, ny_now):
+    historical = _historical_price_snapshot(contract, ny_now)
+    quote = _streaming_quote(contract)
+    market_type = quote.get("market_data_type")
+    bid = quote.get("bid") if market_type in (1, 3) else None
+    ask = quote.get("ask") if market_type in (1, 3) else None
+    midpoint = quote_midpoint(bid, ask)
+    premarket_last = historical.get("premarket_last")
+    premarket_last_as_of = historical.get("premarket_last_time")
+    if premarket_last is None and market_type in (1, 3):
+        premarket_last = quote.get("last")
+        premarket_last_as_of = quote.get("quote_as_of")
+    reference = midpoint or premarket_last or historical.get("previous_close")
+    if midpoint is not None:
+        source = "PREMARKET_MID"
+    elif premarket_last is not None:
+        source = "PREMARKET_LAST"
+    elif historical.get("previous_close") is not None:
+        source = "PREVIOUS_CLOSE_FALLBACK"
+    else:
+        source = "MISSING"
+    if source == "PREMARKET_MID":
+        reference_as_of = quote.get("quote_as_of")
+    elif source == "PREMARKET_LAST":
+        reference_as_of = premarket_last_as_of
+    else:
+        reference_as_of = None
+    return {
+        **historical,
+        "premarket_last": premarket_last,
+        "premarket_bid": bid,
+        "premarket_ask": ask,
+        "premarket_mid": midpoint,
+        "reference_price": reference,
+        "price_source": source,
+        "market_data_type": market_type,
+        "quote_as_of": reference_as_of,
+    }
+
+
+def get_futures_implied_reference(symbol, previous_close, ny_now):
+    mapping = FUTURES_MAP.get(symbol)
+    previous_close = finite_number(previous_close, positive=True)
+    if mapping is None or previous_close is None:
+        return {"symbol": None, "price": None, "as_of": None}
+    root, exchange = mapping
+    try:
+        details = ib.reqContractDetails(Future(root, '', exchange, currency='USD'))
+        candidates = []
+        for detail in details or []:
+            expiration = str(
+                getattr(detail.contract, "lastTradeDateOrContractMonth", ""))[:8]
+            if expiration and expiration >= ny_now.strftime("%Y%m%d"):
+                candidates.append((expiration, detail.contract))
+        if not candidates:
+            return {"symbol": root, "price": None, "as_of": None}
+        roll_guard = (ny_now.date() + timedelta(days=5)).strftime("%Y%m%d")
+        guarded = [item for item in candidates if item[0] > roll_guard]
+        contract = sorted(guarded or candidates, key=lambda item: item[0])[0][1]
+        bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='5 D', barSizeSetting='5 mins',
+            whatToShow='TRADES', useRTH=False, formatDate=2)
+        by_date = {}
+        for bar in bars or []:
+            timestamp = _bar_timestamp(bar.date)
+            price = finite_number(bar.close, positive=True)
+            if timestamp is not None and price is not None:
+                by_date.setdefault(timestamp.date(), []).append((timestamp, price))
+        current = by_date.get(ny_now.date(), [])
+        prior_dates = sorted(day for day in by_date if day < ny_now.date())
+        if not current or not prior_dates:
+            return {"symbol": contract.localSymbol or root, "price": None, "as_of": None}
+        current_time, futures_now = current[-1]
+        futures_previous = by_date[prior_dates[-1]][-1][1]
+        implied = previous_close * futures_now / futures_previous
+        return {
+            "symbol": contract.localSymbol or root,
+            "price": implied,
+            "as_of": current_time.astimezone(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.warning(f"{symbol} 期货映射参考价获取失败: {e}")
+        return {"symbol": root, "price": None, "as_of": None}
+
+
+def get_previous_premarket_record(symbol, report_date):
+    try:
+        response = (
+            supabase.table("stock_options_pre_market")
+            .select("*")
+            .eq("ticker", symbol)
+            .lt("date", report_date)
+            .order("date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return response.data[0] if response.data else None
+    except Exception as e:
+        logger.debug(f"{symbol} 前一盘前快照读取失败: {e}")
+        return None
+
+
+def _fmt(value, digits=2, prefix=""):
+    value = finite_number(value)
+    return f"{prefix}{value:.{digits}f}" if value is not None else "NA"
+
+
+def _round_or_none(value, digits=4):
+    value = finite_number(value)
+    return round(value, digits) if value is not None else None
 
 # ================= 辅助工具与守卫模块 =================
 def send_email(subject, body):
@@ -269,6 +447,7 @@ def get_report():
         ib.reqMarketDataType(4)
 
         rows_written = 0  # 数据质量审计：成功入库的标的数
+        quality_issues = []
 
         # 模块一：宏观数据
         report += get_gex_dix()
@@ -302,13 +481,38 @@ def get_report():
                 report += f"⚠️ 无法获取 {sym} 合约信息。\n"
                 continue
             stock = stock_contracts[0]
-            
-            bars = ib.reqHistoricalData(stock, endDateTime='', durationStr='1 D', barSizeSetting='1 day', whatToShow='TRADES', useRTH=True)
-            if not bars: 
-                report += f"⚠️ 无法获取 {sym} 现价。\n"
+
+            price_snapshot = get_price_snapshot(stock, ny_now)
+            curr_price = price_snapshot.get("reference_price")
+            if curr_price is None:
+                report += f"⚠️ 无法获取 {sym} 昨收或盘前有效报价。\n"
+                quality_issues.append(f"price:{sym}")
                 continue
-            curr_price = bars[-1].close
-            report += f"📌 当前现价: ${curr_price:.2f}\n"
+            futures_ref = get_futures_implied_reference(
+                sym, price_snapshot.get("previous_close"), ny_now)
+            market_type = price_snapshot.get("market_data_type")
+            market_label = {
+                1: "实时", 2: "冻结", 3: "延迟", 4: "延迟冻结",
+            }.get(market_type, "未知")
+            report += (
+                f"📌 上一日正式收盘: {_fmt(price_snapshot.get('previous_close'), prefix='$')}"
+                f" ({price_snapshot.get('previous_close_date') or 'NA'})\n"
+                f"⏱️ 盘前最新成交: {_fmt(price_snapshot.get('premarket_last'), prefix='$')}\n"
+                f"📖 盘前Bid/Ask/Mid: "
+                f"{_fmt(price_snapshot.get('premarket_bid'), prefix='$')} / "
+                f"{_fmt(price_snapshot.get('premarket_ask'), prefix='$')} / "
+                f"{_fmt(price_snapshot.get('premarket_mid'), prefix='$')}\n"
+                f"🧭 期货映射参考: {_fmt(futures_ref.get('price'), prefix='$')}"
+                f" ({futures_ref.get('symbol') or '不适用'})\n"
+                f"🎯 期权测算参考价: ${curr_price:.2f}"
+                f" ({price_snapshot.get('price_source')}，行情={market_label})\n"
+            )
+            if price_snapshot.get("price_source") == "PREVIOUS_CLOSE_FALLBACK":
+                quality_issues.append(f"premarket_quote:{sym}")
+            elif market_type != 1:
+                quality_issues.append(f"premarket_not_live:{sym}")
+            if sym in FUTURES_MAP and futures_ref.get("price") is None:
+                quality_issues.append(f"futures_ref:{sym}")
             
             chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
             if not chains:
@@ -321,28 +525,32 @@ def get_report():
                 report += "⚠️ 期权链数据缺失。\n"
                 continue
             
-            valid_exps = []
-            for exp in sorted(chain.expirations):
-                try:
-                    exp_date = datetime.strptime(exp, '%Y%m%d').date()
-                    if (exp_date - ny_today_date).days >= 0:
-                        valid_exps.append(exp)
-                except: pass
-                
-            if not valid_exps: 
+            target_exps, expiration_coverage = select_expirations(
+                chain.expirations, ny_today_date, horizon_days=MAX_GAMMA_DTE)
+            if not target_exps:
                 report += "⚠️ 无有效未到期合约。\n"
+                quality_issues.append(f"expirations:{sym}")
                 continue
-            
-            short_exp = valid_exps[0]
-            long_exp = next((exp for exp in valid_exps if 15 <= (datetime.strptime(exp, '%Y%m%d').date() - ny_today_date).days <= 45), valid_exps[-1])
-            target_exps = list(set([short_exp, long_exp]))
+            short_exp = target_exps[0]
+            report += (
+                "🗓️ Gamma采样到期日: "
+                + ", ".join(
+                    f"{bucket}={','.join(values) if values else '无'}"
+                    for bucket, values in expiration_coverage.items())
+                + f"；最长{MAX_GAMMA_DTE}日\n"
+            )
 
-            valid_strikes = sorted([s for s in list(chain.strikes) if s % 0.5 == 0])
+            valid_strikes = sorted(
+                s for s in chain.strikes
+                if finite_number(s, positive=True) is not None
+                and curr_price * 0.80 <= float(s) <= curr_price * 1.20)
             if not valid_strikes: continue
-            
             closest_strike = min(valid_strikes, key=lambda x: abs(x - curr_price))
             closest_idx = valid_strikes.index(closest_strike)
-            target_strikes = valid_strikes[max(0, closest_idx - 25):min(len(valid_strikes), closest_idx + 26)]
+            half_window = MAX_STRIKES // 2
+            target_strikes = valid_strikes[
+                max(0, closest_idx - half_window):
+                min(len(valid_strikes), closest_idx + half_window + 1)]
             
             opts = [Option(sym, exp, s, r, 'SMART', tradingClass=getattr(chain, 'tradingClass', None)) for exp in target_exps for s in target_strikes for r in ['C', 'P']]
             try: contracts = ib.qualifyContracts(*opts)
@@ -361,65 +569,63 @@ def get_report():
                         if not r: continue
                         
                         oi = getattr(t, 'callOpenInterest' if r == 'C' else 'putOpenInterest', getattr(t, 'openInterest', 0))
-                        if oi is None or (isinstance(oi, float) and math.isnan(oi)): oi = 0
-                        
-                        if oi > 0:
-                            price = _safe_market_price(t)
-                            if price is not None and price > 0:
-                                s = t.contract.strike
-                                exp_date_str = t.contract.lastTradeDateOrContractMonth
-                                exp_date_obj = datetime.strptime(exp_date_str, '%Y%m%d').date()
-                                dte_days = (exp_date_obj - ny_today_date).days
-                                T = max(dte_days / 365.0, 0.002) 
+                        oi = finite_number(oi, positive=True)
+                        if oi is None:
+                            continue
+                        s = float(t.contract.strike)
+                        exp_date_str = t.contract.lastTradeDateOrContractMonth[:8]
+                        exp_date_obj = datetime.strptime(exp_date_str, '%Y%m%d').date()
+                        dte_days = (exp_date_obj - ny_today_date).days
+                        years = time_to_expiry_years(exp_date_str, ny_now)
+                        if years is None:
+                            continue
+                        bid = finite_number(getattr(t, "bid", None), positive=True)
+                        ask = finite_number(getattr(t, "ask", None), positive=True)
+                        mid = quote_midpoint(bid, ask)
+                        last = finite_number(getattr(t, "last", None), positive=True)
+                        option_price = mid or last
+                        model_greeks = getattr(t, "modelGreeks", None)
+                        model_iv = finite_number(
+                            getattr(model_greeks, "impliedVol", None), positive=True)
+                        iv = (
+                            model_iv if model_iv is not None and model_iv <= 4.0
+                            else implied_volatility(
+                                option_price, curr_price, s, years, 0.053, r)
+                        )
+                        delta, gamma = (None, None)
+                        vanna, charm = (None, None)
+                        if iv is not None:
+                            delta, gamma = calc_delta_gamma(
+                                curr_price, s, years, 0.053, iv, r)
+                            vanna, charm = calc_vanna_charm(
+                                curr_price, s, years, 0.053, iv)
+                        if r == 'P':
+                            vanna = -vanna if vanna is not None else None
+                            charm = -charm if charm is not None else None
+                        rows.append({
+                            'Exp': exp_date_str, 'S': s, 'R': r, 'OI': oi,
+                            'Bid': bid, 'Ask': ask, 'Mid': mid, 'Last': last,
+                            'IV': iv, 'Delta': delta, 'T': years, 'DTE': dte_days,
+                            'Vanna_W': (
+                                oi * vanna * 0.01 * 100 if vanna is not None else None),
+                            'Charm_W': (
+                                oi * charm / 365.0 * 100 if charm is not None else None),
+                        })
                                 
-                                iv = implied_volatility(price, curr_price, s, T, 0.053, r)
-                                delta, gamma = calc_delta_gamma(curr_price, s, T, 0.053, iv, r)
-                                v, c = calc_vanna_charm(curr_price, s, T, 0.053, iv)
-                                if r == 'P': v, c = -v, -c
-                                
-                                v_per_1pct = v * 0.01
-                                c_per_day = c / 365.0
-                                
-                                gamma_shares = oi * gamma * 100
-                                vanna_shares = oi * v_per_1pct * 100
-                                charm_shares = oi * c_per_day * 100
-                                
-                                rows.append({
-                                    'Exp': exp_date_str, 'S': s, 'R': r, 'OI': oi, 'Price': price,
-                                    'IV': iv, 'Delta': delta, 'Gamma_W': gamma_shares, 
-                                    'Vanna_W': vanna_shares, 'Charm_W': charm_shares
-                                })
-                                
-                ib.sleep(SLEEP_SHORT)
+                ib.sleep(0.5)
             
             if rows:
                 df = pd.DataFrame(rows)
+                expected_move = expected_move_metrics(df, curr_price, short_exp)
+                if expected_move["quality"] == "MISSING":
+                    quality_issues.append(f"expected_move:{sym}")
+                oi_pcr = put_call_oi_ratio(df)
+                if oi_pcr is None:
+                    quality_issues.append(f"oi_pcr:{sym}")
+                max_oi = max_oi_metrics(df, curr_price)
+                gamma = gamma_structure(df, curr_price)
                 
-                max_oi_strike, max_oi_type = None, None
-                if not df.empty and df['OI'].sum() > 0:
-                    max_oi_idx = df['OI'].idxmax()
-                    max_oi_row = df.loc[max_oi_idx]
-                    max_oi_strike = float(max_oi_row['S'])
-                    max_oi_type = str(max_oi_row['R'])
-
-                expected_move_pct = 0.0
-                expected_move = 0.0
-                if not df.empty:
-                    atm_strike = min(df['S'].unique(), key=lambda x: abs(x - curr_price))
-                    atm_call = df[(df['S'] == atm_strike) & (df['R'] == 'C') & (df['Exp'] == short_exp)]
-                    atm_put = df[(df['S'] == atm_strike) & (df['R'] == 'P') & (df['Exp'] == short_exp)]
-                    atm_call_px = atm_call['Price'].mean() if not atm_call.empty else 0
-                    atm_put_px = atm_put['Price'].mean() if not atm_put.empty else 0
-                    if pd.isna(atm_call_px): atm_call_px = 0
-                    if pd.isna(atm_put_px): atm_put_px = 0
-                    expected_move = atm_call_px + atm_put_px
-                    expected_move_pct = (expected_move / curr_price) * 100 if curr_price > 0 else 0
-
-                total_call_oi = df[df['R']=='C']['OI'].sum()
-                total_put_oi = df[df['R']=='P']['OI'].sum()
-                oi_pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-                
-                iv_skew = 0
+                iv_skew = None
                 calls = df[(df['R']=='C') & (df['Delta'] > 0)].dropna(subset=['IV', 'Delta'])
                 puts = df[(df['R']=='P') & (df['Delta'] < 0)].dropna(subset=['IV', 'Delta'])
                 if not calls.empty and not puts.empty:
@@ -427,46 +633,200 @@ def get_report():
                     put_25 = puts.iloc[(puts['Delta'] - (-0.25)).abs().argsort()[:1]]
                     if not call_25.empty and not put_25.empty:
                         put_iv, call_iv = put_25['IV'].values[0], call_25['IV'].values[0]
-                        if put_iv > 0 and call_iv > 0: iv_skew = put_iv - call_iv
+                        if put_iv > 0 and call_iv > 0:
+                            iv_skew = put_iv - call_iv
 
-                df_short = df[df['Exp'] == short_exp]
-                df_long = df[df['Exp'] == long_exp]
-                
-                short_net_gamma = df_short[df_short['R']=='C'].groupby('S')['Gamma_W'].sum().add(-df_short[df_short['R']=='P'].groupby('S')['Gamma_W'].sum(), fill_value=0).dropna()
-                long_net_gamma = df_long[df_long['R']=='C'].groupby('S')['Gamma_W'].sum().add(-df_long[df_long['R']=='P'].groupby('S')['Gamma_W'].sum(), fill_value=0).dropna()
-                
-                short_gamma_total = short_net_gamma.sum() / 1e6
-                long_gamma_total = long_net_gamma.sum() / 1e6
-                
-                zgl_strike = float(short_net_gamma.abs().idxmin()) if not short_net_gamma.empty else 0.0
-                
-                calls_s = df_short[df_short['R']=='C'].sort_values('Gamma_W', ascending=False)
-                puts_s = df_short[df_short['R']=='P'].sort_values('Gamma_W', ascending=False)
-                call_w = float(calls_s.iloc[0]['S']) if not calls_s.empty else None
-                put_w = float(puts_s.iloc[0]['S']) if not puts_s.empty else None
-                
-                vanna_m = df_short['Vanna_W'].sum() / 1e6
-                charm_m = df_short['Charm_W'].sum() / 1e6
-                
-                report += f"⚖️ OI PCR (隔夜真实多空比): {oi_pcr:.2f}\n"
-                report += f"📉 IV Skew (恐慌指数偏斜): {iv_skew*100:+.2f}%\n"
-                report += f"📏 预期振幅 (Expected Move): ±${expected_move:.2f} (±{expected_move_pct:.2f}%)\n"
-                report += f"⚔️ 资金主战场 (最大OI): ${max_oi_strike} {'看涨(Call)' if max_oi_type == 'C' else '看跌(Put)'}\n" 
-                report += f"🧱 短期防线 ({short_exp}): Call 墙 ${call_w} / Put 墙 ${put_w}\n"
-                report += f"🌊 短期净 Gamma ({short_exp}): {short_gamma_total:+.2f} M\n"
-                report += f"🌊 中长波段净 Gamma ({long_exp}): {long_gamma_total:+.2f} M\n"
-                report += f"🧲 零伽马分水岭 (ZGL): ${zgl_strike:.2f}\n"
-                report += f"🌪️ 做市商动态对冲: Vanna {vanna_m:+.2f} M | Charm {charm_m:+.2f} M/天\n"
+                near = df[df["DTE"] <= 7]
+                vanna_m = pd.to_numeric(
+                    near.get('Vanna_W'), errors='coerce').sum(min_count=1) / 1e6
+                charm_m = pd.to_numeric(
+                    near.get('Charm_W'), errors='coerce').sum(min_count=1) / 1e6
+                short_values = [
+                    gamma[bucket]["net_gamma_m"] for bucket in ("0DTE", "1-7D")
+                    if gamma[bucket]["net_gamma_m"] is not None
+                ]
+                short_gamma_total = sum(short_values) if short_values else None
+                long_gamma_total = gamma["8-30D"]["net_gamma_m"]
+                zgl_strike = gamma["ALL"]["primary_flip"]
+                call_w, put_w = gamma["call_wall"], gamma["put_wall"]
+                gamma_expirations = {
+                    bucket: gamma[bucket]["expirations"] for bucket in GAMMA_BUCKETS
+                }
+                previous_context = get_previous_premarket_record(sym, today_str)
+                previous_flip = None
+                gamma_flip_change_pct = None
+                gamma_roll_changed = None
+                gamma_flip_quality = (
+                    "NO_CROSSING" if zgl_strike is None else "BASELINE_RESET"
+                )
+                if previous_context:
+                    previous_flip = finite_number(
+                        previous_context.get(
+                            "gamma_flip_all", previous_context.get("zgl_price")),
+                        positive=True)
+                    previous_model = previous_context.get("gamma_sign_model")
+                    previous_expirations = previous_context.get("gamma_expirations")
+                    gamma_roll_changed = (
+                        previous_expirations != gamma_expirations
+                        if previous_expirations is not None else None)
+                    if (
+                        zgl_strike is not None and previous_flip is not None
+                        and previous_model == gamma["sign_model"]
+                    ):
+                        gamma_flip_change_pct = (
+                            (zgl_strike - previous_flip) / curr_price * 100.0)
+                        jump_threshold = max(10.0, curr_price * 0.05)
+                        if abs(zgl_strike - previous_flip) >= jump_threshold:
+                            gamma_flip_quality = "JUMP_REVIEW"
+                            quality_issues.append(f"gamma_flip_jump:{sym}")
+                        elif gamma_roll_changed:
+                            gamma_flip_quality = "ROLL_CHANGED"
+                        else:
+                            gamma_flip_quality = "OK"
+                    elif previous_model and previous_model != gamma["sign_model"]:
+                        gamma_flip_quality = "METHOD_CHANGED"
+
+                report += f"⚖️ Put/Call持仓结构比: {_fmt(oi_pcr)}\n"
+                report += f"📉 IV Skew: {_fmt(iv_skew * 100 if iv_skew is not None else None, prefix='')}%\n"
+                report += (
+                    f"📏 预期振幅 ({expected_move['source'] or 'NA'}): "
+                    f"±{_fmt(expected_move['value'], prefix='$')} "
+                    f"(±{_fmt(expected_move['pct'])}%, "
+                    f"DTE={_fmt(expected_move['dte'], digits=3)}, "
+                    f"质量={expected_move['quality']})\n"
+                )
+                report += (
+                    f"📚 本次采样最大OI合约: {_fmt(max_oi['strike'], prefix='$')} "
+                    f"{max_oi['right'] or 'NA'} | 到期={max_oi['expiration'] or 'NA'} "
+                    f"| OI={max_oi['oi'] if max_oi['oi'] is not None else 'NA'} "
+                    f"| Delta={_fmt(max_oi['delta'], digits=3)} "
+                    f"| Gamma美元={_fmt(max_oi['gamma_dollar_m'])}M "
+                    f"| 距参考价={_fmt(max_oi['distance_pct'])}%\n"
+                )
+                if gamma["pin_strike"] is not None:
+                    pin_name = (
+                        "双边Pin候选位" if gamma["pin_state"] == "PIN_CANDIDATE"
+                        else "双边突破枢轴"
+                    )
+                    report += (
+                        f"🧲 {pin_name}: ${gamma['pin_strike']:.2f} "
+                        f"(Call/Put Gamma集中于同一执行价)\n"
+                    )
+                else:
+                    report += (
+                        f"🧱 Gamma加权墙: Call {_fmt(call_w, prefix='$')} "
+                        f"/ Put {_fmt(put_w, prefix='$')}\n"
+                    )
+                bucket_labels = {
+                    "0DTE": "0DTE", "1-7D": "1—7日", "8-30D": "8—30日",
+                    "31-60D": "31—60日",
+                    "ALL": f"全采样期限(≤{MAX_GAMMA_DTE}日)",
+                }
+                for bucket in GAMMA_BUCKETS:
+                    metrics = gamma[bucket]
+                    zero_text = (
+                        ", ".join(f"${value:.2f}" for value in metrics["zero_points"])
+                        if metrics["zero_points"] else "区间内无零点"
+                    )
+                    report += (
+                        f"🌊 {bucket_labels[bucket]} Gamma: "
+                        f"{_fmt(metrics['net_gamma_m'])}M | "
+                        f"主Flip={_fmt(metrics['primary_flip'], prefix='$')} | "
+                        f"全部零点(±20%网格)={zero_text} | "
+                        f"{metrics['expiration_count']}到期/{metrics['contract_count']}合约\n"
+                    )
+                if gamma_flip_quality == "JUMP_REVIEW":
+                    report += (
+                        f"⚠️ 主Gamma Flip单日跳变待复核: "
+                        f"{_fmt(previous_flip, prefix='$')} → "
+                        f"{_fmt(zgl_strike, prefix='$')} "
+                        f"({_fmt(gamma_flip_change_pct)}%参考价)；"
+                        f"到期采样变化={gamma_roll_changed}。\n"
+                    )
+                elif gamma_flip_quality in ("ROLL_CHANGED", "METHOD_CHANGED"):
+                    report += (
+                        f"ℹ️ 主Gamma Flip连续性状态: {gamma_flip_quality}；"
+                        "仅作观察，不作为硬交易边界。\n"
+                    )
+                report += (
+                    f"📐 距Call墙/Put墙/主Flip: "
+                    f"{_fmt(distance_pct(call_w, curr_price))}% / "
+                    f"{_fmt(distance_pct(put_w, curr_price))}% / "
+                    f"{_fmt(distance_pct(zgl_strike, curr_price))}%\n"
+                    f"🌪️ 动态对冲代理: Vanna {_fmt(vanna_m)}M | "
+                    f"Charm {_fmt(charm_m)}M/天\n"
+                    f"ℹ️ Gamma符号假设: {gamma['sign_model']}；"
+                    f"OI为隔夜持仓，方向不是实际做市商净仓。\n"
+                )
 
                 try:
                     # ✅ V9.0：写入独立的盘前表 stock_options_pre_market（与盘后现货解耦，避免时点错配）
+                    gamma_zeroes = {
+                        bucket: gamma[bucket]["zero_points"] for bucket in GAMMA_BUCKETS
+                    }
                     payload = {
-                        "date": today_str, "ticker": sym, "current_price": round(curr_price, 2),
-                        "zgl_price": float(zgl_strike), "call_wall": call_w, "put_wall": put_w,
-                        "vanna_m": round(vanna_m, 2), "charm_m": round(charm_m, 2),
-                        "expected_move_pct": round(expected_move_pct, 2),
-                        "max_oi_strike": max_oi_strike, "max_oi_type": max_oi_type,
-                        "iv_skew": round(iv_skew, 4), "short_gamma_m": round(short_gamma_total, 2), "long_gamma_m": round(long_gamma_total, 2), "oi_pcr": round(oi_pcr, 2)
+                        "date": today_str, "ticker": sym,
+                        # 兼容旧下游；新代码必须读取下方明确命名字段。
+                        "current_price": _round_or_none(curr_price, 2),
+                        "previous_close": _round_or_none(price_snapshot.get("previous_close"), 2),
+                        "previous_close_date": price_snapshot.get("previous_close_date"),
+                        "premarket_last": _round_or_none(price_snapshot.get("premarket_last"), 2),
+                        "premarket_bid": _round_or_none(price_snapshot.get("premarket_bid"), 2),
+                        "premarket_ask": _round_or_none(price_snapshot.get("premarket_ask"), 2),
+                        "premarket_mid": _round_or_none(price_snapshot.get("premarket_mid"), 2),
+                        "premarket_reference_price": _round_or_none(curr_price, 2),
+                        "premarket_price_source": price_snapshot.get("price_source"),
+                        "market_data_type": market_type,
+                        "quote_as_of": price_snapshot.get("quote_as_of"),
+                        "futures_symbol": futures_ref.get("symbol"),
+                        "futures_reference_price": _round_or_none(futures_ref.get("price"), 2),
+                        "futures_as_of": futures_ref.get("as_of"),
+                        "zgl_price": _round_or_none(zgl_strike, 4),
+                        "call_wall": _round_or_none(call_w, 4),
+                        "put_wall": _round_or_none(put_w, 4),
+                        "distance_to_call_wall_pct": _round_or_none(distance_pct(call_w, curr_price)),
+                        "distance_to_put_wall_pct": _round_or_none(distance_pct(put_w, curr_price)),
+                        "distance_to_zgl_pct": _round_or_none(distance_pct(zgl_strike, curr_price)),
+                        "pin_strike": _round_or_none(gamma["pin_strike"], 4),
+                        "pin_state": gamma["pin_state"],
+                        "vanna_m": _round_or_none(vanna_m, 4),
+                        "charm_m": _round_or_none(charm_m, 4),
+                        "expected_move_value": _round_or_none(expected_move["value"], 4),
+                        "expected_move_pct": _round_or_none(expected_move["pct"], 4),
+                        "expected_move_source": expected_move["source"],
+                        "expected_move_dte": _round_or_none(expected_move["dte"], 6),
+                        "expected_move_quality": expected_move["quality"],
+                        "max_oi_strike": _round_or_none(max_oi["strike"], 4),
+                        "max_oi_type": max_oi["right"],
+                        "max_oi_expiry": (
+                            datetime.strptime(max_oi["expiration"], "%Y%m%d").date().isoformat()
+                            if max_oi["expiration"] else None),
+                        "max_oi_count": max_oi["oi"],
+                        "max_oi_delta": _round_or_none(max_oi["delta"], 6),
+                        "max_oi_gamma_dollar_m": _round_or_none(max_oi["gamma_dollar_m"], 6),
+                        "max_oi_distance_pct": _round_or_none(max_oi["distance_pct"]),
+                        "iv_skew": _round_or_none(iv_skew, 6),
+                        "short_gamma_m": _round_or_none(short_gamma_total, 6),
+                        "long_gamma_m": _round_or_none(long_gamma_total, 6),
+                        "gamma_0dte_m": _round_or_none(gamma["0DTE"]["net_gamma_m"], 6),
+                        "gamma_1_7d_m": _round_or_none(gamma["1-7D"]["net_gamma_m"], 6),
+                        "gamma_8_30d_m": _round_or_none(gamma["8-30D"]["net_gamma_m"], 6),
+                        "gamma_31_60d_m": _round_or_none(gamma["31-60D"]["net_gamma_m"], 6),
+                        "gamma_all_m": _round_or_none(gamma["ALL"]["net_gamma_m"], 6),
+                        "gamma_flip_0dte": _round_or_none(gamma["0DTE"]["primary_flip"], 4),
+                        "gamma_flip_1_7d": _round_or_none(gamma["1-7D"]["primary_flip"], 4),
+                        "gamma_flip_8_30d": _round_or_none(gamma["8-30D"]["primary_flip"], 4),
+                        "gamma_flip_31_60d": _round_or_none(gamma["31-60D"]["primary_flip"], 4),
+                        "gamma_flip_all": _round_or_none(gamma["ALL"]["primary_flip"], 4),
+                        "gamma_previous_flip": _round_or_none(previous_flip, 4),
+                        "gamma_flip_change_pct": _round_or_none(gamma_flip_change_pct),
+                        "gamma_roll_changed": gamma_roll_changed,
+                        "gamma_flip_quality": gamma_flip_quality,
+                        "gamma_zeroes": gamma_zeroes,
+                        "gamma_expirations": gamma_expirations,
+                        "gamma_sign_model": gamma["sign_model"],
+                        "oi_pcr": _round_or_none(oi_pcr, 6),
+                        "oi_source_date": price_snapshot.get("previous_close_date"),
                     }
 
                     if darkpool_data and sym in darkpool_data:
@@ -475,32 +835,76 @@ def get_report():
                         payload["dpsv_source_date"] = finra_date
 
                     attach_metadata(payload, source_date=today_str)
-                    if safe_upsert(supabase, 'stock_options_pre_market', payload, conflict_cols='date,ticker') is not None:
+                    if price_snapshot.get("quote_as_of"):
+                        payload["as_of_time"] = price_snapshot["quote_as_of"]
+                    main_result = safe_upsert(
+                        supabase, 'stock_options_pre_market', payload,
+                        conflict_cols='date,ticker')
+                    if main_result is not None:
                         rows_written += 1
-                    logger.info(f"✅ [{sym}] 进阶期权阵地数据推送成功！")
+                    else:
+                        quality_issues.append(f"db_main:{sym}")
+                    bucket_rows = []
+                    for bucket in GAMMA_BUCKETS:
+                        metrics = gamma[bucket]
+                        bucket_row = {
+                            "date": today_str, "ticker": sym, "bucket": bucket,
+                            "spot_reference": _round_or_none(curr_price, 4),
+                            "net_gamma_m": _round_or_none(metrics["net_gamma_m"], 6),
+                            "primary_flip": _round_or_none(metrics["primary_flip"], 4),
+                            "zero_points": metrics["zero_points"],
+                            "expirations": metrics["expirations"],
+                            "contract_count": metrics["contract_count"],
+                            "expiration_count": metrics["expiration_count"],
+                            "sign_model": gamma["sign_model"],
+                        }
+                        attach_metadata(
+                            bucket_row,
+                            source_date=price_snapshot.get("previous_close_date") or today_str)
+                        bucket_row["as_of_time"] = (
+                            price_snapshot.get("quote_as_of")
+                            or datetime.now(timezone.utc).isoformat())
+                        bucket_rows.append(bucket_row)
+                    bucket_result = safe_upsert(
+                        supabase, 'option_gamma_buckets', bucket_rows,
+                        conflict_cols='date,ticker,bucket')
+                    if bucket_result is None:
+                        quality_issues.append(f"db_gamma_bucket:{sym}")
+                    if main_result is not None and bucket_result is not None:
+                        logger.info(f"✅ [{sym}] 进阶期权阵地数据推送成功！")
                 except Exception as e:
                     logger.warning(f"⚠️ {sym} 入库异常: {e}")
 
-            else: report += f"⚠️ 冻结期权数据获取失败。\n"
+            else:
+                quality_issues.append(f"option_rows:{sym}")
+                report += f"⚠️ 期权持仓或报价数据获取失败。\n"
 
         report += "\n" + "="*55 + "\n[声明] 轨道二：盘前期权阵地扫描完毕！"
 
         # 数据质量审计：记录本次抓取覆盖率与 FINRA 滞后
         try:
-            missing_syms = [s for s in SYMBOLS if darkpool_data is None or s not in darkpool_data]
+            missing_syms = [
+                s for s in SYMBOLS if darkpool_data is None or s not in darkpool_data]
+            quality_issues.extend(f"dpsv:{s}" for s in missing_syms)
             log_data_quality(
                 supabase, job_name='daily_pre_market', table_name='stock_options_pre_market',
-                status='ok' if rows_written == len(SYMBOLS) else ('partial' if rows_written > 0 else 'failed'),
+                status=(
+                    'ok' if rows_written == len(SYMBOLS) and not quality_issues
+                    else ('partial' if rows_written > 0 else 'failed')),
                 rows_written=rows_written,
-                missing_fields=[f"dpsv:{s}" for s in missing_syms] if missing_syms else None,
+                missing_fields=sorted(set(quality_issues)) or None,
                 lag_days=finra_lag or 0,
-                notes=f"FINRA源日期: {finra_date or '不可用'}",
+                notes=(
+                    f"FINRA源日期: {finra_date or '不可用'}; "
+                    f"Gamma期限≤{MAX_GAMMA_DTE}日，符号模型=Call正/Put负代理"),
             )
         except Exception as e:
             logger.warning(f"⚠️ 数据质量记录失败: {e}")
 
-        send_email(f"美股盘前客观数据切片 - 纯净高阶版", report)
-        logger.info("\n✅ 轨道二运行完毕并发送成功！")
+        if send_email("美股盘前客观数据切片 - 纯净高阶版", report):
+            logger.info("\n✅ 轨道二运行完毕并发送成功！")
+        else:
+            logger.warning("\n⚠️ 轨道二数据已处理，但邮件发送失败。")
 
     except Exception as e: logger.error(f"❌ 运行失败: {e}")
     finally: ib.disconnect()

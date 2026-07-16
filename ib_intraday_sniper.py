@@ -243,11 +243,15 @@ class GlobalSentinel:
             try: return float(val) if val is not None else default
             except: return default
 
-        zgl = safe_float(self.opt_ctx.get('zgl_price'))
+        zgl = safe_float(
+            self.opt_ctx.get('gamma_flip_all', self.opt_ctx.get('zgl_price')))
+        gamma_flip_alert_enabled = bool(
+            getattr(cfg, 'ENABLE_GAMMA_FLIP_ALERT', False))
         poc = safe_float(self.opt_ctx.get('poc_price'))
         pcr = safe_float(self.opt_ctx.get('oi_pcr', 1.0))
         exp_move = safe_float(self.opt_ctx.get('expected_move_pct', 1.0)) / 100.0
-        prev_close = safe_float(self.opt_ctx.get('current_price'))
+        prev_close = safe_float(
+            self.opt_ctx.get('previous_close', self.opt_ctx.get('current_price')))
 
         try:
             self.ib.connect('127.0.0.1', 4001, clientId=888, readonly=True)
@@ -321,12 +325,16 @@ class GlobalSentinel:
             lower_bound = prev_close * (1 - exp_move) if prev_close > 0 else spy_px * 0.98
 
             # 判断警报
-            if (spy_px <= lower_bound * 1.002) and (trin_val >= 1.5 or pcr >= 1.2):
+            if (spy_px <= lower_bound * 1.002) and trin_val >= 1.5:
                 if vol_ratio >= 2.0 and ctick_15m_avg > 0:
                     fire = True; title = "🥇【深海核爆】极值恐慌底反转！散户止损，机构扫货，绝佳做多点！"
-            elif (spy_px < zgl) and (spy_px < vwap_now):
+            elif (
+                gamma_flip_alert_enabled and zgl > 0
+                and spy_px < zgl and spy_px < vwap_now
+            ):
                 if vol_ratio <= 0.25 and ctick_15m_avg < -300:
-                    fire = True; title = "🥈【冰山破裂】ZGL跌破引发做市商追空！绝对抛压涌现，顺势做空！"
+                    fire = True
+                    title = "🥈【结构确认】Gamma Flip观察位失守且广度、成交同步恶化"
             elif vol_ratio >= 4.0 and spy_px > vwap_now:
                 fire = True; title = "🥉【趋势碾压】绝对单边做多日！严禁做空，顺势做多后持仓！"
             elif vol_ratio <= 0.20 and spy_px < vwap_now:
@@ -340,9 +348,10 @@ class GlobalSentinel:
                 r += f"🚨 触发警报: {title}\n"
             r += f"=========================\n"
             r += f"【全局战略坐标】\n"
-            r += f"期权 ZGL (零伽马): ${zgl:.2f}\n"
+            zgl_mode = "已校准硬触发" if gamma_flip_alert_enabled else "仅观察"
+            r += f"主Gamma Flip观察位: ${zgl:.2f} ({zgl_mode})\n"
             r += f"现货 POC (成本核): ${poc:.2f}\n"
-            r += f"期权看跌比 (PCR): {pcr:.2f}\n"
+            r += f"Put/Call持仓结构比: {pcr:.2f}\n"
             r += f"【日内高频刺客】\n"
             r += f"SPY 现价: ${spy_px:.2f} (VWAP: ${vwap_now:.2f})\n"
             r += f"买卖资金比 (U/D): {vol_ratio:.2f}\n"
