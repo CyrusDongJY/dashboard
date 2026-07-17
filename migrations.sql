@@ -92,6 +92,10 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_roll_changed
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_flip_quality text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_zeroes jsonb;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_expirations jsonb;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_curve_version text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_grid_width_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_grid_points int;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_max_dte int;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_sign_model text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS oi_source_date date;
 
@@ -107,6 +111,9 @@ CREATE TABLE IF NOT EXISTS option_gamma_buckets (
     expirations         jsonb,
     contract_count      int         DEFAULT 0,
     expiration_count    int         DEFAULT 0,
+    curve_version       text,
+    grid_width_pct      numeric,
+    grid_points         int,
     sign_model          text,
     source_date         date,
     as_of_time          timestamptz,
@@ -115,6 +122,9 @@ CREATE TABLE IF NOT EXISTS option_gamma_buckets (
 );
 CREATE INDEX IF NOT EXISTS idx_option_gamma_buckets_ticker_date
     ON option_gamma_buckets (ticker, date DESC);
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS curve_version text;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS grid_width_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS grid_points int;
 
 CREATE TABLE IF NOT EXISTS stock_spot_post_close (
     date            date        NOT NULL,
@@ -128,6 +138,9 @@ CREATE TABLE IF NOT EXISTS stock_spot_post_close (
     ingested_at     timestamptz,
     PRIMARY KEY (date, ticker)
 );
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS iv_rank_pct numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS iv_percentile_pct numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS current_iv numeric;
 
 -- ------------------------------------------------------------
 -- 3. 汇总视图：把盘前盘后按 (date,ticker) 对齐，供报告/回测统一读取
@@ -205,10 +218,35 @@ SELECT
     pre.gamma_zeroes,
     pre.gamma_expirations,
     pre.gamma_sign_model,
-    pre.oi_source_date
+    pre.oi_source_date,
+    -- 新增列只追加在视图末尾，保证 CREATE OR REPLACE 不改变旧列顺序。
+    post.iv_rank_pct,
+    post.iv_percentile_pct,
+    post.current_iv,
+    pre.gamma_curve_version,
+    pre.gamma_grid_width_pct,
+    pre.gamma_grid_points,
+    pre.gamma_max_dte
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
+
+-- 盘中高频切片的数据质量与上下文血缘。缺数必须写 NULL + 状态，禁止写中性默认值。
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS vol_ratio_status text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS trin_scope text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS trin_source text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS context_quality text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS context_metadata jsonb;
+
+-- 广度字段保留数值、样本和截面，hindenburg 仅作旧字段兼容。
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS new_highs numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS new_lows numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS net_nh_nl numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_scope text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_source text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_as_of timestamptz;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_closing_auction_inclusion text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS breadth_sample_size int;
 
 -- ------------------------------------------------------------
 -- 4. 数据质量表：每次抓取每张表一条，记录成功/缺失/滞后/行数

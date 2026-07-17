@@ -49,7 +49,8 @@ def run_dashboard():
     app.fetch_liquidity_and_smf()
     app.calculate_metrics()
     text = app.generate_outputs()
-    payload, cn_row = app.get_db_payload(datetime.datetime.now().strftime("%Y-%m-%d"))
+    payload, cn_row = app.get_db_payload(
+        datetime.datetime.now(NY_TZ).strftime("%Y-%m-%d"))
     return text, payload, cn_row
 
 def append_local_csv(cn_row, date_str):
@@ -123,7 +124,7 @@ def send_email(subject, content, raw_data=""):
         print(f"❌ 邮件异常: {e}")
 
 if __name__ == "__main__":
-    current_time = datetime.datetime.now()
+    current_time = datetime.datetime.now(NY_TZ)
     today_str = current_time.strftime("%Y-%m-%d")
 
     print(f"\n[{current_time.strftime('%H:%M:%S')}] 🚀 开始执行云端自动化投研流 (结构化直写 V9.0)...")

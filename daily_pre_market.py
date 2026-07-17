@@ -755,7 +755,8 @@ def get_report():
                     f"{_fmt(distance_pct(zgl_strike, curr_price))}%\n"
                     f"🌪️ 动态对冲代理: Vanna {_fmt(vanna_m)}M | "
                     f"Charm {_fmt(charm_m)}M/天\n"
-                    f"ℹ️ Gamma符号假设: {gamma['sign_model']}；"
+                    f"ℹ️ Gamma曲线版本: {gamma['curve_version']}；"
+                    f"符号假设: {gamma['sign_model']}；"
                     f"OI为隔夜持仓，方向不是实际做市商净仓。\n"
                 )
 
@@ -824,6 +825,10 @@ def get_report():
                         "gamma_flip_quality": gamma_flip_quality,
                         "gamma_zeroes": gamma_zeroes,
                         "gamma_expirations": gamma_expirations,
+                        "gamma_curve_version": gamma["curve_version"],
+                        "gamma_grid_width_pct": gamma["grid_width_pct"],
+                        "gamma_grid_points": gamma["grid_points"],
+                        "gamma_max_dte": MAX_GAMMA_DTE,
                         "gamma_sign_model": gamma["sign_model"],
                         "oi_pcr": _round_or_none(oi_pcr, 6),
                         "oi_source_date": price_snapshot.get("previous_close_date"),
@@ -856,6 +861,9 @@ def get_report():
                             "expirations": metrics["expirations"],
                             "contract_count": metrics["contract_count"],
                             "expiration_count": metrics["expiration_count"],
+                            "curve_version": gamma["curve_version"],
+                            "grid_width_pct": gamma["grid_width_pct"],
+                            "grid_points": gamma["grid_points"],
                             "sign_model": gamma["sign_model"],
                         }
                         attach_metadata(

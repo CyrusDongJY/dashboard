@@ -8,6 +8,7 @@ import pandas as pd
 
 
 GAMMA_SIGN_MODEL = "OI_CALL_PLUS_PUT_MINUS_PROXY"
+GAMMA_CURVE_VERSION = "gamma_curve_v2"
 GAMMA_BUCKETS = ("0DTE", "1-7D", "8-30D", "31-60D", "ALL")
 
 
@@ -282,7 +283,10 @@ def gamma_structure(frame, spot, grid_width=0.20, grid_points=161):
     spot = finite_number(spot, positive=True)
     result = {bucket: _empty_gamma_bucket() for bucket in GAMMA_BUCKETS}
     result.update({"call_wall": None, "put_wall": None, "pin_strike": None,
-                   "pin_state": None, "sign_model": GAMMA_SIGN_MODEL})
+                   "pin_state": None, "sign_model": GAMMA_SIGN_MODEL,
+                   "curve_version": GAMMA_CURVE_VERSION,
+                   "grid_width_pct": grid_width * 100.0,
+                   "grid_points": int(grid_points)})
     if spot is None or frame.empty:
         return result
 

@@ -116,12 +116,8 @@ COMPONENTS = [
     ComponentSpec("hyg_tlt_21d", "credit_transmission", "HYG/TLT 21D",
                   "hyg_tlt_ratio", 0.85, +1, mode="pct_change", window=21,
                   min_obs=60),
-    ComponentSpec("hyg_shares_20d", "credit_transmission", "HYG shares 20D",
-                  "hyg_sh_m", 0.45, +1, mode="pct_change", window=20,
-                  min_obs=40),
-    ComponentSpec("jnk_shares_20d", "credit_transmission", "JNK shares 20D",
-                  "jnk_sh_m", 0.35, +1, mode="pct_change", window=20,
-                  min_obs=40),
+    # ETF shares from yfinance are retained as context only. They are not scored
+    # until an issuer-grade daily shares source with a trustworthy as-of date is used.
 
     # Distribution: broad participation, kept separate from system funding.
     ComponentSpec("breadth_20", "market_distribution", "Above 20DMA",
@@ -159,6 +155,8 @@ class ComponentScore:
     source_date: Optional[str]
     lag_days: Optional[int]
     note: str = ""
+    valid_obs_count: int = 0
+    required_obs_count: int = 0
 
 
 @dataclass
@@ -434,13 +432,22 @@ def _score_component(frame: pd.DataFrame, spec: ComponentSpec,
     empty = ComponentScore(
         spec.key, spec.pillar, spec.label, None, 0.0,
         None, None, None, None, "missing",
+        valid_obs_count=0, required_obs_count=spec.min_obs,
     )
     if spec.column not in frame:
-        return empty
+        return ComponentScore(
+            spec.key, spec.pillar, spec.label, None, 0.0,
+            None, None, None, None, "missing column",
+            valid_obs_count=0, required_obs_count=spec.min_obs,
+        )
     raw = pd.to_numeric(frame[spec.column], errors="coerce").loc[:report_date]
     raw = raw.dropna()
     if raw.empty:
-        return empty
+        return ComponentScore(
+            spec.key, spec.pillar, spec.label, None, 0.0,
+            None, None, None, None, "missing values",
+            valid_obs_count=0, required_obs_count=spec.min_obs,
+        )
 
     transformed = raw
     if spec.mode == "change":
@@ -461,6 +468,7 @@ def _score_component(frame: pd.DataFrame, spec: ComponentSpec,
             spec.key, spec.pillar, spec.label, None, 0.0,
             float(raw.iloc[-1]), None, None, None,
             f"insufficient observations ({valid_count}/{spec.min_obs})",
+            valid_obs_count=valid_count, required_obs_count=spec.min_obs,
         )
 
     source_date = None
@@ -502,6 +510,8 @@ def _score_component(frame: pd.DataFrame, spec: ComponentSpec,
         source_date=source_text,
         lag_days=lag,
         note="ok" if quality >= 0.5 else "low confidence",
+        valid_obs_count=valid_count,
+        required_obs_count=spec.min_obs,
     )
 
 
@@ -735,7 +745,20 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
     for key in PILLARS:
         pillar = result.pillars.get(key)
         if not pillar or pillar.score is None:
-            lines.append(f"{PILLARS[key][0]}：数据不足")
+            blockers = [
+                component for component in result.components
+                if component.pillar == key and component.score is None
+            ]
+            diagnostic = "；".join(
+                f"{item.label} {item.valid_obs_count}/{item.required_obs_count}"
+                for item in blockers[:4]
+            )
+            coverage = pillar.coverage if pillar else 0.0
+            suffix = f"（可评分覆盖 {coverage:.0%}"
+            if diagnostic:
+                suffix += f"；有效观测 {diagnostic}"
+            suffix += "）"
+            lines.append(f"{PILLARS[key][0]}：数据不足{suffix}")
         else:
             lines.append(
                 f"{pillar.label}：{pillar.score:.1f}/100 "

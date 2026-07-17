@@ -24,6 +24,9 @@ from datetime import datetime, timedelta
 import math
 import json
 
+from liquidity_sources import OfficialLiquiditySources
+from data_contracts import ETF_FLOW_TICKERS, compute_etf_share_metrics
+
 class UltimateDashboard:
     def __init__(self):
         # ✅ 从金库安全读取 FRED API 密钥
@@ -48,6 +51,7 @@ class UltimateDashboard:
         # 结构化数值缓存：与展示字符串平行存储原始数值，供直接落库（替代正则解析文本）
         self.num = {}
         self.fred_source_dates = {}
+        self.liquidity_source_names = {}
 
     def log(self, msg):
         print(msg)
@@ -123,6 +127,7 @@ class UltimateDashboard:
                         series_dict[col_name] = native
                         if not native.empty:
                             self.fred_source_dates[col_name] = native.index.max().strftime('%Y-%m-%d')
+                            self.liquidity_source_names[col_name] = f"FRED:{series_id}"
             except: continue
                 
         if series_dict:
@@ -158,10 +163,46 @@ class UltimateDashboard:
                 if fed > 0: self.liquidity['g3_liq'] = round(fed + ecb_usd + boj_usd, 2)
             except: self.liquidity['g3_liq'] = '-'
 
+    def refresh_daily_tga_official(self):
+        """Use the same daily Treasury TGA contract as the Waterline monitor."""
+        try:
+            today = pd.Timestamp.now(tz="America/New_York").date()
+            start = (pd.Timestamp(today) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+            source = OfficialLiquiditySources(self.fred_api_key)
+            tga = source.fetch_tga(start, str(today))
+            if tga.empty:
+                return
+            latest_date = pd.Timestamp(tga.index[-1]).strftime("%Y-%m-%d")
+            self.liquidity['tga'] = round(float(tga.iloc[-1]), 2)
+            self.fred_source_dates['TGA'] = latest_date
+            self.liquidity_source_names['TGA'] = "TreasuryFiscalData:DTS"
+            fred_history = self.data_cache.get('fred_historical')
+            if fred_history is not None and not fred_history.empty and 'TGA' in fred_history:
+                target = fred_history.index
+                aligned_tga_m = (tga.reindex(target.union(tga.index)).sort_index()
+                                 .ffill().reindex(target) * 1_000)
+                first_official = pd.Timestamp(tga.index.min())
+                mask = target >= first_official
+                fred_history.loc[mask, 'TGA'] = aligned_tga_m.loc[mask]
+            if all(self.liquidity.get(key, '-') != '-' for key in ('assets', 'tga', 'rrp')):
+                self.liquidity['net_liq'] = round(
+                    self.liquidity['assets'] - self.liquidity['tga'] - self.liquidity['rrp'], 2)
+        except Exception as exc:
+            self.log(f"⚠️ Treasury日度TGA获取失败，保留FRED周度口径: {exc}")
+
     def fetch_liquidity_and_smf(self):
-        self.smf = {'dix': '-', 'gex': '-', 'sp500_net': '-', 'nasdaq_net': '-', 'cot_vix': '-', 'spy_sh': '-', 'qqq_sh': '-', 'hyg_sh': '-', 'jnk_sh': '-', 'hyg_px': '-', 'jnk_px': '-', 'junk_flow': '-'}
-        self.score_details.update({'trin': '-', 'pct_20ma': '-', 'pct_50ma': '-', 'pct_200ma': '-', 'nh': '-', 'nl': '-', 'net_nh_nl': '-', 'breadth_thrust': '⚪ 未触发'})
+        self.smf = {'dix': '-', 'gex': '-', 'sp500_net': '-', 'nasdaq_net': '-', 'cot_vix': '-', 'spy_sh': '-', 'qqq_sh': '-', 'hyg_sh': '-', 'jnk_sh': '-', 'hyg_px': '-', 'jnk_px': '-', 'junk_flow': '-', 'etf_share_metrics': {}}
+        self.score_details.update({
+            'trin': '-', 'trin_scope': 'top500_nyse_nasdaq_by_mktcap',
+            'trin_source': 'TradingViewScanner', 'trin_as_of': None,
+            'trin_closing_auction_inclusion': 'UNVERIFIED',
+            'breadth_sample_size': 0,
+            'pct_20ma': '-', 'pct_50ma': '-', 'pct_200ma': '-',
+            'nh': '-', 'nl': '-', 'net_nh_nl': '-',
+            'breadth_thrust': '⚪ 未触发'
+        })
         self.fetch_fred_data_direct()
+        self.refresh_daily_tga_official()
 
         try:
             df_sm = pd.read_csv("https://squeezemetrics.com/monitor/static/DIX.csv")
@@ -214,10 +255,14 @@ class UltimateDashboard:
                 self.score_details.update({
                     'trin': round(trin, 2), 'pct_20ma': round((a20 / total) * 100, 1), 
                     'pct_50ma': round((a50 / total) * 100, 1), 'pct_200ma': round((a200 / total) * 100, 1), 
-                    'net_nh_nl': nh - nl, 'nh': nh, 'nl': nl
+                    'net_nh_nl': nh - nl, 'nh': nh, 'nl': nl,
+                    'breadth_sample_size': total,
+                    'trin_as_of': pd.Timestamp.now(
+                        tz="America/New_York").isoformat(),
                 })
 
-                today_str = datetime.now().strftime("%Y-%m-%d")
+                today_str = pd.Timestamp.now(
+                    tz="America/New_York").strftime("%Y-%m-%d")
                 cache_file = os.path.join(self.lake_dir, 'breadth_history.json')
                 history = []
                 if os.path.exists(cache_file):
@@ -247,10 +292,11 @@ class UltimateDashboard:
         except: pass
 
         try:
-            new_records, hyg_flow, jnk_flow = [], 0.0, 0.0
-            today_str = datetime.now().strftime("%Y-%m-%d")
+            new_records = []
+            today_str = pd.Timestamp.now(
+                tz="America/New_York").strftime("%Y-%m-%d")
             csv_file = os.path.expanduser("~/market_dashboard/ETF_Flows_Cache.csv")
-            for ticker in ['SPY', 'QQQ', 'HYG', 'JNK']:
+            for ticker in ETF_FLOW_TICKERS:
                 tk = yf.Ticker(ticker)
                 shares = tk.info.get('sharesOutstanding', 0)
                 if shares == 0 and hasattr(tk, 'fast_info'):
@@ -268,16 +314,37 @@ class UltimateDashboard:
                         elif ticker == 'HYG': self.smf['hyg_sh'] = f"{round(shares/1e6, 2)}M"
                         elif ticker == 'JNK': self.smf['jnk_sh'] = f"{round(shares/1e6, 2)}M"
 
-            if os.path.exists(csv_file) and new_records:
-                df_hist = pd.read_csv(csv_file)
-                for rec in new_records:
-                    past = df_hist[df_hist['Ticker'] == rec['Ticker']]
-                    if not past.empty:
-                        flow = ((rec['Shares'] - past.iloc[-1]['Shares']) * rec['Price']) / 1e6
-                        if rec['Ticker'] == 'HYG': hyg_flow = flow
-                        elif rec['Ticker'] == 'JNK': jnk_flow = flow
-            self.smf['junk_flow'] = round(hyg_flow + jnk_flow, 2)
-        except: pass
+            if new_records:
+                if os.path.exists(csv_file):
+                    try:
+                        df_hist = pd.read_csv(csv_file)
+                    except Exception:
+                        df_hist = pd.DataFrame(columns=['Date', 'Ticker', 'Shares', 'Price'])
+                else:
+                    df_hist = pd.DataFrame(columns=['Date', 'Ticker', 'Shares', 'Price'])
+                combined = pd.concat(
+                    [df_hist, pd.DataFrame(new_records)], ignore_index=True)
+                combined['Date'] = pd.to_datetime(
+                    combined['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                combined = (combined.dropna(subset=['Date', 'Ticker'])
+                            .sort_values(['Date', 'Ticker'])
+                            .drop_duplicates(['Date', 'Ticker'], keep='last'))
+                os.makedirs(os.path.dirname(csv_file), exist_ok=True)
+                temp_file = f"{csv_file}.tmp"
+                combined.to_csv(temp_file, index=False)
+                os.replace(temp_file, csv_file)
+
+                metrics = compute_etf_share_metrics(combined)
+                self.smf['etf_share_metrics'] = metrics
+                debt_flows = []
+                for ticker in ('HYG', 'JNK'):
+                    one_day = metrics.get(ticker, {}).get('changes', {}).get('1d')
+                    if one_day and one_day.get('dollar_flow_m') is not None:
+                        debt_flows.append(one_day['dollar_flow_m'])
+                self.smf['junk_flow'] = (
+                    round(sum(debt_flows), 2) if len(debt_flows) == 2 else '-')
+        except Exception as exc:
+            self.log(f"⚠️ ETF份额历史更新失败: {exc}")
 
     def calculate_metrics(self):
         df, raw_df = self.data_cache.get('close', pd.DataFrame()), self.data_cache.get('raw_close', pd.DataFrame())
@@ -553,9 +620,29 @@ class UltimateDashboard:
     def generate_outputs(self):
         mac_s, mic_s = self.score_details.get('macro_score', 0), self.score_details.get('micro_score', 0)
         m_val = lambda k: self.macro_engines.get(k, '-')
+        etf_lines = []
+        for ticker in ETF_FLOW_TICKERS:
+            metric = self.smf.get('etf_share_metrics', {}).get(ticker, {})
+            changes = metric.get('changes', {})
+            parts = []
+            for window in ('1d', '5d', '20d'):
+                change = changes.get(window)
+                if not change:
+                    parts.append(f"{window}=NA")
+                    continue
+                pct = change.get('share_change_pct')
+                flow = change.get('dollar_flow_m')
+                pct_text = f"{pct:+.3f}%" if pct is not None else "NA"
+                flow_text = f"${flow:+.2f}M" if flow is not None else "NA"
+                parts.append(
+                    f"{window} {pct_text} / {flow_text}")
+            etf_lines.append(
+                f"[{ticker}份额变化]: " + " | ".join(parts)
+                + f" (source={metric.get('source', 'NA')}, context-only)")
+        etf_detail_text = "\n".join(etf_lines) if etf_lines else "[ETF份额变化]: 历史不足"
         
         text_output = f"""
-[尾部黑天鹅预警]: {self.score_details.get('net_nh_nl', '-')} (净新高-新低)
+[净新高−新低]: {self.score_details.get('net_nh_nl', '-')} (正值代表正向广度)
 [深度广度推力信号]: {self.score_details.get('breadth_thrust', '-')}
 [机构暗池背离信号]: {self.score_details.get('dix_divergence', '-')}
 
@@ -566,6 +653,7 @@ class UltimateDashboard:
 [TGA账户余额]: {self.liquidity.get('tga', '-')}
 [隔夜逆回购RRP]: {self.liquidity.get('rrp', '-')}
 [银行准备金]: {self.liquidity.get('reserves', '-')}
+[流动性来源日期]: Fed资产 {self.fred_source_dates.get('Fed_Assets', 'NA')} / TGA {self.fred_source_dates.get('TGA', 'NA')} / RRP {self.fred_source_dates.get('RRP', 'NA')} / 准备金 {self.fred_source_dates.get('Reserves', 'NA')}
 [SOFR利率]: {self.liquidity.get('sofr', '-')}
 [Chicago Fed NFCI]: {self.liquidity.get('nfci', '-')}
 
@@ -594,7 +682,7 @@ class UltimateDashboard:
 [50MA占比]: {self.score_details.get('pct_50ma', '-')}
 [200MA占比]: {self.score_details.get('pct_200ma', '-')}
 [净新高新低]: 创新高 {self.score_details.get('nh', '-')} / 创新低 {self.score_details.get('nl', '-')}
-[TRIN成交量广度]: {self.score_details.get('trin', '-')}
+[前500大市值样本TRIN]: {self.score_details.get('trin', '-')} (NYSE+Nasdaq, 样本数={self.score_details.get('breadth_sample_size', 0)}, 截面={self.score_details.get('trin_as_of', 'NA')}, 收盘竞价=UNVERIFIED)
 [做市商敞口GEX]: {self.smf.get('gex', '-')}
 [暗池买盘DIX]: {self.smf.get('dix', '-')}
 
@@ -626,6 +714,8 @@ class UltimateDashboard:
 [QQQ份额]: {self.smf.get('qqq_sh', '-')}
 [HYG份额]: {self.smf.get('hyg_sh', '-')}
 [JNK份额]: {self.smf.get('jnk_sh', '-')}
+[ETF份额来源声明]: yfinance sharesOutstanding/fast_info，未验证原生发布日期，仅作上下文，不参与Waterline评分
+{etf_detail_text}
 [HYG价格]: {self.smf.get('hyg_px', '-')}
 [JNK价格]: {self.smf.get('jnk_px', '-')}
 
@@ -659,7 +749,8 @@ class UltimateDashboard:
         """直接从内部状态组装 market_history 的结构化 payload。
         替代 auto_review 旧有的『打印文本 -> 50条正则抠数字』链路：
         文案/emoji 变动不再影响入库数据。返回 (payload, cn_row_dict)。"""
-        date_str = date_str or datetime.now().strftime('%Y-%m-%d')
+        date_str = date_str or pd.Timestamp.now(
+            tz="America/New_York").strftime('%Y-%m-%d')
 
         def nz(v):
             # '-' / NaN / 带逗号字符串 统一转 float 或 None
@@ -695,8 +786,16 @@ class UltimateDashboard:
             "cot_vix": nz(sm.get('cot_vix')), "vrp": vm.get('vrp'),
             "pct_20ma": nz(sd.get('pct_20ma')), "pct_50ma": nz(sd.get('pct_50ma')),
             "pct_200ma": nz(sd.get('pct_200ma')),
+            "new_highs": nz(sd.get('nh')), "new_lows": nz(sd.get('nl')),
+            "net_nh_nl": nz(sd.get('net_nh_nl')),
             "nh_nl": f"创新高 {sd.get('nh', '-')} / 创新低 {sd.get('nl', '-')}",
             "trin": nz(sd.get('trin')), "gex": nz(sm.get('gex')), "dix": nz(sm.get('dix')),
+            "trin_scope": sd.get('trin_scope'),
+            "trin_source": sd.get('trin_source'),
+            "trin_as_of": sd.get('trin_as_of'),
+            "trin_closing_auction_inclusion": sd.get(
+                'trin_closing_auction_inclusion'),
+            "breadth_sample_size": int(sd.get('breadth_sample_size', 0) or 0),
             "sp500_net": nz(sm.get('sp500_net')), "nasdaq_net": nz(sm.get('nasdaq_net')),
             "dxy": nz(rg.get('dxy')), "jpy": nz(rg.get('jpy')), "oil": nz(rg.get('oil')),
             "gold": nz(rg.get('gold')), "btc": nz(rg.get('btc')), "cmf": nz(sd.get('cmf')),
@@ -709,7 +808,8 @@ class UltimateDashboard:
             "yc_chg": num.get('yc_chg'), "liq_roc": num.get('liq_roc'),
             "m2_yoy": num.get('m2_yoy'), "credit_z": num.get('credit_z'),
             "cg_z": num.get('cg_z'),
-            "hindenburg": f"{net_nh_nl} (净新高-新低)",
+            # 旧列仅为兼容；不再冒充 Hindenburg/黑天鹅指标。
+            "hindenburg": f"净新高-新低: {net_nh_nl}",
         }
         # 结构化数值附录（含 vrp 数值、vix_term 比值），供异常引擎读取
         payload["full_metrics"] = {
@@ -719,6 +819,14 @@ class UltimateDashboard:
             "hyg_tlt_roc21": num.get('hyg_tlt_roc21'),
             "breadth_sample": "top500_by_mktcap",
             "fred_source_dates": self.fred_source_dates,
+            "liquidity_source_names": self.liquidity_source_names,
+            "liquidity_source_contract": "official_liquidity_v2",
+            "etf_share_metrics": self.smf.get('etf_share_metrics', {}),
+            "net_liq_source_date": min(
+                [self.fred_source_dates.get(key) for key in ('Fed_Assets', 'TGA', 'RRP')
+                 if self.fred_source_dates.get(key)],
+                default=None,
+            ),
         }
 
         # 本地 CSV 备份用的中文表头行（保持既有格式）
@@ -727,7 +835,7 @@ class UltimateDashboard:
             '[总评]宏观压力得分': payload['macro_score'], '[总评]微观战术得分': payload['micro_score'],
             '[价格]QQQ': self.current_prices.get('NDX 100 (QQQ)', '-'),
             '[价格]SPY': self.current_prices.get('S&P 500 (SPY)', '-'),
-            '[总评]大盘骨架': payload['skeleton'], '[总评]黑天鹅预警': payload['hindenburg'],
+            '[总评]大盘骨架': payload['skeleton'], '[广度]净新高-新低': payload['net_nh_nl'],
             '[信号]广度推力': payload['breadth_thrust'], '[信号]暗池背离': payload['dix_div'],
             '[波动]VRP风险溢价': payload['vrp'], '[波动]VIX期限结构': payload['vix_term'],
             '[避险]垃圾债/长债比': payload['hyg_tlt_ratio'], '[避险]21天动能': payload['hyg_tlt_trend'],
@@ -747,7 +855,7 @@ class UltimateDashboard:
             '[波动]SKEW': payload['skew'], '[波动]PCR': payload['pcr'], '[波动]VIX净持仓': payload['cot_vix'],
             '[股市]20MA占比(%)': payload['pct_20ma'], '[股市]50MA占比(%)': payload['pct_50ma'],
             '[股市]200MA占比(%)': payload['pct_200ma'], '[股市]净新高新低': payload['nh_nl'],
-            '[股市]TRIN广度': payload['trin'], '[股市]GEX敞口(B)': payload['gex'],
+            '[股市]前500大市值样本TRIN': payload['trin'], '[股市]GEX敞口(B)': payload['gex'],
             '[股市]DIX暗池(%)': payload['dix'],
             '[宏观]SP500净持仓': payload['sp500_net'], '[宏观]纳指净持仓': payload['nasdaq_net'],
             '[宏观]美元DXY': payload['dxy'], '[宏观]日元JPY': payload['jpy'],

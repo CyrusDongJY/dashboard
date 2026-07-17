@@ -7,13 +7,25 @@
 
 - 昨收、盘前成交、Bid/Ask/Mid、期货映射参考价分别存储，禁止混称"当前现价"；
 - Expected Move 优先ATM跨式双边中间价，回退ATM IV公式，失败写NULL并登记质量告警；
-- Gamma按0DTE、1—7日、8—30日、31—60日和全采样期限分别计算；
+- Gamma按0DTE、1—7日、8—30日、31—60日和采样期限合计（默认≤60日）分别计算；
   为满足IBKR行情订阅节流，每个桶选择代表性到期日和现价附近31档，
   报告与数据库会保存真实采样到期日/合约数，不把采样结果冒充完整全链；
 - Gamma Flip来自现货情景网格的真实零交叉，不再用单执行价差额最小点冒充；
 - 最大OI附到期日、OI、Delta、美元Gamma和距参考价百分比；
 - 同一Call/Put墙改为Pin候选位或负Gamma突破枢轴；
 - OI PCR统一命名为"Put/Call持仓结构比"，不再解释为真实多空。
+
+2026-07-17 数据契约补强：
+
+- 盘中 POC 改从 `stock_spot_post_close` 读取，盘前表缺字段不再显示为 0；
+- U/D、TRIN、PCR、Gamma 缺失或过期时写 NULL/NA 与质量状态，不再填 1.00/0；
+- 盘中 Gamma 坐标输出 ticker、截面、期限、曲线版本、现价参考和零点数；
+- TRIN 分离 `NYSE TRIN` 与 `前500大市值样本TRIN`；
+- `净新高-新低` 不再命名为黑天鹅预警；
+- IV Rank 与 IV Percentile 分列存储；
+- ETF 份额缓存开始按日推进并输出 1/5/20 日变化，但 yfinance 份额仍标为
+  `CONTEXT_ONLY`，在接入基金管理人级日度来源前不参与 Waterline 评分；
+- Waterline 数据不足时显示各组件有效观测数/最低要求，不再只显示覆盖率 0。
 
 ## 一、部署步骤（按顺序）
 
@@ -38,6 +50,7 @@
    | 文件 | 动作 |
    |---|---|
    | `market_utils.py` | 新增（**必须**放这里） |
+   | `data_contracts.py` | 新增（纯数据契约与 fail-closed 计算，**必须**放这里） |
    | `pre_market_metrics.py` | 新增（盘前纯计算引擎，**必须**放这里） |
    | `anomaly_engine.py` | 新增（**必须**放这里） |
    | `environment_indices.py` | 新增（影子指数，**必须**放这里） |
@@ -62,7 +75,7 @@
    **📁 `~/TradingRadar/`**
    | 文件 | 动作 |
    |---|---|
-   | `ib_intraday_sniper.py` | 覆盖 —— 读取明确盘前字段，Gamma Flip默认仅观察，无新依赖 |
+   | `ib_intraday_sniper.py` | 覆盖 —— 读取明确盘前/盘后字段；依赖共享的 `data_contracts.py` |
 
    新增哨兵 `market_sentinel.py` 放 **`~/market_dashboard/`**（它 import
    `anomaly_engine` / `market_utils`，与共享模块同目录最省事）。
@@ -70,7 +83,8 @@
    ⚠️ **最易犯的错**：把 `market_utils.py` / `anomaly_engine.py` 复制到了 `quant_bot`
    或 `TradingRadar`。那样 `auto_analyst` 可能侥幸能跑（同目录），但
    `daily_pre_market` / `daily_post_close` 会 `ModuleNotFoundError`。
-   `pre_market_metrics.py` 同样只保留在 `~/market_dashboard/`。
+   `pre_market_metrics.py` 与 `data_contracts.py` 同样只保留在
+   `~/market_dashboard/`。
 
 3. **cron 调整**：时间/路径/参数基本不变，只建议一处——
    把 `auto_analyst` 从 `16:35` 挪到 `16:45`。原因：升级后 `auto_review`（16:30）

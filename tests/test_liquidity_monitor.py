@@ -7,6 +7,12 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pandas as pd
 
+try:
+    import matplotlib  # noqa: F401
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
 from liquidity_monitor import (
     CALC_VERSION,
     COMPONENTS,
@@ -136,6 +142,16 @@ class LiquidityScoreTests(unittest.TestCase):
         self.assertNotIn("sofr_rate", columns)
         self.assertNotIn("dix_pct", columns)
         self.assertNotIn("gex_billions", columns)
+        self.assertNotIn("hyg_sh_m", columns)
+        self.assertNotIn("jnk_sh_m", columns)
+
+    def test_missing_pillar_summary_explains_observation_gap(self):
+        index = pd.bdate_range("2026-01-02", periods=5)
+        result = score_liquidity_frame(
+            pd.DataFrame({"pct_20ma": [50.0] * 5}, index=index))
+        summary = format_liquidity_summary(result)
+        self.assertIn("有效观测", summary)
+        self.assertIn("5/60", summary)
 
     def test_vix_curve_contract_keeps_two_distinct_columns(self):
         columns = {spec.column for spec in COMPONENTS}
@@ -346,6 +362,7 @@ class LiquiditySourceTests(unittest.TestCase):
         self.assertIn(503, retries.status_forcelist)
 
 
+@unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib not installed")
 class LiquidityChartTests(unittest.TestCase):
     def test_png_is_nonempty(self):
         frame = synthetic_frame(True)

@@ -65,7 +65,7 @@ METRIC_REGISTRY = {
     "pct_20ma":        {"cn": "20MA占比", "bad_dir": -1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
     "breadth_diff_pct":{"cn": "Mag7-RSP广度差", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 1.5, 1)], "z": (2.0, 3.0)},
-    "trin":            {"cn": "TRIN", "bad_dir": +1, "scope": "MACRO",
+    "trin":            {"cn": "前500大市值样本TRIN", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 2.0, 1)], "z": (2.5, 3.5)},
     # 跨资产
     "dxy":             {"cn": "美元指数", "bad_dir": +1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
@@ -76,13 +76,15 @@ METRIC_REGISTRY = {
     # 微观（个股，反向信号指标）
     "dpsv_pct":        {"cn": "FINRA场外短售量代理", "bad_dir": 0, "scope": "STOCK",
                           "abs": None, "z": (2.0, 3.0)},
-    "ivr_pct":         {"cn": "IVR波动率百分位", "bad_dir": -1, "scope": "STOCK",
+    "ivr_pct":         {"cn": "IV Rank（52周区间位置）", "bad_dir": -1, "scope": "STOCK",
+                          "abs": [("<", 10, 1)], "z": (2.0, 3.0)},
+    "iv_percentile_pct":{"cn": "IV Percentile（历史日分位）", "bad_dir": -1, "scope": "STOCK",
                           "abs": [("<", 10, 1)], "z": (2.0, 3.0)},
     "expected_move_pct":{"cn": "预期波幅", "bad_dir": +1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "short_gamma_m":   {"cn": "短期期限净Gamma", "bad_dir": -1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "oi_pcr":          {"cn": "Put/Call持仓结构比", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     # 下列结构值先只积累曲线。方向依赖价格位置、到期结构和符号约定，不直接进入风险评分。
-    "zgl_price":       {"cn": "全采样期限主Gamma Flip", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "zgl_price":       {"cn": "采样期限主Gamma Flip", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "call_wall":       {"cn": "Gamma加权Call Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "put_wall":        {"cn": "Gamma加权Put Wall", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "distance_to_call_wall_pct":{"cn": "距Call墙百分比", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
@@ -92,7 +94,7 @@ METRIC_REGISTRY = {
     "gamma_1_7d_m":    {"cn": "1—7日净Gamma代理", "bad_dir": -1, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "gamma_8_30d_m":   {"cn": "8—30日净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "gamma_31_60d_m":  {"cn": "31—60日净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
-    "gamma_all_m":     {"cn": "全采样期限净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
+    "gamma_all_m":     {"cn": "采样期限净Gamma代理", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "vanna_m":         {"cn": "Vanna", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "charm_m":         {"cn": "Charm", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
     "long_gamma_m":    {"cn": "中长期限净Gamma", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
@@ -573,15 +575,23 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
         try:
             g = _fetch_history(
                 supabase, 'stock_spot_post_close', 'date', ticker=tkr, end_date=report_date)
-            if not g.empty and 'ivr_pct' in g.columns:
-                src = _metric_source_date(g, 'ivr_pct', 'date', ('source_date',))
-                events += scan_metric('ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src)
-                row = metric_snapshot(
-                    'ivr_pct', g['ivr_pct'], report_date, scope=tkr, source_date=src,
-                    session=session, is_final=is_final, source_name="stock_spot_post_close")
-                if row: snap_rows.append(row)
-                clean = _clean(g['ivr_pct'])
-                if not clean.empty: ivr_vals.append(float(clean.iloc[-1]))
+            if not g.empty:
+                for metric in ('ivr_pct', 'iv_percentile_pct'):
+                    if metric not in g.columns:
+                        continue
+                    src = _metric_source_date(g, metric, 'date', ('source_date',))
+                    events += scan_metric(
+                        metric, g[metric], report_date, scope=tkr, source_date=src)
+                    row = metric_snapshot(
+                        metric, g[metric], report_date, scope=tkr, source_date=src,
+                        session=session, is_final=is_final,
+                        source_name="stock_spot_post_close")
+                    if row:
+                        snap_rows.append(row)
+                if 'ivr_pct' in g.columns:
+                    clean = _clean(g['ivr_pct'])
+                    if not clean.empty:
+                        ivr_vals.append(float(clean.iloc[-1]))
         except Exception:
             pass
 

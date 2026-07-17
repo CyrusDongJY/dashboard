@@ -16,7 +16,11 @@ from ib_insync import *
 from supabase import create_client, Client
 import pandas_market_calendars as mcal
 
-from market_utils import attach_metadata, safe_upsert, log_data_quality, find_missing_fields
+from market_utils import (
+    attach_metadata, safe_upsert,
+    log_data_quality, find_missing_fields,
+)
+from data_contracts import calculate_iv_rank_percentile
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -328,24 +332,36 @@ def get_vix_term_structure(ib):
         return f"⚠️ VIX 异常报错: {e}\n", {}
 
 def get_ivr_only(ib, symbol):
-    report = f"\n--- ⚡ {symbol} 波动率情绪 (IVR) ---\n"
+    report = f"\n--- ⚡ {symbol} 波动率情绪 (IV Rank / IV Percentile) ---\n"
     try:
         contracts = ib.qualifyContracts(Stock(symbol, 'SMART', 'USD'))
         if not contracts: return report + "⚠️ 无法获取合约信息。\n", {}
         
         iv_bars = ib.reqHistoricalData(contracts[0], endDateTime='', durationStr='1 Y', barSizeSetting='1 day', whatToShow='OPTION_IMPLIED_VOLATILITY', useRTH=True)
         ivr = None
+        iv_percentile = None
+        current_iv = None
         if iv_bars:
             iv_closes = [bar.close for bar in iv_bars if bar.close is not None and bar.close > 0]
             if iv_closes:
-                current_iv = iv_closes[-1]
-                min_iv, max_iv = min(iv_closes), max(iv_closes)
-                ivr = ((current_iv - min_iv) / (max_iv - min_iv)) * 100 if max_iv > min_iv else 0.0
+                metrics = calculate_iv_rank_percentile(iv_closes)
+                current_iv = metrics['current_iv']
+                min_iv, max_iv = metrics['min_iv'], metrics['max_iv']
+                ivr = metrics['iv_rank_pct']
+                iv_percentile = metrics['iv_percentile_pct']
                 report += f"📊 隐含波动率 (IV): {current_iv:.4f} (52周区间: {min_iv:.4f} - {max_iv:.4f})\n"
-                report += f"📈 IVR (波动率百分位): {ivr:.1f}%\n"
+                report += f"📈 IV Rank (52周区间位置): {ivr:.1f}%\n"
+                report += f"📊 IV Percentile (低于当前IV的交易日占比): {iv_percentile:.1f}%\n"
         else: report += "⚠️ 未获取到历史 IV 数据。\n"
 
-        return report, {"ivr_pct": round(ivr, 2) if ivr is not None else None}
+        return report, {
+            # ivr_pct 为旧下游兼容字段；新代码读取明确命名字段。
+            "ivr_pct": round(ivr, 2) if ivr is not None else None,
+            "iv_rank_pct": round(ivr, 2) if ivr is not None else None,
+            "iv_percentile_pct": (
+                round(iv_percentile, 2) if iv_percentile is not None else None),
+            "current_iv": round(current_iv, 6) if current_iv is not None else None,
+        }
     except Exception as e: return report + f"⚠️ IVR 分析异常: {e}\n", {}
 
 def get_unusual_options_activity(ib, symbol):
@@ -543,6 +559,9 @@ def get_report():
                 "poc_price": dict_poc.get("poc_price"),
                 "obv_status": dict_poc.get("obv_status"),
                 "ivr_pct": dict_ivr.get("ivr_pct"),
+                "iv_rank_pct": dict_ivr.get("iv_rank_pct"),
+                "iv_percentile_pct": dict_ivr.get("iv_percentile_pct"),
+                "current_iv": dict_ivr.get("current_iv"),
             }
             attach_metadata(spot_payload, source_date=today_str)
             if safe_upsert(supabase, 'stock_spot_post_close', spot_payload, conflict_cols='date,ticker') is not None:

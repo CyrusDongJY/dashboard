@@ -16,6 +16,7 @@ import requests
 from ib_insync import *
 from supabase import create_client, Client
 import pandas_market_calendars as mcal  
+from data_contracts import up_down_volume_ratio
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -78,6 +79,8 @@ class GlobalSentinel:
         self.log_file = os.path.join(script_dir, 'sniper.log')
         self.ib = IB()
         self.opt_ctx = {}
+        self.spot_ctx = {}
+        self.context_quality = "MISSING"
 
     def is_trading_day(self):
         try:
@@ -182,12 +185,28 @@ class GlobalSentinel:
     def load_sentinel_context(self):
         self.log("正在装载 Supabase 宏观与期权全局视野...")
         try:
-            # V9.0 拆表后期权阵地数据在 stock_options_pre_market；失败时回退旧表兼容
+            today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+            # 期权上下文必须显式核对交易日。可以展示旧行供诊断，但旧行不得参与触发。
             res_o = supabase.table('stock_options_pre_market').select('*').eq('ticker', 'SPY').order('date', desc=True).limit(1).execute()
             if not res_o.data:
                 res_o = supabase.table('stock_options_daily').select('*').eq('ticker', 'SPY').order('date', desc=True).limit(1).execute()
             if res_o.data:
                 self.opt_ctx = res_o.data[0]
+                if self.opt_ctx.get('ticker') != 'SPY':
+                    self.context_quality = "TICKER_MISMATCH"
+                elif str(self.opt_ctx.get('date')) != today_str:
+                    self.context_quality = "STALE"
+                elif self.opt_ctx.get('gamma_curve_version') != 'gamma_curve_v2':
+                    self.context_quality = "LEGACY_METHOD"
+                else:
+                    self.context_quality = "OK"
+
+            # POC 属于盘后现货域，不能再从盘前期权表读取。盘中使用最近一次已完成盘后截面。
+            res_s = (supabase.table('stock_spot_post_close').select('*')
+                     .eq('ticker', 'SPY').lte('date', today_str)
+                     .order('date', desc=True).limit(1).execute())
+            if res_s.data:
+                self.spot_ctx = res_s.data[0]
         except Exception as e:
             self.log(f"⚠️ 装载全局视野失败: {e}")
 
@@ -239,19 +258,58 @@ class GlobalSentinel:
 
         self.load_sentinel_context()
         
-        def safe_float(val, default=0.0):
-            try: return float(val) if val is not None else default
-            except: return default
+        def optional_float(val):
+            try:
+                number = float(val)
+                return number if math.isfinite(number) else None
+            except (TypeError, ValueError):
+                return None
 
-        zgl = safe_float(
+        def display_number(value, digits=2, prefix=''):
+            return f"{prefix}{value:.{digits}f}" if value is not None else "NA"
+
+        zgl = optional_float(
             self.opt_ctx.get('gamma_flip_all', self.opt_ctx.get('zgl_price')))
         gamma_flip_alert_enabled = bool(
-            getattr(cfg, 'ENABLE_GAMMA_FLIP_ALERT', False))
-        poc = safe_float(self.opt_ctx.get('poc_price'))
-        pcr = safe_float(self.opt_ctx.get('oi_pcr', 1.0))
-        exp_move = safe_float(self.opt_ctx.get('expected_move_pct', 1.0)) / 100.0
-        prev_close = safe_float(
+            getattr(cfg, 'ENABLE_GAMMA_FLIP_ALERT', False)
+            and self.context_quality == "OK" and zgl is not None)
+        poc = optional_float(self.spot_ctx.get('poc_price'))
+        pcr = optional_float(self.opt_ctx.get('oi_pcr'))
+        exp_move_pct = optional_float(self.opt_ctx.get('expected_move_pct'))
+        exp_move = exp_move_pct / 100.0 if exp_move_pct is not None else None
+        prev_close = optional_float(
             self.opt_ctx.get('previous_close', self.opt_ctx.get('current_price')))
+
+        gamma_zeroes = self.opt_ctx.get('gamma_zeroes') or {}
+        all_zeroes = gamma_zeroes.get('ALL', []) if isinstance(gamma_zeroes, dict) else []
+        gamma_expirations = self.opt_ctx.get('gamma_expirations') or {}
+        all_expirations = (
+            gamma_expirations.get('ALL', [])
+            if isinstance(gamma_expirations, dict) else []
+        )
+        gamma_max_dte = int(optional_float(
+            self.opt_ctx.get('gamma_max_dte')) or 60)
+        context_metadata = {
+            "ticker": self.opt_ctx.get('ticker'),
+            "pre_market_date": self.opt_ctx.get('date'),
+            "pre_market_as_of": self.opt_ctx.get('quote_as_of') or self.opt_ctx.get('as_of_time'),
+            "pre_market_context_quality": self.context_quality,
+            "spot_reference": self.opt_ctx.get('premarket_reference_price', self.opt_ctx.get('current_price')),
+            "spot_reference_source": self.opt_ctx.get('premarket_price_source'),
+            "gamma_scope": f"sampled_expirations_le_{gamma_max_dte}d",
+            "gamma_max_dte": gamma_max_dte,
+            "gamma_curve_version": self.opt_ctx.get('gamma_curve_version') or 'LEGACY_UNKNOWN',
+            "gamma_sign_model": self.opt_ctx.get('gamma_sign_model'),
+            "gamma_flip_quality": self.opt_ctx.get('gamma_flip_quality'),
+            "gamma_expirations": all_expirations,
+            "gamma_zero_count": len(all_zeroes),
+            "gamma_zeroes": all_zeroes,
+            "pcr_source_date": self.opt_ctx.get('oi_source_date'),
+            "poc_date": self.spot_ctx.get('date'),
+            "poc_as_of": self.spot_ctx.get('as_of_time'),
+            "poc_method": "6m_daily_close_volume_profile_50_bins",
+            "trin_closing_auction_inclusion": "UNVERIFIED",
+        }
 
         try:
             self.ib.connect('127.0.0.1', 4001, clientId=888, readonly=True)
@@ -284,16 +342,13 @@ class GlobalSentinel:
                 
                 uvol_val = self.get_robust_index_val(contracts['UVOL'], t_dict['UVOL-NYSE'])
                 dvol_val = self.get_robust_index_val(contracts['DVOL'], t_dict['DVOL-NYSE'])
-                trin_val = self.get_robust_index_val(contracts['TRIN'], t_dict['TRIN-NYSE'])
+                trin_raw = self.get_robust_index_val(contracts['TRIN'], t_dict['TRIN-NYSE'])
+                trin_val = trin_raw if trin_raw > 0 else None
                 tick_now = self.get_robust_index_val(contracts['TICK'], t_dict['TICK-NYSE'])
 
             # 防除零错：计算量比
-            if dvol_val > 0:
-                vol_ratio = uvol_val / dvol_val
-            elif uvol_val > 0:
-                vol_ratio = 99.0  # 极端单边上涨
-            else:
-                vol_ratio = 1.0
+            vol_ratio, vol_ratio_status = up_down_volume_ratio(
+                uvol_val, dvol_val)
             
             # 计算 15 分钟累积 TICK
             ctick_15m_avg = tick_now
@@ -322,22 +377,27 @@ class GlobalSentinel:
             fire = False
             title = ""
             
-            lower_bound = prev_close * (1 - exp_move) if prev_close > 0 else spy_px * 0.98
+            lower_bound = (
+                prev_close * (1 - exp_move)
+                if prev_close is not None and prev_close > 0 and exp_move is not None
+                and self.context_quality == "OK" else None
+            )
 
             # 判断警报
-            if (spy_px <= lower_bound * 1.002) and trin_val >= 1.5:
-                if vol_ratio >= 2.0 and ctick_15m_avg > 0:
+            if (lower_bound is not None and trin_val is not None
+                    and spy_px <= lower_bound * 1.002 and trin_val >= 1.5):
+                if vol_ratio is not None and vol_ratio >= 2.0 and ctick_15m_avg > 0:
                     fire = True; title = "🥇【深海核爆】极值恐慌底反转！散户止损，机构扫货，绝佳做多点！"
             elif (
-                gamma_flip_alert_enabled and zgl > 0
+                gamma_flip_alert_enabled and zgl is not None and zgl > 0
                 and spy_px < zgl and spy_px < vwap_now
             ):
-                if vol_ratio <= 0.25 and ctick_15m_avg < -300:
+                if vol_ratio is not None and vol_ratio <= 0.25 and ctick_15m_avg < -300:
                     fire = True
                     title = "🥈【结构确认】Gamma Flip观察位失守且广度、成交同步恶化"
-            elif vol_ratio >= 4.0 and spy_px > vwap_now:
+            elif vol_ratio is not None and vol_ratio >= 4.0 and spy_px > vwap_now:
                 fire = True; title = "🥉【趋势碾压】绝对单边做多日！严禁做空，顺势做多后持仓！"
-            elif vol_ratio <= 0.20 and spy_px < vwap_now:
+            elif vol_ratio is not None and vol_ratio <= 0.20 and spy_px < vwap_now:
                 fire = True; title = "🥉【趋势碾压】绝对单边暴跌日！严禁抄底，顺势做空后持仓！"
 
             # 格式化绝对纽约时间
@@ -349,13 +409,28 @@ class GlobalSentinel:
             r += f"=========================\n"
             r += f"【全局战略坐标】\n"
             zgl_mode = "已校准硬触发" if gamma_flip_alert_enabled else "仅观察"
-            r += f"主Gamma Flip观察位: ${zgl:.2f} ({zgl_mode})\n"
-            r += f"现货 POC (成本核): ${poc:.2f}\n"
-            r += f"Put/Call持仓结构比: {pcr:.2f}\n"
+            r += (
+                f"SPY ≤{gamma_max_dte}日采样主Gamma Flip: {display_number(zgl, prefix='$')} "
+                f"({zgl_mode}, 质量={self.context_quality})\n"
+            )
+            r += (
+                f"Gamma血缘: 截面={context_metadata['pre_market_date'] or 'NA'} "
+                f"| 现价参考={display_number(optional_float(context_metadata['spot_reference']), prefix='$')} "
+                f"| 模型={context_metadata['gamma_sign_model'] or 'NA'} "
+                f"| 到期数={len(all_expirations)} | 零点数={len(all_zeroes)}\n"
+            )
+            r += (
+                f"最近盘后6M日线POC: {display_number(poc, prefix='$')} "
+                f"(ticker=SPY, 日期={context_metadata['poc_date'] or 'NA'})\n"
+            )
+            r += (
+                f"SPY Put/Call持仓结构比: {display_number(pcr)} "
+                f"(OI日期={context_metadata['pcr_source_date'] or 'NA'})\n"
+            )
             r += f"【日内高频刺客】\n"
             r += f"SPY 现价: ${spy_px:.2f} (VWAP: ${vwap_now:.2f})\n"
-            r += f"买卖资金比 (U/D): {vol_ratio:.2f}\n"
-            r += f"抛售广度 (TRIN): {trin_val:.2f}\n"
+            r += f"NYSE上涨/下跌成交量比 (U/D): {display_number(vol_ratio)} ({vol_ratio_status})\n"
+            r += f"NYSE TRIN: {display_number(trin_val)} (IBKR TRIN-NYSE, 截面={ny_timestamp_str}, 收盘竞价=UNVERIFIED)\n"
             r += f"15m累积暗流 (CTICK): {ctick_15m_avg:+.0f}\n"
 
             print(r)
@@ -372,7 +447,12 @@ class GlobalSentinel:
                 "spy_px": spy_px, "sma20": sma20, "vwap_now": vwap_now, "vwap_30m": vwap_30m,
                 "add_val": add_val, "uvol": uvol_val, "dvol": dvol_val, "vol_ratio": vol_ratio,
                 "trin": trin_val, "tick_now": tick_now, "ctick_15m": ctick_15m_avg,
-                "alert_triggered": title if fire else None
+                "alert_triggered": title if fire else None,
+                "vol_ratio_status": vol_ratio_status,
+                "trin_scope": "NYSE",
+                "trin_source": "IBKR:TRIN-NYSE",
+                "context_quality": self.context_quality,
+                "context_metadata": context_metadata,
             }
             
             if safe_db_insert('intraday_logs', db_payload):

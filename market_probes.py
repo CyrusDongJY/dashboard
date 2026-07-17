@@ -138,7 +138,7 @@ def scan_micro_options(supabase, cutoff_date):
             if pd.notna(zgl_today) and pd.notna(zgl_lw) and zgl_today != zgl_lw:
                 direction = "上移 🔼" if zgl_today > zgl_lw else "下移 🔽"
                 ticker_anomalies.append(
-                    f"[Gamma Flip观察-WoW] 主零点{direction} "
+                    f"[Gamma Flip观察-WoW] 采样期限主零点{direction} "
                     f"(上周: {zgl_lw} -> 今日: {zgl_today})；"
                     "到期滚动和采样变化可能造成跳变。")
 
