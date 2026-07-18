@@ -1,187 +1,182 @@
-# ETF 数据源与预算选型表（P0A 决策）
+# ETF 数据源与预算选型（P0A 决策）
 
-- **决策ID**: capflow-etf-source-2026-07-18
-- **状态**: DRAFT — 待 POC 验证与预算拍板
-- **定位**: P0A 第一优先级决策。此表决定"美股资金行为监控系统"能否从研究概念进入生产。
-- **前置**: [2026-07-18-capital-flow-plan-review.md](../audits/2026-07-18-capital-flow-plan-review.md)（CAPFLOW-003 / 005：ETF 权威数据源是第一阻断条件）
-- **分支**: `feature/capital-flow-monitor`
-- **核查时间**: 2026-07-18（供应商能力/授权会变动，价格档位为指示性，务必 POC 期间询价复核）
-
----
-
-## 一、P0 真正需要的字段（难点在最后四项）
-
-事实层一「基金配置流」的旗舰指标 `etf_primary_flow_daily` 要求：
-
-| # | 字段 | 难度 | 说明 |
-|---|---|---|---|
-| 1 | 日度基金份额（shares outstanding） | ★★★ | 计算净发行的核心；多数便宜源只有季度报表口径 |
-| 2 | 同日 NAV | ★★ | 必须与份额同日对齐，否则口径错位 |
-| 3 | AUM | ★ | 用于 Flow/AUM bps |
-| 4 | **公司行动（拆分/反向拆分/合并/清盘/ticker 变更）** | ★★★ | 无此源则拆分日爆假申购（CAPFLOW-005） |
-| 5 | **点时 / 修订历史（point-in-time）** | ★★★ | 决定能否提前回测（你的修订 #2） |
-| 6 | **历史深度 3–5 年** | ★★★ | 同上 |
-| 7 | **授权允许自动抓取 + 存储 + 派生 + 内部分发** | ★★★ | 发行商直连的真正风险点 |
-
-> 关键判断：**便宜的 API 档在 #1/#4/#5 上普遍不合格**（份额多为季度报表口径、公司行动不带、无点时）。真正能过 P0 的只有"发行商直连"和"专用参考/点时数据商"两条路。
+- **决策 ID**：`capflow-etf-source-2026-07-18`
+- **状态**：DRAFT — 待供应商样本、书面授权与前向 POC 验收
+- **定位**：决定 ETF 一级市场配置流能否从 `CONTEXT_ONLY` 研究观察进入正式事实层
+- **前置审查**：[资本流方案审查](../audits/2026-07-18-capital-flow-plan-review.md)
+- **配套文件**：[供应商 RFI 与样本验收表](2026-07-18-etf-data-vendor-rfi.md)
+- **首轮探针**：[10 只 ETF 基线记录](../audits/2026-07-18-etf-issuer-probe-baseline.md)
+- **证据复核日**：2026-07-18
 
 ---
 
-## 二、候选源矩阵
+## 一、决策边界
 
-评级：✅ 满足 ／ ⚠️ 部分/需确认 ／ ❌ 不满足 ／ 💲 指示性成本（务必询价）
+旗舰指标统一命名为 `ETF_PRIMARY_MARKET_FLOW_ESTIMATE`。即使拥有日度份额和 NAV，它仍是创建/赎回单位的 NAV 价值估算，不等同于实际现金转账；实物申赎尤其不能写成“现金净流入”。
 
-### A 档 · 发行商直连（免费，权威，但授权与工程成本在你这边）
+P0 需要以下字段：
 
-| 源 | 日度份额 | 同日NAV | 公司行动 | 点时/修订 | 历史深度 | 自动抓取授权 | 成本 |
-|---|---|---|---|---|---|---|---|
-| SSGA/SPDR（daily holdings xlsx） | ✅ | ✅ | ❌ 需自建 | ❌ 只能自采向前攒 | ❌ 仅当前 | ⚠️ 个人/非商用，二次分发/派生需另签，且含指数商 IP（S&P/MSCI/FTSE/CRSP） | 免费 |
-| iShares/BlackRock | ✅ | ✅ | ❌ | ❌ | ❌ | ⚠️ 同上；**非交易日不出持仓**（cadence 差异） | 免费 |
-| Vanguard | ✅ | ✅ | ❌ | ❌ | ❌ | ⚠️ 同上；**用日历月末日期**（与 iShares 口径不一致） | 免费 |
-| Invesco | ✅ | ✅ | ❌ | ❌ | ❌ | ⚠️ 同上 | 免费 |
-
-- 社区库 `etf-scraper` 覆盖以上四家，但作者明确免责"不保证符合各基金 T&C"——**授权是灰区，不能默认可商用/可派生**。
-- **定位**：最佳的**地面真值校验**源 + **向前自建点时归档**的起点；**不能**当历史回补源，**不能**当干净公司行动源。选它 = 走"路径 B"（见第四节）。
-
-### B 档 · 专用参考 / 点时数据商（付费，直击难点字段）
-
-| 源 | 命中的难点 | 说明 | 成本 |
-|---|---|---|---|
-| **EDI（Exchange Data International）** | #1 #4 | Official + **Daily-Adjusted Shares Outstanding** 双数据集，专为"官方更新发布前公司行动导致份额突变"设计（含 bonus/buyback/consolidation/rights）。**最直接命中"CA 调整后份额"**。 | 💲询价（中档） |
-| **DTCC ETF Portfolio Data** | #4 #7 | ETF 原生的 announcement & security reference，美国 ETF 最权威。 | 💲询价（企业） |
-| **Databento** | #4 #5 #6 | 点时 instrument definition、公司行动按"如同当时"打时间戳、价格回溯调整、无幸存者/前视偏差；310k+ 工具。**点时回测最强**。 | 💲较可及（有 $125 试用额度） |
-| **QUODD** | #4 #5 | 跨 identifier 变更自动缝合、调整因子、任意时点任意 identifier、无幸存者偏差。 | 💲询价 |
-
-### C 档 · 企业级基金流平台（贵，含成品 flow，但授权不透明）
-
-| 源 | flow 频率 | 定位 | 指示性价格 |
-|---|---|---|---|
-| **Bloomberg Data License** | 亚秒/实时推送 | 频率最高、跨资产最广；redistribution 权限单独谈 | 💲议价，按数据类目/量/分发权，无公开价 |
-| **FactSet** | 机构实时 flow alert | 建模集成强 | 💲~$12–20k/席/年（席位价；企业馈送另议） |
-| **Morningstar Direct** | 日频 + 深历史 | 基金流专家，日频足够时性价比最好 | 💲~$10k+/席/年 |
-| **LSEG/Refinitiv（Lipper）** | EOD 净流入/出 | 多数美国 ETF 的 EOD flow | 💲询价 |
-
-> 注意：C 档给的是**成品 flow**，会绕过你自建"Σ 日调整份额 × 日 NAV"的算法透明度；且席位价 ≠ 可编程摄入的企业馈送价（后者三家都要销售报价）。若买 C 档，需确认**授权允许把 flow 派生进你自己的评分并内部分发**。
-
-### D 档 · 便宜 API（P0 不合格，仅可做 AUM/价格 context）
-
-| 源 | 份额口径 | 判定 |
+| 字段 | 必要性 | 验收要求 |
 |---|---|---|
-| EODHD | 季度报表 + 点时指数成分 | ❌ 非日度份额 |
-| Barchart OnDemand `getETFDetails` | 份额+NAV 同对象但**快照** | ⚠️ 需自己每日轮询存档才成序列 |
-| Finnworlds | NAV 日更（SEC+基金源） | ⚠️ 值得单独问是否有日度份额历史序列 |
-| Twelve Data / Alpha Vantage / FMP / Intrinio / Polygon | 多为报表口径份额 | ❌ 日度净发行不可用 |
-| ICI 周度 | 行业总量、估算、可修订 | ✅ 仅作行业总量校验（方案已定位） |
+| 基金级日度 shares outstanding | 必须 | 不是公司财报季度股本，也不是成分股持仓数量 |
+| 同日 NAV | 必须 | 与份额使用同一基金、份额类别和估值日 |
+| AUM / net assets | 强烈建议 | 用于恒等式校验与 Flow/AUM 标准化 |
+| 公司行动 | 必须 | 拆分、反拆、合并、清盘、ticker/CUSIP 变更均需识别 |
+| `published_at` / `available_at` | 路径 A 必须 | 能重建当时真实可见的信息集 |
+| 修订 / vintage 历史 | 路径 A 必须 | 原始值不得被后值无痕覆盖 |
+| 3—5 年历史 | 路径 A 必须 | 必须说明 adjusted 与 as-reported 口径 |
+| 自动摄入、存储、派生、内部分发权 | 一票否决 | 以书面合同为准，不从网页可访问性推断授权 |
+
+当前 `data_contracts.py` 的 yfinance 份额观察继续保持 `CONTEXT_ONLY`，不得因为本决策文档而升级。
 
 ---
 
-## 三、结论：难点字段把选择压到两条路
+## 二、证据等级
 
-- **份额 + NAV + AUM** → A 档发行商直连即可拿到（免费）。
-- **公司行动 + 点时/修订历史 + 3–5 年深度 + 派生授权** → **只有 B/C 档能给**。
+候选能力不再用笼统的“满足/不满足”表示，改用三种证据状态：
 
-因此 P0A 的真问题不是"选哪个 API"，而是**"要不要买点时历史"**——这正好对应你修订 #2 的分叉。
+- **PUBLICLY_CONFIRMED**：供应商官方公开资料明确写出相应字段或能力；仍需合同和样本验收。
+- **VENDOR_SAMPLE_REQUIRED**：公开资料不足，必须取得字段字典、真实样本和书面说明。
+- **COMPANION_ONLY**：公开能力适合公司行动、PCF 或标识符等伴随层，不是基金份额/NAV 主源。
 
----
-
-## 四、两条采购路径（对应你的修订 #2）
-
-### 路径 A：买点时历史（B 档为主）
-```
-EDI 日调整份额  +  Databento 点时/公司行动  +  NAV（发行商或 EDI）
-```
-- **优点**：可回放历史 → **提前回测**，不必干等 6–12 个月；公司行动、点时、修订开箱即用。
-- **代价**：真金白银（询价，估中五位数/年级别）+ 授权谈判周期。
-- **仍需**：≥3 个月真实在线影子运行，验证**你自己的**抓取链路与修订行为（你的修订 #2 结论）。
-
-### 路径 B：发行商直连 + 向前自建点时（A 档为主）
-```
-SSGA/iShares/Vanguard/Invesco 日度持仓&份额&NAV  →  每日快照落 etf_fund_snapshot_daily  →  自建点时归档
-公司行动：单独接一个 CA 源（否则 fail-closed）
-```
-- **优点**：数据成本近零。
-- **代价**：(a) 授权灰区，商用/派生需逐家确认；(b) **无历史 → 6–12 个月才有足够样本**；(c) 公司行动要么单买要么 fail-closed；(d) 三家 cadence/口径不一，工程量在你这边。
-- **定位**：即使走路径 A，也建议**同时**用 A 档做地面真值校验。
-
-> 混合建议：**B 档买点时历史用于回测 + A 档发行商做每日真值校验 + 便宜源仅补 AUM/价格 context**。是否值得，取决于第六节的预算上限。
+价格统一标记 `UNQUOTED`。公开终端席位价不能替代 API、批量存储、派生与分发授权报价。
 
 ---
 
-## 五、数据源验收 POC（把你的 §五 形式化，动工前必做）
+## 三、候选源矩阵（修订后）
 
-**不写生产功能，先做 POC。** 选 10 只代表 ETF，连续 20 个纽约交易日：
+| 候选源 | 公开证据能确认的能力 | 尚未确认的关键能力 | 当前定位 |
+|---|---|---|---|
+| **FactSet Funds API / DataFeed** | 官方 Funds API 明确覆盖 ETF NAV、AUM、flows，并说明单日 flow 使用份额变化与 NAV 计算 | as-reported vintage、修订时间、公司行动处理、具体 ETF 历史深度与许可 | **第一轮 RFI 主候选**；`PUBLICLY_CONFIRMED` 到字段族，生产资格仍待样本 |
+| **EDI Worldwide Shares Outstanding** | 官方说明含 Official 与 Daily-Adjusted shares，调整事件包含拆分、合并、回购、配股等 | 美国 ETF 基金级份额覆盖、逐基金日频、NAV、ETF vintage 与授权 | `VENDOR_SAMPLE_REQUIRED`；不得默认等同 ETF 日度基金份额源 |
+| **QUODD** | 官方说明含 ETF NAV、公司行动、标识符连续性和调整历史 | 日度基金份额、flow、revision/vintage | `VENDOR_SAMPLE_REQUIRED` |
+| **Databento Corporate Actions** | ETF 公司行动、调整因子、标识符变化及约六年 point-in-time 事件 | 基金级日度份额、NAV、AUM | **公司行动/点时伴随源**；`COMPANION_ONLY` |
+| **DTCC ETF Portfolio Data** | 创建赎回篮子、PCF、成分构成及自 2007 年起的历史 PCF | 基金级 shares outstanding、NAV、AUM、flow vintage | **申赎篮子与 look-through 层**；`COMPANION_ONLY` |
+| Bloomberg / LSEG / Morningstar | 企业级基金数据产品存在 | 本项目所需字段、频率、修订、授权与价格均需逐项证明 | `VENDOR_SAMPLE_REQUIRED`；不得写入未经证明的实时频率或预算数字 |
+| 发行商官网 | SSGA 与 iShares 产品页公开展示部分基金的 NAV、AUM、shares outstanding；其他发行商字段覆盖不一 | 自动化许可、稳定接口、历史与修订、公司行动统一口径 | 地面真值和前向技术探针；不能默认可商用或可回补 |
+| yfinance / 便宜基本面 API | 快照或报表口径字段 | 权威日度基金份额、点时历史、修订与公司行动闭环 | 仅 `CONTEXT_ONLY` |
 
-样本（覆盖发行商 × 资产类别 × 结构）：
+### 关键纠偏
 
-| Ticker | 发行商 | 类别 |
+1. EDI 的公开资料不能证明其对 SPY/IVV/QQQ 等美国 ETF 提供基金级日度份额；必须先看 ETF 专项样本。
+2. Databento 不承担份额/NAV 主源角色，只补公司行动、标识符和 point-in-time 事件。
+3. DTCC 的核心价值是 PCF 与申赎篮子穿透，不把 PCF 误写成基金份额或 NAV。
+4. FactSet 因官方资料明确出现 ETF NAV、AUM 和 flow，提升为第一轮直接询价对象；但仍不得跳过 vintage、授权和公司行动验收。
+5. 所有成本在取得书面报价前均为 `UNQUOTED`，不以“中五位数”等未经报价的数字做预算基线。
+
+---
+
+## 四、批准的下一步：双线并行，不建设生产管道
+
+### 线 A：统一 RFI 与历史样本回放
+
+第一批联系顺序：
+
+1. FactSet Funds API / DataFeed；
+2. EDI（必须点名 ETF fund units/shares outstanding）；
+3. QUODD；
+4. Bloomberg、LSEG、Morningstar 比较组；
+5. Databento 作为公司行动伴随源；
+6. DTCC 作为 PCF / look-through 源。
+
+所有供应商使用同一份 [RFI](2026-07-18-etf-data-vendor-rfi.md)，不得接受只有营销截图、没有字段样本的“满足”。
+
+### 线 B：发行商官网前向探针
+
+启动非生产探针，目标是验证：
+
+- 官方页面/文件能否稳定访问；
+- NAV、份额、AUM 分别属于哪个 source date；
+- `ETag`、`Last-Modified` 和页面内容是否真实刷新；
+- 不同发行商在周末、节假日和修订日的 cadence；
+- 是否存在字段消失、页面模板变化和反爬限制。
+
+探针只做不可覆盖的原始归档与字段覆盖检查：
+
+- 不写 Supabase；
+- 不进入 `metric_daily`、Waterline、评分、告警或日报；
+- 不产生正式 flow；
+- 抓取必须由操作者显式确认研究用途；
+- 部署定时任务前必须完成逐发行商授权审查。
+
+---
+
+## 五、POC 样本与验收闸门
+
+样本覆盖发行商、资产类别和结构：
+
+| Ticker | 发行商 | 类型 |
 |---|---|---|
-| SPY | SSGA | 大盘股票 |
+| SPY | State Street | 大盘股票 |
 | IVV | iShares | 大盘股票 |
 | VOO | Vanguard | 大盘股票 |
 | QQQ | Invesco | 科技成长 |
 | VTI | Vanguard | 全市场 |
 | IWM | iShares | 小盘 |
 | HYG | iShares | 高收益债 |
-| LQD | iShares | IG 债 |
-| XLF | SSGA | 行业 |
+| LQD | iShares | 投资级债 |
+| XLF | State Street | 行业 |
 | TQQQ | ProShares | 杠杆 |
 
-**逐源打分（每源填一列，POC 期间实测，不靠供应商话术）：**
+执行窗口分三段：
 
-| 验收项 | 阈值 | 权重 |
-|---|---|---|
-| 份额/NAV/AUM 同日齐备 | 关键字段覆盖率 ≥ 98% | 必过 |
-| 正常发布滞后 | ≤ 1 交易日 | 必过 |
-| 历史可回补 | ≥ 3 年（最好 5 年）且为点时版本 | 路径 A 必过 |
-| 公司行动识别 | 拆分/反拆/合并识别率 = 100% | 必过 |
-| 无法确认 CA 时 | **必须 fail-closed**（见下） | 必过 |
-| 修订是否留痕 | 有 revision_id/published_at | 加分 |
-| 拆分前后 AUM 连续 | 无断崖 | 必过 |
-| 与发行商官网一致 | 抽样 100% 一致 | 必过 |
-| 授权 | 允许自动抓取 + 存储 + 派生 + 内部分发 | **一票否决** |
+1. **5—10 个交易日技术探针**：验证访问、归档、字段和发布时间，不等待 20 日才联系供应商。
+2. **供应商历史事件回放**：至少回放 3—5 个拆分、反拆、代码变更或显著修订事件。
+3. **20 个纽约交易日完整 POC**：评估覆盖率、发布滞后、修订行为和跨源一致性。
 
-**fail-closed 规则（写进事实层）：**
+验收标准：
+
+| 验收项 | 阈值 |
+|---|---|
+| shares/NAV 同日关键字段覆盖率 | ≥ 98% |
+| 正常发布滞后 | ≤ 1 个交易日，且供应商发布计划有书面定义 |
+| 路径 A 历史 | ≥ 3 年，优先 5 年，并可重建 point-in-time 信息集 |
+| 公司行动识别 | 样本事件 100% 识别 |
+| 修订留痕 | 原值、新值、`published_at`/`available_at`、revision 标识可追溯 |
+| AUM 恒等式 | 解释 `shares × NAV` 与官方 net assets 的差异及容差 |
+| 发行商抽样一致性 | 抽样值与 source date 均一致 |
+| 授权 | 自动摄入、存储、派生、内部展示均有书面许可；否则一票否决 |
+
+### Fail-closed 规则
+
+```text
+关键字段缺失或日期不一致
+  → INCOMPLETE_SOURCE_SNAPSHOT
+  → 不计算 flow
+
+份额异常跳变且没有已确认公司行动
+  → SUSPECT_CORPORATE_ACTION
+  → 当日 ETF flow 置空并禁止进入任何聚合
+
+授权状态未确认
+  → RESEARCH_ONLY
+  → 只允许隔离归档，不接生产系统
 ```
-无法确认公司行动
-  → 标记 SUSPECT_CORPORATE_ACTION
-  → 该 ETF 当日 etf_primary_flow_daily 置空
-  → 禁止进入任何聚合
-  # 绝不假定调整因子 = 1
-```
 
-**闸门**：无任何源通过 → **不启动 ETF 正式评分**，仅保留现有 `CONTEXT_ONLY` 观察（`data_contracts.py:53-54` 现状不变）。
+没有任何源通过全部硬闸门时，不启动 ETF 正式评分；现有 `CONTEXT_ONLY` 状态保持不变。
 
 ---
 
-## 六、待你拍板的业务决定（这张表框定，但只有你能定）
+## 六、生产前的数据模型边界
 
-1. **预算上限**：接受路径 A 的付费点时历史（估中五位数/年，需询价），还是先走零成本路径 B 干等样本？
-2. **回测时点**：要"尽快能回测"（→ 必须买点时历史，路径 A），还是可接受 6–12 个月在线积累（→ 路径 B）？
-3. **授权范围**：系统产出是否会对外/跨团队分发？这决定发行商直连是否可用、以及 C 档 redistribution 条款是否要谈。
-4. **成品 flow vs 自算**：接受 C 档现成 flow（算法不透明、但省事），还是坚持自建"Σ 日调整份额 × 日 NAV"（透明可审计、但要 B 档原料）？
+待 POC 通过后再正式迁移，计划事实表为：
+
+```text
+etf_fund_snapshot_daily   原始/标准化份额、NAV、AUM、各字段 source date 与版本
+corporate_actions         事件、调整因子、available_at 与来源
+etf_primary_flow_daily    公司行动确认后产生的一级市场流量估算
+```
+
+`1/5/20D` 只由特征层从日事实聚合，不写回原始表。计算约定必须明确采用哪一天 NAV、是否使用 as-reported 或 adjusted shares，不能把供应商成品 flow 与自算 flow 混成同一指标版本。
 
 ---
 
-## 七、落库映射（与审查 §四 一致）
+## 七、公开证据来源
 
-```
-etf_fund_snapshot_daily   -- 原始：份额/NAV/AUM/来源/版本（raw，单日事实）
-etf_primary_flow_daily    -- 派生：经公司行动处理后的净发行（CA-adjusted）
-corporate_actions         -- 硬依赖，缺失即 fail-closed
-1/5/20 日窗口             -- 由 SQL/特征层算，不进原始表
-```
-
----
-
-## 附：核查来源
-
-- [SSGA SPY daily holdings（xlsx 直连示例）](https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx)
-- [etf-scraper（社区库，作者免责 T&C）](https://pypi.org/project/etf-scraper/)
-- [Exchange Data International — Shares Outstanding（Official + Daily-Adjusted）](https://datarade.ai/data-products/shares-outstanding)
+- [FactSet Funds API](https://developer.factset.com/api-catalog/factset-funds-api)
+- [EDI Worldwide Shares Outstanding](https://developer.exchange-data.com/product/worldwide_shares_outstanding)
+- [Databento Corporate Actions](https://databento.com/corporate-actions)
 - [DTCC ETF Portfolio Data](https://www.dtcc.com/data-services/corporate-actions-and-reference-data/etf-portfolio-data)
-- [Databento — Corporate Actions（点时）](https://databento.com/corporate-actions)
-- [QUODD — Stock & ETF Data](https://www.quodd.com/stock-and-etf-data)
-- [EODHD — Fundamentals（份额季度口径）](https://eodhd.com/financial-apis/stock-etfs-fundamental-data-feeds)
-- [Barchart OnDemand — getETFDetails](https://www.barchart.com/ondemand/api/getETFDetails)
-- [Bloomberg Professional — Funds Data](https://professional.bloomberg.com/products/data/enterprise-catalog/funds/)
-- [AlphaEx Capital — Where to Find ETF Flow Data](https://www.alphaexcapital.com/etfs/etf-analysis-and-research/fund-flows-and-market-sentiment-in-etfs/where-to-find-etf-flow-data)
+- [QUODD Stock and ETF Data](https://www.quodd.com/stock-and-etf-data)
+- [State Street SPY 产品页](https://www.ssga.com/us/en/individual/etfs/state-street-spdr-sp-500-etf-trust-spy)
+- [iShares IVV 产品页](https://www.ishares.com/us/products/239726/ivv-ishares-core-sp-500-etf)

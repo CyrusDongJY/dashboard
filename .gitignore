@@ -7,3 +7,4 @@ __pycache__/
 market_config.py
 sniper.log
 .claude/
+.probe_data/
