@@ -9,6 +9,13 @@ from email.header import Header
 from contextlib import contextmanager
 import urllib.parse
 
+# Shared contracts and secrets live outside TradingRadar on the cloud host.  The
+# path must be installed before importing either module; cron does not set
+# PYTHONPATH for this job.
+CONFIG_DIR = os.path.expanduser('~/market_dashboard')
+if CONFIG_DIR not in sys.path:
+    sys.path.insert(0, CONFIG_DIR)
+
 import pytz
 import pandas as pd
 import numpy as np
@@ -19,10 +26,6 @@ import pandas_market_calendars as mcal
 from data_contracts import up_down_volume_ratio
 
 # ================= 🔐 安全挂载全局金库 =================
-CONFIG_DIR = os.path.expanduser('~/market_dashboard')
-if CONFIG_DIR not in sys.path:
-    sys.path.append(CONFIG_DIR)
-
 try:
     import market_config as cfg
 except ImportError:
@@ -105,8 +108,10 @@ class GlobalSentinel:
             server.sendmail(cfg.SENDER_EMAIL, [cfg.RECEIVER_EMAIL], msg.as_string())
             server.quit()
             print("✅ 战报邮件已通过 Gmail 火速送达 QQ 邮箱！")
+            return True
         except Exception as e:
             print(f"❌ 邮件异常: {e}")
+            return False
 
     def send_alert(self, subject, body):
         self.send_email(subject, body)
