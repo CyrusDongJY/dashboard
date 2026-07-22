@@ -5,6 +5,8 @@ from datetime import date
 import pandas as pd
 
 from pre_market_metrics import (
+    apply_gamma_quality_gate,
+    distance_pct,
     expected_move_metrics,
     gamma_structure,
     max_oi_metrics,
@@ -72,6 +74,27 @@ class ExpectedMoveTests(unittest.TestCase):
 
 
 class StructureTests(unittest.TestCase):
+    def test_distance_is_positive_when_level_is_above_spot(self):
+        self.assertAlmostEqual(distance_pct(105, 100), 5.0)
+        self.assertAlmostEqual(distance_pct(95, 100), -5.0)
+
+    def test_low_gamma_coverage_suppresses_precise_outputs(self):
+        frame = pd.DataFrame([
+            option_row("20260720", 100 + index, "C" if index % 2 else "P",
+                       1000, years=4 / 365, dte=4)
+            for index in range(8)
+        ])
+        raw = gamma_structure(frame, 100)
+        gated = apply_gamma_quality_gate(
+            raw,
+            {'0DTE': 0, '1-7D': 62, '8-30D': 0, '31-60D': 0, 'ALL': 62},
+            {'0DTE': 0, '1-7D': 62, '8-30D': 0, '31-60D': 0, 'ALL': 62},
+            {'0DTE': 0, '1-7D': 8, '8-30D': 0, '31-60D': 0, 'ALL': 8},
+        )
+        self.assertEqual(gated['ALL']['quality'], 'LOW_COVERAGE')
+        self.assertIsNone(gated['ALL']['net_gamma_m'])
+        self.assertIsNotNone(gated['ALL']['raw_net_gamma_m'])
+        self.assertIsNone(gated['call_wall'])
     def test_put_call_ratio_never_turns_missing_denominator_into_zero(self):
         frame = pd.DataFrame([
             option_row("20260815", 100, "P", 200),

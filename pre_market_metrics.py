@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Pure calculations for the pre-market options monitor."""
 import math
+from copy import deepcopy
 from datetime import datetime, time
 
 import numpy as np
@@ -10,6 +11,7 @@ import pandas as pd
 GAMMA_SIGN_MODEL = "OI_CALL_PLUS_PUT_MINUS_PROXY"
 GAMMA_CURVE_VERSION = "gamma_curve_v2"
 GAMMA_BUCKETS = ("0DTE", "1-7D", "8-30D", "31-60D", "ALL")
+DISTANCE_SIGN_VERSION = "LEVEL_MINUS_SPOT_V2"
 
 
 def finite_number(value, positive=False):
@@ -37,7 +39,7 @@ def distance_pct(level, spot):
     spot = finite_number(spot, positive=True)
     if level is None or spot is None:
         return None
-    return (spot - level) / spot * 100.0
+    return (level - spot) / spot * 100.0
 
 
 def norm_cdf(x):
@@ -275,6 +277,9 @@ def _empty_gamma_bucket():
         "contract_count": 0,
         "expiration_count": 0,
         "expirations": [],
+        "call_count": 0,
+        "put_count": 0,
+        "strike_count": 0,
     }
 
 
@@ -332,6 +337,9 @@ def gamma_structure(frame, spot, grid_width=0.20, grid_points=161):
             "contract_count": int(len(subset)),
             "expiration_count": int(subset["Exp"].nunique()),
             "expirations": sorted(str(value) for value in subset["Exp"].unique()),
+            "call_count": int((subset["R"] == "C").sum()),
+            "put_count": int((subset["R"] == "P").sum()),
+            "strike_count": int(subset["S"].nunique()),
         }
 
     near = working[working["Bucket"].isin(("0DTE", "1-7D"))].copy()
@@ -358,6 +366,72 @@ def gamma_structure(frame, spot, grid_width=0.20, grid_points=161):
                 "PIN_CANDIDATE" if all_gamma is not None and all_gamma >= 0
                 else "BREAKOUT_PIVOT"
             )
+    return result
+
+
+def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
+                             oi_valid_counts):
+    """Suppress precise Gamma outputs when sampled-chain coverage is unusable."""
+    result = deepcopy(structure)
+    minimum_contracts = {
+        "0DTE": 12, "1-7D": 12, "8-30D": 16,
+        "31-60D": 12, "ALL": 30,
+    }
+    for bucket in GAMMA_BUCKETS:
+        metrics = result[bucket]
+        requested = int(requested_counts.get(bucket, 0) or 0)
+        qualified = int(qualified_counts.get(bucket, 0) or 0)
+        oi_valid = int(oi_valid_counts.get(bucket, 0) or 0)
+        valid = int(metrics.get("contract_count", 0) or 0)
+        coverage = valid / requested if requested > 0 else 0.0
+
+        if requested == 0:
+            quality = "NO_EXPIRY"
+        elif qualified == 0:
+            quality = "QUALIFICATION_FAILED"
+        elif oi_valid == 0:
+            quality = "OI_MISSING"
+        elif valid == 0:
+            quality = "IV_MISSING"
+        elif (
+            valid < minimum_contracts[bucket]
+            or coverage < 0.20
+            or metrics.get("call_count", 0) < 4
+            or metrics.get("put_count", 0) < 4
+            or metrics.get("strike_count", 0) < 4
+        ):
+            quality = "LOW_COVERAGE"
+        else:
+            quality = "OK"
+
+        metrics.update({
+            "quality": quality,
+            "requested_contract_count": requested,
+            "qualified_contract_count": qualified,
+            "oi_valid_contract_count": oi_valid,
+            "coverage_pct": coverage * 100.0,
+            "raw_net_gamma_m": metrics.get("net_gamma_m"),
+            "raw_primary_flip": metrics.get("primary_flip"),
+            "raw_zero_points": metrics.get("zero_points", []),
+        })
+        if quality != "OK":
+            metrics["net_gamma_m"] = None
+            metrics["primary_flip"] = None
+            metrics["zero_points"] = []
+
+    active_near = [
+        bucket for bucket in ("0DTE", "1-7D")
+        if result[bucket]["requested_contract_count"] > 0
+    ]
+    if not active_near or any(result[bucket]["quality"] != "OK"
+                              for bucket in active_near):
+        result["call_wall"] = None
+        result["put_wall"] = None
+        result["pin_strike"] = None
+        result["pin_state"] = None
+    result["quality"] = {
+        bucket: result[bucket]["quality"] for bucket in GAMMA_BUCKETS
+    }
     return result
 
 

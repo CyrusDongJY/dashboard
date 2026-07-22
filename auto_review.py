@@ -40,6 +40,7 @@ from market_utils import (
 CRITICAL_FIELDS = [
     'macro_score', 'micro_score', 'vix', 'move', 'credit_spread',
     'pct_200ma', 'trin', 'dix', 'gex', 'hyg_tlt_ratio', 'credit_z', 'cg_z',
+    'dix_gex_source_date', 'cot_report_date', 'concentration_quality',
 ]
 
 def run_dashboard():

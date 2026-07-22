@@ -20,7 +20,11 @@ from market_utils import (
     attach_metadata, safe_upsert,
     log_data_quality, find_missing_fields,
 )
-from data_contracts import calculate_iv_rank_percentile
+from data_contracts import (
+    calculate_iv_rank_percentile,
+    gap_acceptance,
+    vwap_acceptance,
+)
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -187,30 +191,112 @@ def get_market_breadth_ib(ib):
         try:
             contracts = ib.qualifyContracts(Stock(sym, 'SMART', 'USD'))
             if not contracts:
-                perf_dict[sym] = 0
+                perf_dict[sym] = None
                 continue
             bars = ib.reqHistoricalData(contracts[0], endDateTime='', durationStr='2 D', barSizeSetting='1 day', whatToShow='TRADES', useRTH=True)
             if bars and len(bars) >= 2:
                 perf_dict[sym] = (bars[-1].close / bars[-2].close - 1) * 100
-            else: perf_dict[sym] = 0
-        except: perf_dict[sym] = 0
+            else: perf_dict[sym] = None
+        except Exception as exc:
+            logger.warning(f"{sym} 广度收益获取失败: {exc}")
+            perf_dict[sym] = None
 
     mag7_list = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA']
-    mag7_perf = [perf_dict[sym] for sym in mag7_list if sym in perf_dict]
-    avg_mag7 = sum(mag7_perf) / len(mag7_perf) if mag7_perf else 0
+    mag7_perf = [perf_dict.get(sym) for sym in mag7_list
+                 if perf_dict.get(sym) is not None]
+    avg_mag7 = (sum(mag7_perf) / len(mag7_perf)
+                if len(mag7_perf) == len(mag7_list) else None)
 
-    spy_perf = perf_dict.get('SPY', 0)
-    rsp_perf = perf_dict.get('RSP', 0)
-    diff_perf = avg_mag7 - rsp_perf
+    spy_perf = perf_dict.get('SPY')
+    rsp_perf = perf_dict.get('RSP')
+    diff_perf = (avg_mag7 - rsp_perf
+                 if avg_mag7 is not None and rsp_perf is not None else None)
 
-    report += f"- 头部科技 (Mag 7) 平均涨跌: {avg_mag7:+.2f}%\n"
-    report += f"- 标普500 (SPY) 整体涨跌: {spy_perf:+.2f}%\n"
-    report += f"- 标普等权重 (RSP) 真实涨跌: {rsp_perf:+.2f}%\n"
-    report += f"- 巨头与等权重偏差率: {diff_perf:+.2f}% (正值代表资金极度抱团巨头)\n\n"
+    def fmt(value):
+        return f"{value:+.2f}%" if value is not None else "NA"
+
+    report += f"- Mag 7等权平均涨跌: {fmt(avg_mag7)} (样本 {len(mag7_perf)}/7)\n"
+    report += f"- 标普500市值权重(SPY): {fmt(spy_perf)}\n"
+    report += f"- 标普500等权重(RSP): {fmt(rsp_perf)}\n"
+    report += f"- Mag7−RSP相对表现差: {fmt(diff_perf)} (集中度观察，不推断资金主体)\n\n"
     
     return report, {
-        "mag7_perf_pct": round(avg_mag7, 2), "rsp_perf_pct": round(rsp_perf, 2), "breadth_diff_pct": round(diff_perf, 2)
+        "mag7_perf_pct": round(avg_mag7, 2) if avg_mag7 is not None else None,
+        "rsp_perf_pct": round(rsp_perf, 2) if rsp_perf is not None else None,
+        "breadth_diff_pct": round(diff_perf, 2) if diff_perf is not None else None,
+        "mag7_rsp_spread_pct": round(diff_perf, 2) if diff_perf is not None else None,
+        "mag7_sample_count": len(mag7_perf),
     }
+
+
+def get_cash_acceptance_ib(ib, symbol):
+    """End-of-day gap and contemporaneous cumulative-VWAP acceptance diagnostics."""
+    report = f"\n--- 现金市场接受度 ({symbol}) ---\n"
+    result = {}
+    try:
+        contracts = ib.qualifyContracts(Stock(symbol, 'SMART', 'USD'))
+        if not contracts:
+            return report + "合约不可用。\n", result
+        contract = contracts[0]
+        daily = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='30 D',
+            barSizeSetting='1 day', whatToShow='TRADES', useRTH=True)
+        if daily and len(daily) >= 21:
+            daily_frame = pd.DataFrame([{
+                'high': bar.high, 'low': bar.low, 'close': bar.close,
+                'open': bar.open,
+            } for bar in daily])
+            previous = daily_frame['close'].shift(1)
+            true_range = pd.concat([
+                daily_frame['high'] - daily_frame['low'],
+                (daily_frame['high'] - previous).abs(),
+                (daily_frame['low'] - previous).abs(),
+            ], axis=1).max(axis=1)
+            gap = gap_acceptance(
+                daily_frame['close'].iloc[-2], daily_frame['open'].iloc[-1],
+                daily_frame['close'].iloc[-1], true_range.tail(20).mean())
+        else:
+            gap = gap_acceptance(None, None, None)
+
+        intraday = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='1 D',
+            barSizeSetting='5 mins', whatToShow='TRADES', useRTH=True)
+        vwap = vwap_acceptance([{
+            'high': bar.high, 'low': bar.low, 'close': bar.close,
+            'volume': bar.volume,
+        } for bar in (intraday or [])])
+
+        prefix = symbol.lower()
+        result.update({
+            f'{prefix}_gap_pct': round(gap['gap_pct'], 4)
+            if gap['gap_pct'] is not None else None,
+            f'{prefix}_gap_acceptance': round(gap['acceptance_ratio'], 4)
+            if gap['acceptance_ratio'] is not None else None,
+            f'{prefix}_gap_quality': gap['quality'],
+            f'{prefix}_vwap_time_acceptance_pct': round(
+                vwap['time_acceptance_pct'], 2)
+            if vwap['time_acceptance_pct'] is not None else None,
+            f'{prefix}_vwap_volume_acceptance_pct': round(
+                vwap['volume_acceptance_pct'], 2)
+            if vwap['volume_acceptance_pct'] is not None else None,
+            f'{prefix}_vwap_sample_count': vwap['sample_count'],
+            f'{prefix}_vwap_quality': vwap['quality'],
+        })
+        gap_ratio = (f"{gap['acceptance_ratio'] * 100:.1f}%"
+                     if gap['acceptance_ratio'] is not None else "NA")
+        time_value = (f"{vwap['time_acceptance_pct']:.1f}%"
+                      if vwap['time_acceptance_pct'] is not None else "NA")
+        volume_value = (f"{vwap['volume_acceptance_pct']:.1f}%"
+                        if vwap['volume_acceptance_pct'] is not None else "NA")
+        report += (
+            f"缺口接受率: {gap_ratio} | 状态={gap['state']} | "
+            f"质量={gap['quality']}\n"
+            f"动态VWAP接受: 时间={time_value} / 成交量={volume_value} | "
+            f"样本={vwap['sample_count']}/78 | 质量={vwap['quality']}\n")
+    except Exception as exc:
+        logger.warning(f"{symbol} 现金市场接受度获取失败: {exc}")
+        report += f"计算失败: {exc}\n"
+    return report, result
 
 def get_spot_poc_obv_ib(ib, symbol, duration='6 M'):
     report = f"\n--- 📍 现货筹码与资金动能 ({symbol}) ---\n"
@@ -263,12 +349,19 @@ def get_spot_poc_obv_ib(ib, symbol, duration='6 M'):
         except Exception as e:
             logger.warning(f"{symbol} POC 计算失败: {e}")
 
-        report += f"绝对成本核 (POC): {('$' + format(poc_price, '.2f')) if poc_price is not None else '未知'}\n"
+        report += f"6M日线收盘价分箱POC代理: {('$' + format(poc_price, '.2f')) if poc_price is not None else '未知'}\n"
         if poc_price is not None:
             report += "当前价格位阶: 位于 POC 之上\n" if curr_price >= poc_price else "当前价格位阶: 跌破 POC 水位\n"
         report += f"近5日动能 (OBV): {obv_status}\n"
 
-        return report, {"poc_price": round(poc_price, 2) if poc_price is not None else None, "obv_status": obv_status, "close_price": round(curr_price, 2)}
+        return report, {
+            "poc_price": round(poc_price, 2) if poc_price is not None else None,
+            "poc_method": "daily_close_volume_bin_50_v2",
+            "poc_window": duration,
+            "poc_source_date": pd.Timestamp(df['Date'].iloc[-1]).date().isoformat(),
+            "obv_status": obv_status,
+            "close_price": round(curr_price, 2),
+        }
     except Exception as e: 
         return report + f"⚠️ 现货筹码计算异常: {e}\n", {}
 
@@ -487,11 +580,13 @@ def get_report():
         ib.reqMarketDataType(4)
 
         report += "\n【模块零：日内动能绝对值】\n"
-        ib.qualifyContracts(*[Stock('QQQ', 'SMART', 'USD'), Stock('QQQE', 'SMART', 'USD')])
+        comparison_symbols = ['QQQ', 'QQQE', 'SPY', 'RSP']
+        ib.qualifyContracts(*[
+            Stock(symbol, 'SMART', 'USD') for symbol in comparison_symbols])
         hist_data_c2c = {}
         hist_data_o2c = {}
         
-        for s in [Stock('QQQ', 'SMART', 'USD'), Stock('QQQE', 'SMART', 'USD')]:
+        for s in [Stock(symbol, 'SMART', 'USD') for symbol in comparison_symbols]:
             try:
                 contracts = ib.qualifyContracts(s)
                 if not contracts: continue
@@ -499,34 +594,58 @@ def get_report():
                 if bars and len(bars) >= 2:
                     hist_data_c2c[s.symbol] = (bars[-1].close - bars[-2].close) / bars[-2].close * 100
                     hist_data_o2c[s.symbol] = (bars[-1].close - bars[-1].open) / bars[-1].open * 100
-                elif bars and len(bars) == 1:
-                    hist_data_c2c[s.symbol] = 0
-                    hist_data_o2c[s.symbol] = (bars[0].close - bars[0].open) / bars[0].open * 100
-            except: pass
+            except Exception as exc:
+                logger.warning(f"{s.symbol} 双轨动能获取失败: {exc}")
 
-        qqq_c2c = hist_data_c2c.get('QQQ', 0)
-        qqqe_c2c = hist_data_c2c.get('QQQE', 0)
-        qqq_o2c = hist_data_o2c.get('QQQ', 0)
-        qqqe_o2c = hist_data_o2c.get('QQQE', 0)
+        qqq_c2c = hist_data_c2c.get('QQQ')
+        qqqe_c2c = hist_data_c2c.get('QQQE')
+        spy_c2c = hist_data_c2c.get('SPY')
+        rsp_c2c = hist_data_c2c.get('RSP')
+        qqq_o2c = hist_data_o2c.get('QQQ')
+        qqqe_o2c = hist_data_o2c.get('QQQE')
         
-        diff_c2c = qqq_c2c - qqqe_c2c
-        diff_o2c = qqq_o2c - qqqe_o2c
+        diff_c2c = (qqq_c2c - qqqe_c2c
+                    if qqq_c2c is not None and qqqe_c2c is not None else None)
+        diff_o2c = (qqq_o2c - qqqe_o2c
+                    if qqq_o2c is not None and qqqe_o2c is not None else None)
+        spy_rsp = (spy_c2c - rsp_c2c
+                   if spy_c2c is not None and rsp_c2c is not None else None)
+
+        def perf_text(value):
+            return f"{value:+.2f}%" if value is not None else "NA"
 
         report += f"【模块零：双轨动能透视】\n"
         report += f"📊 宏观表象 (包含跳空，看总盈亏)\n"
-        report += f"- QQQ 总涨跌幅: {qqq_c2c:+.2f}%\n"
-        report += f"- QQQE 总涨跌幅: {qqqe_c2c:+.2f}%\n"
-        report += f"- 宏观广度差额: {diff_c2c:+.2f}% (正值代表巨头拉盘)\n\n"
+        report += f"- QQQ 总涨跌幅: {perf_text(qqq_c2c)}\n"
+        report += f"- QQQE 总涨跌幅: {perf_text(qqqe_c2c)}\n"
+        report += f"- QQQ−QQQE市值权重集中度差: {perf_text(diff_c2c)}\n"
+        report += f"- SPY−RSP市值权重集中度差: {perf_text(spy_rsp)}\n"
+        report += "  注：正值只表示市值权重指数相对占优，不推断资金主体。\n\n"
         
         report += f"🕵️ 微观真相 (排除跳空，看主力日内买卖)\n"
-        report += f"- QQQ 日内真实动能: {qqq_o2c:+.2f}%\n"
-        report += f"- QQQE 日内真实动能: {qqqe_o2c:+.2f}%\n"
-        report += f"- 日内广度差额: {diff_o2c:+.2f}% (负值代表巨头盘中遭暗中派发)\n\n"
+        report += f"- QQQ 开收到收盘: {perf_text(qqq_o2c)}\n"
+        report += f"- QQQE 开收到收盘: {perf_text(qqqe_o2c)}\n"
+        report += f"- 日内市值权重差: {perf_text(diff_o2c)}\n\n"
         
         rep_breadth, dict_breadth = get_market_breadth_ib(ib)
         report += rep_breadth
         macro_data_db.update(dict_breadth)
-        macro_data_db['qqq_mom_pct'] = round(qqq_c2c, 2)
+        macro_data_db['qqq_mom_pct'] = (
+            round(qqq_c2c, 2) if qqq_c2c is not None else None)
+        macro_data_db['qqq_qqqe_spread_pct'] = (
+            round(diff_c2c, 2) if diff_c2c is not None else None)
+        macro_data_db['spy_rsp_spread_pct'] = (
+            round(spy_rsp, 2) if spy_rsp is not None else None)
+        macro_data_db['concentration_quality'] = (
+            'OK' if diff_c2c is not None and spy_rsp is not None
+            and dict_breadth.get('mag7_sample_count') == 7 else 'PARTIAL')
+
+        report += "\n【模块一B：现金市场接受度影子指标】\n"
+        for acceptance_symbol in ('SPY', 'QQQ'):
+            acceptance_report, acceptance_data = get_cash_acceptance_ib(
+                ib, acceptance_symbol)
+            report += acceptance_report
+            macro_data_db.update(acceptance_data)
 
         rep_drag, dict_drag = get_etf_structural_drag(ib, 'QQQ', 'TQQQ', leverage=3)
         macro_data_db.update(dict_drag)
@@ -557,6 +676,9 @@ def get_report():
                 "date": today_str, "ticker": sym,
                 "current_price": dict_poc.get("close_price"),
                 "poc_price": dict_poc.get("poc_price"),
+                "poc_method": dict_poc.get("poc_method"),
+                "poc_window": dict_poc.get("poc_window"),
+                "poc_source_date": dict_poc.get("poc_source_date"),
                 "obv_status": dict_poc.get("obv_status"),
                 "ivr_pct": dict_ivr.get("ivr_pct"),
                 "iv_rank_pct": dict_ivr.get("iv_rank_pct"),
@@ -573,7 +695,12 @@ def get_report():
 
         # 数据质量审计
         try:
-            macro_missing = find_missing_fields(macro_data_db, ['vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct', 'qqq_poc_price', 'spy_poc_price'])
+            macro_missing = find_missing_fields(macro_data_db, [
+                'vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct',
+                'qqq_poc_price', 'spy_poc_price', 'concentration_quality',
+                'spy_gap_quality', 'qqq_gap_quality',
+                'spy_vwap_quality', 'qqq_vwap_quality',
+            ])
             log_data_quality(
                 supabase, job_name='daily_post_close', table_name='stock_spot_post_close',
                 status='ok' if rows_written == len(SYMBOLS) else ('partial' if rows_written > 0 else 'failed'),

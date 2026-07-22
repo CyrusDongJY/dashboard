@@ -27,6 +27,23 @@
   `CONTEXT_ONLY`，在接入基金管理人级日度来源前不参与 Waterline 评分；
 - Waterline 数据不足时显示各组件有效观测数/最低要求，不再只显示覆盖率 0。
 
+2026-07-22 交易判断与解释口径补强：
+
+- 关键位距离统一为 `(level - spot) / spot`，正值表示关键位在现价上方；
+  新增 `LEVEL_MINUS_SPOT_V2` 版本，异常引擎不拼接旧符号历史；
+- Gamma增加请求、合约资格、OI、IV、Call/Put、执行价和覆盖率闸门；
+  `LOW_COVERAGE` 只保留原始诊断，不发布正式Gamma、Flip或墙位；
+- QQQ存在0DTE但无法计算时，明确区分无到期日、合约资格失败、OI缺失、
+  IV缺失和低覆盖；
+- U/D继续fail-closed，并记录UVOL/DVOL原值、来源与IBKR抓取失败诊断；
+- DIX/GEX补源日期并统一降为context-only，异常引擎不再赋予确定方向；
+- QQQ−QQQE、SPY−RSP、Mag7−RSP分列，缺数写NULL，不再用0制造差值；
+- HYG/TLT同时输出HYG与TLT 21日收益，净流动性明确为63业务日ROC；
+- COT输出报告日期、Leveraged Money类别、净仓/OI、156周Z值和样本数；
+- 新增缺口接受率、动态累计VWAP时间/成交量接受率影子指标；
+- 集中度贡献采用点时权重差乘收益的互斥分组算法；权重源未通过验收时
+  返回 `POINT_IN_TIME_WEIGHTS_UNAVAILABLE`，不生成伪精确归因。
+
 ## 一、部署步骤（按顺序）
 
 1. **执行数据库迁移**：在 Supabase SQL Editor 中运行 [migrations.sql](migrations.sql)。

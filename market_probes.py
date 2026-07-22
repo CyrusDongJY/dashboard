@@ -183,7 +183,10 @@ def scan_volatility_spot(supabase, cutoff_date):
 
     breadth_diff = pd.to_numeric(today.get('breadth_diff_pct', np.nan), errors='coerce')
     if pd.notna(breadth_diff):
-        if breadth_diff > 1.5: report_lines.append(f"⚠️ 【严重抱团】Mag7 表现领先等权重(RSP) {breadth_diff:+.2f}%，掩盖内部抛压。"); alert_level += 1
+        if breadth_diff > 1.5:
+            report_lines.append(
+                f"ℹ️ 【市值权重集中度观察】Mag7相对RSP领先 "
+                f"{breadth_diff:+.2f}%；仅说明相对表现集中，不归因资金主体。")
         elif breadth_diff < -1.5: report_lines.append(f"⚠️ 【巨头失血】资金撤出头部科技股，落后大盘 {breadth_diff:+.2f}%。")
 
     tqqq_drag = pd.to_numeric(today.get('tqqq_drag_pct', np.nan), errors='coerce')

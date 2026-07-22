@@ -46,9 +46,9 @@ METRIC_REGISTRY = {
                           "abs": [(">", 10, 1)], "z": (2.0, 3.0)},
     "vix_term_ratio":  {"cn": "VIX/VIX3M", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">=", 1.0, 2)], "z": (2.0, 3.0)},
-    "dix_pct":         {"cn": "DIX场外短售代理", "bad_dir": -1, "scope": "MACRO",
+    "dix_pct":         {"cn": "DIX场外短售代理", "bad_dir": 0, "scope": "MACRO",
                           "abs": None, "z": (2.0, 3.0)},
-    "gex_billions":    {"cn": "GEX做市商Gamma代理", "bad_dir": -1, "scope": "MACRO",
+    "gex_billions":    {"cn": "GEX做市商Gamma代理", "bad_dir": 0, "scope": "MACRO",
                           "abs": None, "z": (2.0, 3.0)},
     # 信用与流动性
     "credit_spread":   {"cn": "高收益债信用利差", "bad_dir": +1, "scope": "MACRO",
@@ -63,8 +63,17 @@ METRIC_REGISTRY = {
     "pct_200ma":       {"cn": "200MA占比", "bad_dir": -1, "scope": "MACRO",
                           "abs": [("<", 30, 2), ("<", 40, 1)], "z": (2.0, 3.0)},
     "pct_20ma":        {"cn": "20MA占比", "bad_dir": -1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
-    "breadth_diff_pct":{"cn": "Mag7-RSP广度差", "bad_dir": +1, "scope": "MACRO",
+    "pct_50ma":        {"cn": "50MA占比", "bad_dir": -1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "pct_adv":         {"cn": "当日上涨家数占比", "bad_dir": -1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "breadth_diff_pct":{"cn": "Mag7-RSP集中度差", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 1.5, 1)], "z": (2.0, 3.0)},
+    "qqq_qqqe_spread_pct":{"cn": "QQQ-QQQE集中度差", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "spy_rsp_spread_pct":{"cn": "SPY-RSP集中度差", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "mag7_rsp_spread_pct":{"cn": "Mag7-RSP相对表现差", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "spy_gap_acceptance":{"cn": "SPY缺口接受率", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "qqq_gap_acceptance":{"cn": "QQQ缺口接受率", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "spy_vwap_time_acceptance_pct":{"cn": "SPY动态VWAP时间接受率", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "qqq_vwap_time_acceptance_pct":{"cn": "QQQ动态VWAP时间接受率", "bad_dir": 0, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
     "trin":            {"cn": "前500大市值样本TRIN", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 2.0, 1)], "z": (2.5, 3.5)},
     # 跨资产
@@ -497,9 +506,11 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
     # ---- 宏观：market_history ----
     mh = _fetch_history(supabase, 'market_history', 'record_date', end_date=report_date)
     if not mh.empty:
-        macro_metrics = ['vix', 'move', 'vvix', 'credit_spread', 'credit_z', 'nfci',
-                         'hyg_tlt_ratio', 'net_liq', 'pct_200ma', 'pct_20ma', 'trin',
-                         'dxy', 'cg_z']
+        macro_metrics = [
+            'vix', 'move', 'vvix', 'credit_spread', 'credit_z', 'nfci',
+            'hyg_tlt_ratio', 'net_liq', 'pct_200ma', 'pct_50ma', 'pct_20ma',
+            'pct_adv', 'trin', 'dxy', 'cg_z',
+        ]
         for m in macro_metrics:
             if m in mh.columns:
                 src = _metric_source_date(mh, m, 'record_date', ('source_date',))
@@ -519,7 +530,13 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
     # ---- 现货波动率：macro_spot_daily ----
     ms = _fetch_history(supabase, 'macro_spot_daily', 'date', end_date=report_date)
     if not ms.empty:
-        for m in ['vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct']:
+        for m in [
+            'vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct',
+            'qqq_qqqe_spread_pct', 'spy_rsp_spread_pct',
+            'mag7_rsp_spread_pct', 'spy_gap_acceptance',
+            'qqq_gap_acceptance', 'spy_vwap_time_acceptance_pct',
+            'qqq_vwap_time_acceptance_pct',
+        ]:
             if m in ms.columns:
                 src = _metric_source_date(ms, m, 'date', ('source_date',))
                 events += scan_metric(m, ms[m], report_date, scope="MACRO", source_date=src)
@@ -562,11 +579,17 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
                 for m in pre_metrics:
                     if m not in g.columns:
                         continue
+                    metric_series = g[m]
+                    if (m.startswith('distance_to_')
+                            and 'distance_sign_version' in g.columns):
+                        metric_series = g.loc[
+                            g['distance_sign_version'] == 'LEVEL_MINUS_SPOT_V2', m]
                     source_cols = ('dpsv_source_date', 'source_date') if m == 'dpsv_pct' else ('source_date',)
                     src = _metric_source_date(g, m, 'date', source_cols)
-                    events += scan_metric(m, g[m], report_date, scope=tkr, source_date=src)
+                    events += scan_metric(
+                        m, metric_series, report_date, scope=tkr, source_date=src)
                     row = metric_snapshot(
-                        m, g[m], report_date, scope=tkr, source_date=src,
+                        m, metric_series, report_date, scope=tkr, source_date=src,
                         session=session, is_final=is_final,
                         source_name="stock_options_pre_market")
                     if row: snap_rows.append(row)

@@ -4,8 +4,12 @@ import pandas as pd
 
 from data_contracts import (
     calculate_iv_rank_percentile,
+    classify_hyg_tlt,
+    concentration_attribution,
     compute_etf_share_metrics,
+    gap_acceptance,
     up_down_volume_ratio,
+    vwap_acceptance,
 )
 from pre_market_metrics import gamma_structure
 
@@ -31,6 +35,47 @@ class IVDefinitionTests(unittest.TestCase):
         skewed = calculate_iv_rank_percentile([10, 10.5, 11, 19, 20, 12])
         self.assertAlmostEqual(skewed["iv_rank_pct"], 20.0)
         self.assertAlmostEqual(skewed["iv_percentile_pct"], 50.0)
+
+
+class AcceptanceTests(unittest.TestCase):
+    def test_gap_acceptance_expansion_and_small_gap_guard(self):
+        expanded = gap_acceptance(100, 101, 101.25, atr20=2)
+        self.assertEqual(expanded['quality'], 'OK')
+        self.assertEqual(expanded['state'], 'EXPANDED')
+        self.assertAlmostEqual(expanded['acceptance_ratio'], 1.25)
+
+        small = gap_acceptance(100, 100.05, 101, atr20=2)
+        self.assertEqual(small['quality'], 'SMALL_GAP')
+        self.assertIsNone(small['acceptance_ratio'])
+
+    def test_vwap_acceptance_uses_contemporaneous_cumulative_vwap(self):
+        result = vwap_acceptance([
+            {'high': 100.2, 'low': 99.8, 'close': 100, 'volume': 100},
+            {'high': 101.2, 'low': 100.8, 'close': 101, 'volume': 100},
+            {'high': 102.2, 'low': 101.8, 'close': 102, 'volume': 100},
+        ], expected_samples=3)
+        self.assertEqual(result['quality'], 'OK')
+        self.assertAlmostEqual(result['time_acceptance_pct'], 2 / 3 * 100)
+        self.assertAlmostEqual(result['volume_acceptance_pct'], 2 / 3 * 100)
+
+    def test_hyg_tlt_label_does_not_call_rate_driven_ratio_full_risk_on(self):
+        self.assertEqual(
+            classify_hyg_tlt(1.0, -2.0, 3.0),
+            'CREDIT_STRONG_RATE_DRIVEN')
+
+    def test_concentration_attribution_uses_exclusive_weight_differences(self):
+        result = concentration_attribution(
+            {'NVDA': 2.0, 'AMD': 1.0},
+            {'NVDA': 0.7, 'AMD': 0.3},
+            {'NVDA': 0.5, 'AMD': 0.5},
+            {'NVDA': 'MAG7', 'AMD': 'SEMIS_EX_MAG7'},
+        )
+        self.assertEqual(result['quality'], 'OK')
+        self.assertAlmostEqual(result['spread_pct'], 0.2)
+        self.assertAlmostEqual(
+            result['group_contributions_pct']['MAG7'], 0.4)
+        self.assertAlmostEqual(
+            result['group_contributions_pct']['SEMIS_EX_MAG7'], -0.2)
 
 
 class ETFShareHistoryTests(unittest.TestCase):

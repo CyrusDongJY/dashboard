@@ -252,8 +252,11 @@ class GlobalSentinel:
             if bars:
                 return float(bars[-1].close)
         except Exception:
-            pass
+            self.log(
+                f"⚠️ {getattr(contract, 'symbol', 'UNKNOWN')} 历史行情兜底失败")
             
+        self.log(
+            f"⚠️ {getattr(contract, 'symbol', 'UNKNOWN')} 行情不可用，返回缺失")
         return 0.0
 
     def run_scan(self):
@@ -312,7 +315,9 @@ class GlobalSentinel:
             "pcr_source_date": self.opt_ctx.get('oi_source_date'),
             "poc_date": self.spot_ctx.get('date'),
             "poc_as_of": self.spot_ctx.get('as_of_time'),
-            "poc_method": "6m_daily_close_volume_profile_50_bins",
+            "poc_method": self.spot_ctx.get('poc_method'),
+            "poc_window": self.spot_ctx.get('poc_window'),
+            "poc_source_date": self.spot_ctx.get('poc_source_date'),
             "trin_closing_auction_inclusion": "UNVERIFIED",
         }
 
@@ -333,27 +338,50 @@ class GlobalSentinel:
             self.ib.qualifyContracts(*contracts.values())
             
             with market_data_subscription(self.ib, contracts.values(), 4) as tickers:
-                t_dict = {t.contract.symbol: t for t in tickers}
+                t_dict = {
+                    getattr(t.contract, 'conId', None): t for t in tickers
+                    if getattr(t, 'contract', None) is not None
+                }
+
+                def ticker_for(key):
+                    return t_dict.get(getattr(contracts[key], 'conId', None))
 
                 # 提取数据，全部过一遍 "重武器" 函数
-                spy_px = self.get_robust_index_val(contracts['SPY'], t_dict['SPY'])
+                spy_px = self.get_robust_index_val(
+                    contracts['SPY'], ticker_for('SPY'))
                 if spy_px == 0: 
                     self.log("⚠️ SPY 现价获取失败，跳过本次扫描。")
                     return
 
-                adv_val = self.get_robust_index_val(contracts['ADV'], t_dict['ADV-NYSE'])
-                decl_val = self.get_robust_index_val(contracts['DECL'], t_dict['DECL-NYSE'])
+                adv_val = self.get_robust_index_val(
+                    contracts['ADV'], ticker_for('ADV'))
+                decl_val = self.get_robust_index_val(
+                    contracts['DECL'], ticker_for('DECL'))
                 add_val = adv_val - decl_val  # ✅ 完美算出真实的 ADD
                 
-                uvol_val = self.get_robust_index_val(contracts['UVOL'], t_dict['UVOL-NYSE'])
-                dvol_val = self.get_robust_index_val(contracts['DVOL'], t_dict['DVOL-NYSE'])
-                trin_raw = self.get_robust_index_val(contracts['TRIN'], t_dict['TRIN-NYSE'])
+                uvol_val = self.get_robust_index_val(
+                    contracts['UVOL'], ticker_for('UVOL'))
+                dvol_val = self.get_robust_index_val(
+                    contracts['DVOL'], ticker_for('DVOL'))
+                trin_raw = self.get_robust_index_val(
+                    contracts['TRIN'], ticker_for('TRIN'))
                 trin_val = trin_raw if trin_raw > 0 else None
-                tick_now = self.get_robust_index_val(contracts['TICK'], t_dict['TICK-NYSE'])
+                tick_now = self.get_robust_index_val(
+                    contracts['TICK'], ticker_for('TICK'))
 
             # 防除零错：计算量比
             vol_ratio, vol_ratio_status = up_down_volume_ratio(
                 uvol_val, dvol_val)
+            if vol_ratio is None:
+                self.log(
+                    "⚠️ NYSE U/D不可用：请核对UVOL-NYSE/DVOL-NYSE合约、"
+                    "IBKR行情权限及指数历史数据能力")
+            context_metadata.update({
+                "uvol_raw": uvol_val if uvol_val > 0 else None,
+                "dvol_raw": dvol_val if dvol_val > 0 else None,
+                "vol_ratio_status": vol_ratio_status,
+                "ud_source": "IBKR:UVOL-NYSE/DVOL-NYSE",
+            })
             
             # 计算 15 分钟累积 TICK
             ctick_15m_avg = tick_now
@@ -425,8 +453,10 @@ class GlobalSentinel:
                 f"| 到期数={len(all_expirations)} | 零点数={len(all_zeroes)}\n"
             )
             r += (
-                f"最近盘后6M日线POC: {display_number(poc, prefix='$')} "
-                f"(ticker=SPY, 日期={context_metadata['poc_date'] or 'NA'})\n"
+                f"最近完整盘后6M日线收盘价分箱POC代理: {display_number(poc, prefix='$')} "
+                f"(ticker=SPY, 行日期={context_metadata['poc_date'] or 'NA'}, "
+                f"源日期={context_metadata['poc_source_date'] or 'NA'}, "
+                f"方法={context_metadata['poc_method'] or 'NA'})\n"
             )
             r += (
                 f"SPY Put/Call持仓结构比: {display_number(pcr)} "

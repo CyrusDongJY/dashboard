@@ -25,7 +25,11 @@ import math
 import json
 
 from liquidity_sources import OfficialLiquiditySources
-from data_contracts import ETF_FLOW_TICKERS, compute_etf_share_metrics
+from data_contracts import (
+    ETF_FLOW_TICKERS,
+    classify_hyg_tlt,
+    compute_etf_share_metrics,
+)
 
 class UltimateDashboard:
     def __init__(self):
@@ -76,7 +80,8 @@ class UltimateDashboard:
             real_time_tickers = list(self.tickers_dict.keys()) + list(self.sector_dict.keys()) + [
                 '^VIX', '^MOVE', '^VIX3M', '^VVIX', '^SKEW', 
                 'DX-Y.NYB', 'JPY=X', 'BTC-USD', 'GC=F', 'CL=F', '^TNX', 
-                'HYG', 'TLT', 'HG=F'
+                'HYG', 'TLT', 'HG=F', 'QQQE', 'RSP', 'SOXX',
+                'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA'
             ]
             # 2y 数据窗口：保证 252D z-score 基准真正生效（6mo 只有约126个交易日，rolling(252) 全 NaN）
             recent_df = yf.download(real_time_tickers, period="2y", interval="1d", progress=False)['Close']
@@ -191,12 +196,20 @@ class UltimateDashboard:
             self.log(f"⚠️ Treasury日度TGA获取失败，保留FRED周度口径: {exc}")
 
     def fetch_liquidity_and_smf(self):
-        self.smf = {'dix': '-', 'gex': '-', 'sp500_net': '-', 'nasdaq_net': '-', 'cot_vix': '-', 'spy_sh': '-', 'qqq_sh': '-', 'hyg_sh': '-', 'jnk_sh': '-', 'hyg_px': '-', 'jnk_px': '-', 'junk_flow': '-', 'etf_share_metrics': {}}
+        self.smf = {
+            'dix': '-', 'gex': '-', 'dix_gex_source_date': None,
+            'sp500_net': '-', 'nasdaq_net': '-', 'cot_vix': '-',
+            'cot_report_date': None, 'cot_category': 'Leveraged Money',
+            'cot_metadata': {}, 'spy_sh': '-', 'qqq_sh': '-', 'hyg_sh': '-',
+            'jnk_sh': '-', 'hyg_px': '-', 'jnk_px': '-', 'junk_flow': '-',
+            'etf_share_metrics': {},
+        }
         self.score_details.update({
             'trin': '-', 'trin_scope': 'top500_nyse_nasdaq_by_mktcap',
             'trin_source': 'TradingViewScanner', 'trin_as_of': None,
             'trin_closing_auction_inclusion': 'UNVERIFIED',
             'breadth_sample_size': 0,
+            'pct_adv': '-', 'up_down_volume_ratio': '-',
             'pct_20ma': '-', 'pct_50ma': '-', 'pct_200ma': '-',
             'nh': '-', 'nl': '-', 'net_nh_nl': '-',
             'breadth_thrust': '⚪ 未触发'
@@ -206,7 +219,12 @@ class UltimateDashboard:
 
         try:
             df_sm = pd.read_csv("https://squeezemetrics.com/monitor/static/DIX.csv")
-            self.smf.update({'dix': round(df_sm.iloc[-1]['dix'] * 100, 2), 'gex': round(df_sm.iloc[-1]['gex'] / 1e9, 2)})
+            latest_sm = df_sm.iloc[-1]
+            self.smf.update({
+                'dix': round(latest_sm['dix'] * 100, 2),
+                'gex': round(latest_sm['gex'] / 1e9, 2),
+                'dix_gex_source_date': str(latest_sm.get('date'))[:10],
+            })
         except: pass
 
         try:
@@ -214,12 +232,72 @@ class UltimateDashboard:
             date_res = requests.get(url_cftc, params={"$limit": "1", "$select": "report_date_as_yyyy_mm_dd", "$order": "report_date_as_yyyy_mm_dd DESC"}, headers=self.headers, timeout=10).json()
             if date_res:
                 latest_date = date_res[0]['report_date_as_yyyy_mm_dd'][:10]
-                for item in requests.get(url_cftc, params={"report_date_as_yyyy_mm_dd": latest_date, "$limit": "1500"}, headers=self.headers, timeout=15).json():
+                self.smf['cot_report_date'] = latest_date
+                latest_rows = requests.get(
+                    url_cftc,
+                    params={"report_date_as_yyyy_mm_dd": latest_date,
+                            "$limit": "1500"},
+                    headers=self.headers, timeout=15).json()
+
+                def cot_net(row):
+                    return float(row.get(
+                        'lev_money_positions_long_all',
+                        row.get('lev_money_positions_long', 0))) - float(row.get(
+                            'lev_money_positions_short_all',
+                            row.get('lev_money_positions_short', 0)))
+
+                for item in latest_rows:
                     name = item.get('contract_market_name', '').upper()
-                    net = int(float(item.get('lev_money_positions_long_all', item.get('lev_money_positions_long', 0))) - float(item.get('lev_money_positions_short_all', item.get('lev_money_positions_short', 0))))
-                    if 'S&P 500' in name and 'MINI' in name and 'MICRO' not in name: self.smf['sp500_net'] = f"{net:,}"
-                    elif 'NASDAQ' in name and '100' in name and 'MICRO' not in name: self.smf['nasdaq_net'] = f"{net:,}"
-                    elif 'VIX FUTURES' in name: self.smf['cot_vix'] = f"{net:,}"
+                    key = None
+                    output_key = None
+                    if 'S&P 500' in name and 'MINI' in name and 'MICRO' not in name:
+                        key, output_key = 'sp500', 'sp500_net'
+                    elif 'NASDAQ' in name and '100' in name and 'MICRO' not in name:
+                        key, output_key = 'nasdaq100', 'nasdaq_net'
+                    elif 'VIX FUTURES' in name:
+                        key, output_key = 'vix', 'cot_vix'
+                    if key is None:
+                        continue
+                    net = cot_net(item)
+                    self.smf[output_key] = f"{int(net):,}"
+                    code = str(item.get('cftc_contract_market_code', ''))
+                    history = []
+                    if code.replace('-', '').isalnum():
+                        history = requests.get(
+                            url_cftc,
+                            params={
+                                "$where": f"cftc_contract_market_code='{code}'",
+                                "$order": "report_date_as_yyyy_mm_dd DESC",
+                                "$limit": "156",
+                            }, headers=self.headers, timeout=15).json()
+                    net_history_values = []
+                    for row in history:
+                        try:
+                            net_history_values.append(cot_net(row))
+                        except (TypeError, ValueError):
+                            continue
+                    net_history = pd.Series(net_history_values, dtype=float)
+                    zscore = None
+                    if len(net_history) >= 30 and net_history.std(ddof=1) > 0:
+                        zscore = float(
+                            (net - net_history.mean()) / net_history.std(ddof=1))
+                    open_interest = item.get('open_interest_all')
+                    try:
+                        net_oi_pct = net / float(open_interest) * 100.0
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        net_oi_pct = None
+                    self.smf['cot_metadata'][key] = {
+                        'report_date': latest_date,
+                        'category': 'Leveraged Money',
+                        'contract_market_name': item.get('contract_market_name'),
+                        'contract_code': code or None,
+                        'net_contracts': int(net),
+                        'net_open_interest_pct': round(net_oi_pct, 4)
+                        if net_oi_pct is not None else None,
+                        'zscore_156w': round(zscore, 3)
+                        if zscore is not None else None,
+                        'sample_count': int(len(net_history)),
+                    }
         except: pass
 
         try:
@@ -256,6 +334,11 @@ class UltimateDashboard:
                     'trin': round(trin, 2), 'pct_20ma': round((a20 / total) * 100, 1), 
                     'pct_50ma': round((a50 / total) * 100, 1), 'pct_200ma': round((a200 / total) * 100, 1), 
                     'net_nh_nl': nh - nl, 'nh': nh, 'nl': nl,
+                    'pct_adv': round(
+                        adv_i / (adv_i + dec_i) * 100, 1)
+                    if adv_i + dec_i > 0 else None,
+                    'up_down_volume_ratio': round(adv_v / dec_v, 3)
+                    if dec_v > 0 else None,
                     'breadth_sample_size': total,
                     'trin_as_of': pd.Timestamp.now(
                         tz="America/New_York").isoformat(),
@@ -352,6 +435,40 @@ class UltimateDashboard:
         
         self.score_details.update({'macro_score': 0, 'micro_score': 0, 'vix': '-', 'move': '-', 'pcr': '-', 'cmf': '-'})
         self.regime = {'desc': '不明朗', 'spread': self.regime.get('spread', '-'), 'cg_ratio': '-', 'hyg': '-', 'oil': '-', 'dxy': '-', 'btc': '-', 'gold': '-', 'jpy': '-'}
+
+        mag7_symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA']
+        one_day_returns = {}
+        for symbol in ['QQQ', 'QQQE', 'SPY', 'RSP', *mag7_symbols]:
+            if symbol not in df.columns:
+                continue
+            series = self.clean_trading_days(df[symbol])
+            if len(series) >= 2:
+                one_day_returns[symbol] = float(
+                    (series.iloc[-1] / series.iloc[-2] - 1.0) * 100.0)
+        mag7_values = [one_day_returns[symbol] for symbol in mag7_symbols
+                       if symbol in one_day_returns]
+        mag7_return = (sum(mag7_values) / len(mag7_values)
+                       if len(mag7_values) == len(mag7_symbols) else None)
+        qqq_qqqe = (one_day_returns['QQQ'] - one_day_returns['QQQE']
+                    if all(key in one_day_returns for key in ('QQQ', 'QQQE'))
+                    else None)
+        spy_rsp = (one_day_returns['SPY'] - one_day_returns['RSP']
+                   if all(key in one_day_returns for key in ('SPY', 'RSP'))
+                   else None)
+        mag7_rsp = (mag7_return - one_day_returns['RSP']
+                    if mag7_return is not None and 'RSP' in one_day_returns
+                    else None)
+        self.num.update({
+            'qqq_qqqe_spread_pct': round(qqq_qqqe, 4)
+            if qqq_qqqe is not None else None,
+            'spy_rsp_spread_pct': round(spy_rsp, 4)
+            if spy_rsp is not None else None,
+            'mag7_rsp_spread_pct': round(mag7_rsp, 4)
+            if mag7_rsp is not None else None,
+            'concentration_quality': 'OK'
+            if None not in (qqq_qqqe, spy_rsp, mag7_rsp) else 'PARTIAL',
+            'contribution_attribution_status': 'POINT_IN_TIME_WEIGHTS_UNAVAILABLE',
+        })
         
         for k, t in {'dxy':'DX-Y.NYB', 'jpy':'JPY=X', 'oil':'CL=F', 'gold':'GC=F'}.items(): 
             self.regime[k] = round(df[t].iloc[-1], 2) if t in df.columns else '-'
@@ -414,7 +531,10 @@ class UltimateDashboard:
                     self.num['vrp'] = round(float(vrp), 2)
                     self.num['hv20'] = round(float(hv20), 2)
 
-        self.risk_scissors = {'ratio': '-', 'roc_21d': '-', 'state': '-'}
+        self.risk_scissors = {
+            'ratio': '-', 'roc_21d': '-', 'hyg_return_21d': '-',
+            'tlt_return_21d': '-', 'state': '-',
+        }
         if 'HYG' in df.columns and 'TLT' in df.columns:
             s_hyg, s_tlt = self.clean_trading_days(df['HYG']), self.clean_trading_days(df['TLT'])
             common_idx = s_hyg.index.intersection(s_tlt.index)
@@ -422,10 +542,23 @@ class UltimateDashboard:
                 ratio_s = s_hyg.loc[common_idx] / s_tlt.loc[common_idx]
                 cur_r, past_r = ratio_s.iloc[-1], ratio_s.iloc[-21]
                 roc = (cur_r / past_r - 1) * 100
-                state = "🔴聪明钱狂买美债避险" if roc < -2.0 else ("🟢风险偏好全开" if roc > 2.0 else "⚪情绪震荡")
-                self.risk_scissors = {'ratio': f"{cur_r:.3f}", 'roc_21d': f"{roc:+.2f}%", 'state': state}
+                hyg_return = (s_hyg.loc[common_idx].iloc[-1]
+                              / s_hyg.loc[common_idx].iloc[-21] - 1) * 100
+                tlt_return = (s_tlt.loc[common_idx].iloc[-1]
+                              / s_tlt.loc[common_idx].iloc[-21] - 1) * 100
+                state = classify_hyg_tlt(hyg_return, tlt_return, roc)
+                self.risk_scissors = {
+                    'ratio': f"{cur_r:.3f}",
+                    'roc_21d': f"{roc:+.2f}%",
+                    'hyg_return_21d': f"{hyg_return:+.2f}%",
+                    'tlt_return_21d': f"{tlt_return:+.2f}%",
+                    'state': state,
+                }
                 self.num['hyg_tlt_ratio'] = round(float(cur_r), 4)
                 self.num['hyg_tlt_roc21'] = round(float(roc), 2)
+                self.num['hyg_return_21d'] = round(float(hyg_return), 2)
+                self.num['tlt_return_21d'] = round(float(tlt_return), 2)
+                self.num['hyg_tlt_state'] = state
 
         cg_val = cg_z = '-'
         if 'HG=F' in df.columns and 'GC=F' in df.columns:
@@ -489,8 +622,9 @@ class UltimateDashboard:
             nl = (fh['Fed_Assets']/1000) - (fh['TGA']/1000) - fh['RRP']
             if len(nl) >= 63:
                 l_roc = (nl.iloc[-1] / nl.iloc[-63] - 1) * 100
-                self.macro_engines['liq'] = f"ROC: {l_roc:+.2f}%"
+                self.macro_engines['liq'] = f"63业务日ROC: {l_roc:+.2f}%"
                 self.num['liq_roc'] = round(float(l_roc), 2)
+                self.num['liq_roc_window'] = 63
                 m_score += 15 if l_roc < -5.0 else (8 if l_roc < -2.0 else 0)
             
             # 5. M2 货币供应 (M2)
@@ -640,6 +774,19 @@ class UltimateDashboard:
                 f"[{ticker}份额变化]: " + " | ".join(parts)
                 + f" (source={metric.get('source', 'NA')}, context-only)")
         etf_detail_text = "\n".join(etf_lines) if etf_lines else "[ETF份额变化]: 历史不足"
+        def cot_detail(key, output_key):
+            meta = self.smf.get('cot_metadata', {}).get(key, {})
+            return (
+                f"净仓={self.smf.get(output_key, '-')} | "
+                f"报告日={meta.get('report_date', 'NA')} | "
+                f"类别={meta.get('category', 'NA')} | "
+                f"净仓/OI={meta.get('net_open_interest_pct', 'NA')}% | "
+                f"156周Z={meta.get('zscore_156w', 'NA')} | "
+                f"样本={meta.get('sample_count', 0)}"
+            )
+        cot_vix_detail = cot_detail('vix', 'cot_vix')
+        cot_sp500_detail = cot_detail('sp500', 'sp500_net')
+        cot_nasdaq_detail = cot_detail('nasdaq100', 'nasdaq_net')
         
         text_output = f"""
 [净新高−新低]: {self.score_details.get('net_nh_nl', '-')} (正值代表正向广度)
@@ -674,7 +821,7 @@ class UltimateDashboard:
 [期权看跌比PCR]: {self.score_details.get('pcr', '-')}
 [VIX倒挂比]: {self.vol_metrics.get('vix_term', '-')}
 [VRP波动率风险溢价]: {self.vol_metrics.get('vrp', '-')}
-[VIX净持仓COT]: {self.smf.get('cot_vix', '-')}
+[VIX COT]: {cot_vix_detail}
 
 ==== 🦅 股市结构与广度 (样本: 前500大市值股) ====
 [大盘骨架评级]: {self.score_details.get('skeleton', '-')}
@@ -682,13 +829,24 @@ class UltimateDashboard:
 [50MA占比]: {self.score_details.get('pct_50ma', '-')}
 [200MA占比]: {self.score_details.get('pct_200ma', '-')}
 [净新高新低]: 创新高 {self.score_details.get('nh', '-')} / 创新低 {self.score_details.get('nl', '-')}
+[当日上涨家数占比]: {self.score_details.get('pct_adv', '-')}%
+[当日上涨/下跌成交量比]: {self.score_details.get('up_down_volume_ratio', '-')}
 [前500大市值样本TRIN]: {self.score_details.get('trin', '-')} (NYSE+Nasdaq, 样本数={self.score_details.get('breadth_sample_size', 0)}, 截面={self.score_details.get('trin_as_of', 'NA')}, 收盘竞价=UNVERIFIED)
-[做市商敞口GEX]: {self.smf.get('gex', '-')}
-[暗池买盘DIX]: {self.smf.get('dix', '-')}
+[做市商敞口GEX代理]: {self.smf.get('gex', '-')} (源日期={self.smf.get('dix_gex_source_date') or 'NA'}, context-only)
+[DIX场外短售代理]: {self.smf.get('dix', '-')} (源日期={self.smf.get('dix_gex_source_date') or 'NA'}, context-only)
+
+==== 指数集中度相对表现 ====
+[QQQ−QQQE]: {self.num.get('qqq_qqqe_spread_pct', 'NA')}%
+[SPY−RSP]: {self.num.get('spy_rsp_spread_pct', 'NA')}%
+[Mag7−RSP]: {self.num.get('mag7_rsp_spread_pct', 'NA')}%
+[集中度质量]: {self.num.get('concentration_quality', 'PARTIAL')}；正值仅表示市值权重相对占优
+[成分贡献分解]: {self.num.get('contribution_attribution_status')}；缺少点时权重，不生成伪精确归因
 
 ==== ⚖️ 聪明钱避险剪刀差 (HYG/TLT) ====
 [垃圾债/长债比值]: {self.risk_scissors.get('ratio', '-')}
-[近21天趋势动能]: {self.risk_scissors.get('roc_21d', '-')} -> {self.risk_scissors.get('state', '-')}
+[HYG 21日收益]: {self.risk_scissors.get('hyg_return_21d', '-')}
+[TLT 21日收益]: {self.risk_scissors.get('tlt_return_21d', '-')}
+[HYG/TLT 21日相对变化]: {self.risk_scissors.get('roc_21d', '-')} -> {self.risk_scissors.get('state', '-')}
 
 ==== 🏭 11 大 GICS 行业轮动 (相对 SPY 超额收益) ====
 """
@@ -697,8 +855,8 @@ class UltimateDashboard:
 
         text_output += f"""
 ==== 🌍 资产定价与仓位 ====
-[S&P500净持仓]: {self.smf.get('sp500_net', '-')}
-[纳指净持仓]: {self.smf.get('nasdaq_net', '-')}
+[S&P500 COT]: {cot_sp500_detail}
+[Nasdaq100 COT]: {cot_nasdaq_detail}
 [美元指数DXY]: {self.regime.get('dxy', '-')}
 [日元汇率JPY]: {self.regime.get('jpy', '-')}
 [WTI原油Oil]: {self.regime.get('oil', '-')}
@@ -786,6 +944,8 @@ class UltimateDashboard:
             "cot_vix": nz(sm.get('cot_vix')), "vrp": vm.get('vrp'),
             "pct_20ma": nz(sd.get('pct_20ma')), "pct_50ma": nz(sd.get('pct_50ma')),
             "pct_200ma": nz(sd.get('pct_200ma')),
+            "pct_adv": nz(sd.get('pct_adv')),
+            "up_down_volume_ratio": nz(sd.get('up_down_volume_ratio')),
             "new_highs": nz(sd.get('nh')), "new_lows": nz(sd.get('nl')),
             "net_nh_nl": nz(sd.get('net_nh_nl')),
             "nh_nl": f"创新高 {sd.get('nh', '-')} / 创新低 {sd.get('nl', '-')}",
@@ -796,6 +956,11 @@ class UltimateDashboard:
             "trin_closing_auction_inclusion": sd.get(
                 'trin_closing_auction_inclusion'),
             "breadth_sample_size": int(sd.get('breadth_sample_size', 0) or 0),
+            "qqq_qqqe_spread_pct": num.get('qqq_qqqe_spread_pct'),
+            "spy_rsp_spread_pct": num.get('spy_rsp_spread_pct'),
+            "mag7_rsp_spread_pct": num.get('mag7_rsp_spread_pct'),
+            "breadth_diff_pct": num.get('mag7_rsp_spread_pct'),
+            "concentration_quality": num.get('concentration_quality'),
             "sp500_net": nz(sm.get('sp500_net')), "nasdaq_net": nz(sm.get('nasdaq_net')),
             "dxy": nz(rg.get('dxy')), "jpy": nz(rg.get('jpy')), "oil": nz(rg.get('oil')),
             "gold": nz(rg.get('gold')), "btc": nz(rg.get('btc')), "cmf": nz(sd.get('cmf')),
@@ -804,12 +969,20 @@ class UltimateDashboard:
             "hyg_px": nz(sm.get('hyg_px')), "jnk_px": nz(sm.get('jnk_px')),
             "hyg_tlt_ratio": num.get('hyg_tlt_ratio'),
             "hyg_tlt_trend": f"{self.risk_scissors.get('roc_21d', '-')} -> {self.risk_scissors.get('state', '-')}",
+            "hyg_return_21d": num.get('hyg_return_21d'),
+            "tlt_return_21d": num.get('tlt_return_21d'),
+            "hyg_tlt_state": num.get('hyg_tlt_state'),
             "tnx_z": num.get('tnx_z'), "oil_roc": num.get('oil_roc'),
             "yc_chg": num.get('yc_chg'), "liq_roc": num.get('liq_roc'),
+            "liq_roc_window": num.get('liq_roc_window'),
             "m2_yoy": num.get('m2_yoy'), "credit_z": num.get('credit_z'),
             "cg_z": num.get('cg_z'),
             # 旧列仅为兼容；不再冒充 Hindenburg/黑天鹅指标。
             "hindenburg": f"净新高-新低: {net_nh_nl}",
+            "dix_gex_source_date": sm.get('dix_gex_source_date'),
+            "cot_report_date": sm.get('cot_report_date'),
+            "cot_category": sm.get('cot_category'),
+            "cot_metadata": sm.get('cot_metadata', {}),
         }
         # 结构化数值附录（含 vrp 数值、vix_term 比值），供异常引擎读取
         payload["full_metrics"] = {
@@ -822,6 +995,8 @@ class UltimateDashboard:
             "liquidity_source_names": self.liquidity_source_names,
             "liquidity_source_contract": "official_liquidity_v2",
             "etf_share_metrics": self.smf.get('etf_share_metrics', {}),
+            "contribution_attribution_status": num.get(
+                'contribution_attribution_status'),
             "net_liq_source_date": min(
                 [self.fred_source_dates.get(key) for key in ('Fed_Assets', 'TGA', 'RRP')
                  if self.fred_source_dates.get(key)],

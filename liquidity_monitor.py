@@ -126,6 +126,8 @@ COMPONENTS = [
                   "pct_50ma", 0.80, +1, min_obs=60),
     ComponentSpec("breadth_200", "market_distribution", "Above 200DMA",
                   "pct_200ma", 1.00, +1, min_obs=60),
+    ComponentSpec("breadth_daily", "market_distribution", "Daily advancers",
+                  "pct_adv", 0.55, +1, min_obs=60),
     ComponentSpec("concentration", "market_distribution", "Cap-weight gap",
                   "breadth_diff_pct", 0.85, -1, min_obs=60),
 

@@ -22,11 +22,14 @@ from market_utils import (
     lag_trading_days,
 )
 from pre_market_metrics import (
+    DISTANCE_SIGN_VERSION,
     GAMMA_BUCKETS,
+    apply_gamma_quality_gate,
     calc_delta_gamma,
     calc_vanna_charm,
     distance_pct,
     expected_move_metrics,
+    expiration_bucket,
     finite_number,
     gamma_structure,
     implied_volatility,
@@ -544,7 +547,10 @@ def get_report():
                 s for s in chain.strikes
                 if finite_number(s, positive=True) is not None
                 and curr_price * 0.80 <= float(s) <= curr_price * 1.20)
-            if not valid_strikes: continue
+            if not valid_strikes:
+                report += "⚠️ 现价±20%范围内无有效执行价。\n"
+                quality_issues.append(f"strikes:{sym}")
+                continue
             closest_strike = min(valid_strikes, key=lambda x: abs(x - curr_price))
             closest_idx = valid_strikes.index(closest_strike)
             half_window = MAX_STRIKES // 2
@@ -553,10 +559,31 @@ def get_report():
                 min(len(valid_strikes), closest_idx + half_window + 1)]
             
             opts = [Option(sym, exp, s, r, 'SMART', tradingClass=getattr(chain, 'tradingClass', None)) for exp in target_exps for s in target_strikes for r in ['C', 'P']]
+            requested_counts = {
+                bucket: len(expiration_coverage.get(bucket, []))
+                * len(target_strikes) * 2
+                for bucket in GAMMA_BUCKETS if bucket != "ALL"
+            }
+            requested_counts["ALL"] = sum(requested_counts.values())
             try: contracts = ib.qualifyContracts(*opts)
             except Exception: contracts = []
             
-            if not contracts: continue
+            if not contracts:
+                report += "⚠️ 期权合约资格确认失败。\n"
+                quality_issues.append(f"option_qualification:{sym}")
+                continue
+
+            qualified_counts = {bucket: 0 for bucket in GAMMA_BUCKETS}
+            for contract in contracts:
+                try:
+                    expiry = datetime.strptime(
+                        contract.lastTradeDateOrContractMonth[:8], '%Y%m%d').date()
+                    bucket = expiration_bucket((expiry - ny_today_date).days)
+                    if bucket:
+                        qualified_counts[bucket] += 1
+                        qualified_counts["ALL"] += 1
+                except (TypeError, ValueError):
+                    continue
             
             rows = []
             for i in range(0, len(contracts), BATCH_SIZE):
@@ -623,7 +650,20 @@ def get_report():
                 if oi_pcr is None:
                     quality_issues.append(f"oi_pcr:{sym}")
                 max_oi = max_oi_metrics(df, curr_price)
-                gamma = gamma_structure(df, curr_price)
+                oi_valid_counts = {bucket: 0 for bucket in GAMMA_BUCKETS}
+                for bucket in GAMMA_BUCKETS:
+                    if bucket == "ALL":
+                        oi_valid_counts[bucket] = int(len(df))
+                    else:
+                        oi_valid_counts[bucket] = int(
+                            df["DTE"].apply(expiration_bucket).eq(bucket).sum())
+                gamma = apply_gamma_quality_gate(
+                    gamma_structure(df, curr_price),
+                    requested_counts, qualified_counts, oi_valid_counts)
+                for bucket in GAMMA_BUCKETS:
+                    if gamma[bucket]["quality"] not in ("OK", "NO_EXPIRY"):
+                        quality_issues.append(
+                            f"gamma_{bucket.lower()}:{sym}:{gamma[bucket]['quality']}")
                 
                 iv_skew = None
                 calls = df[(df['R']=='C') & (df['Delta'] > 0)].dropna(subset=['IV', 'Delta'])
@@ -641,6 +681,15 @@ def get_report():
                     near.get('Vanna_W'), errors='coerce').sum(min_count=1) / 1e6
                 charm_m = pd.to_numeric(
                     near.get('Charm_W'), errors='coerce').sum(min_count=1) / 1e6
+                active_near = [
+                    bucket for bucket in ("0DTE", "1-7D")
+                    if gamma[bucket]["requested_contract_count"] > 0
+                ]
+                near_quality_ok = bool(active_near) and all(
+                    gamma[bucket]["quality"] == "OK" for bucket in active_near)
+                if not near_quality_ok:
+                    vanna_m = None
+                    charm_m = None
                 short_values = [
                     gamma[bucket]["net_gamma_m"] for bucket in ("0DTE", "1-7D")
                     if gamma[bucket]["net_gamma_m"] is not None
@@ -657,9 +706,11 @@ def get_report():
                 gamma_flip_change_pct = None
                 gamma_roll_changed = None
                 gamma_flip_quality = (
-                    "NO_CROSSING" if zgl_strike is None else "BASELINE_RESET"
+                    gamma["ALL"]["quality"]
+                    if gamma["ALL"]["quality"] != "OK"
+                    else ("NO_CROSSING" if zgl_strike is None else "BASELINE_RESET")
                 )
-                if previous_context:
+                if previous_context and gamma["ALL"]["quality"] == "OK":
                     previous_flip = finite_number(
                         previous_context.get(
                             "gamma_flip_all", previous_context.get("zgl_price")),
@@ -724,16 +775,25 @@ def get_report():
                 }
                 for bucket in GAMMA_BUCKETS:
                     metrics = gamma[bucket]
-                    zero_text = (
-                        ", ".join(f"${value:.2f}" for value in metrics["zero_points"])
-                        if metrics["zero_points"] else "区间内无零点"
-                    )
+                    if metrics["quality"] != "OK":
+                        zero_text = "因质量闸门不发布"
+                    else:
+                        zero_text = (
+                            ", ".join(
+                                f"${value:.2f}" for value in metrics["zero_points"])
+                            if metrics["zero_points"] else "区间内无零点"
+                        )
                     report += (
                         f"🌊 {bucket_labels[bucket]} Gamma: "
                         f"{_fmt(metrics['net_gamma_m'])}M | "
                         f"主Flip={_fmt(metrics['primary_flip'], prefix='$')} | "
                         f"全部零点(±20%网格)={zero_text} | "
-                        f"{metrics['expiration_count']}到期/{metrics['contract_count']}合约\n"
+                        f"质量={metrics['quality']} | "
+                        f"有效={metrics['contract_count']}/请求="
+                        f"{metrics['requested_contract_count']} "
+                        f"({metrics['coverage_pct']:.1f}%) | "
+                        f"Call/Put={metrics['call_count']}/{metrics['put_count']} | "
+                        f"{metrics['expiration_count']}到期\n"
                     )
                 if gamma_flip_quality == "JUMP_REVIEW":
                     report += (
@@ -749,7 +809,8 @@ def get_report():
                         "仅作观察，不作为硬交易边界。\n"
                     )
                 report += (
-                    f"📐 距Call墙/Put墙/主Flip: "
+                    f"📐 关键位相对现价距离(正值=关键位在上方): "
+                    f"Call墙/Put墙/主Flip "
                     f"{_fmt(distance_pct(call_w, curr_price))}% / "
                     f"{_fmt(distance_pct(put_w, curr_price))}% / "
                     f"{_fmt(distance_pct(zgl_strike, curr_price))}%\n"
@@ -788,6 +849,7 @@ def get_report():
                         "distance_to_call_wall_pct": _round_or_none(distance_pct(call_w, curr_price)),
                         "distance_to_put_wall_pct": _round_or_none(distance_pct(put_w, curr_price)),
                         "distance_to_zgl_pct": _round_or_none(distance_pct(zgl_strike, curr_price)),
+                        "distance_sign_version": DISTANCE_SIGN_VERSION,
                         "pin_strike": _round_or_none(gamma["pin_strike"], 4),
                         "pin_state": gamma["pin_state"],
                         "vanna_m": _round_or_none(vanna_m, 4),
@@ -823,6 +885,11 @@ def get_report():
                         "gamma_flip_change_pct": _round_or_none(gamma_flip_change_pct),
                         "gamma_roll_changed": gamma_roll_changed,
                         "gamma_flip_quality": gamma_flip_quality,
+                        "gamma_quality": gamma["quality"],
+                        "gamma_requested_contract_count": requested_counts["ALL"],
+                        "gamma_qualified_contract_count": qualified_counts["ALL"],
+                        "gamma_oi_valid_contract_count": oi_valid_counts["ALL"],
+                        "gamma_valid_contract_count": gamma["ALL"]["contract_count"],
                         "gamma_zeroes": gamma_zeroes,
                         "gamma_expirations": gamma_expirations,
                         "gamma_curve_version": gamma["curve_version"],
@@ -861,6 +928,16 @@ def get_report():
                             "expirations": metrics["expirations"],
                             "contract_count": metrics["contract_count"],
                             "expiration_count": metrics["expiration_count"],
+                            "requested_contract_count": metrics["requested_contract_count"],
+                            "qualified_contract_count": metrics["qualified_contract_count"],
+                            "oi_valid_contract_count": metrics["oi_valid_contract_count"],
+                            "coverage_pct": _round_or_none(metrics["coverage_pct"], 4),
+                            "call_count": metrics["call_count"],
+                            "put_count": metrics["put_count"],
+                            "strike_count": metrics["strike_count"],
+                            "quality": metrics["quality"],
+                            "raw_net_gamma_m": _round_or_none(metrics["raw_net_gamma_m"], 6),
+                            "raw_primary_flip": _round_or_none(metrics["raw_primary_flip"], 4),
                             "curve_version": gamma["curve_version"],
                             "grid_width_pct": gamma["grid_width_pct"],
                             "grid_points": gamma["grid_points"],

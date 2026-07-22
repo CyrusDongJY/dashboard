@@ -98,6 +98,12 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_grid_points 
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_max_dte int;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_sign_model text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS oi_source_date date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS distance_sign_version text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_quality jsonb;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_requested_contract_count int;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_qualified_contract_count int;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_oi_valid_contract_count int;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_valid_contract_count int;
 
 CREATE TABLE IF NOT EXISTS option_gamma_buckets (
     date                date        NOT NULL,
@@ -125,6 +131,16 @@ CREATE INDEX IF NOT EXISTS idx_option_gamma_buckets_ticker_date
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS curve_version text;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS grid_width_pct numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS grid_points int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS requested_contract_count int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS qualified_contract_count int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS oi_valid_contract_count int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS call_count int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS put_count int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS strike_count int;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS quality text;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS raw_net_gamma_m numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS raw_primary_flip numeric;
 
 CREATE TABLE IF NOT EXISTS stock_spot_post_close (
     date            date        NOT NULL,
@@ -141,6 +157,9 @@ CREATE TABLE IF NOT EXISTS stock_spot_post_close (
 ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS iv_rank_pct numeric;
 ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS iv_percentile_pct numeric;
 ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS current_iv numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_method text;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_window text;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_source_date date;
 
 -- ------------------------------------------------------------
 -- 3. 汇总视图：把盘前盘后按 (date,ticker) 对齐，供报告/回测统一读取
@@ -226,7 +245,16 @@ SELECT
     pre.gamma_curve_version,
     pre.gamma_grid_width_pct,
     pre.gamma_grid_points,
-    pre.gamma_max_dte
+    pre.gamma_max_dte,
+    pre.distance_sign_version,
+    pre.gamma_quality,
+    pre.gamma_requested_contract_count,
+    pre.gamma_qualified_contract_count,
+    pre.gamma_oi_valid_contract_count,
+    pre.gamma_valid_contract_count,
+    post.poc_method,
+    post.poc_window,
+    post.poc_source_date
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
@@ -247,6 +275,41 @@ ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_source text;
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_as_of timestamptz;
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS trin_closing_auction_inclusion text;
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS breadth_sample_size int;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS pct_adv numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS up_down_volume_ratio numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS qqq_qqqe_spread_pct numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS spy_rsp_spread_pct numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS mag7_rsp_spread_pct numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS concentration_quality text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS hyg_return_21d numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS tlt_return_21d numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS hyg_tlt_state text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS liq_roc_window int;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS dix_gex_source_date date;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS cot_report_date date;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS cot_category text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS cot_metadata jsonb;
+
+-- 盘后现金市场接受度与集中度影子指标。
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_qqqe_spread_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_rsp_spread_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS mag7_rsp_spread_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS mag7_sample_count int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS concentration_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_gap_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_gap_acceptance numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_gap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_acceptance numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_time_acceptance_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_volume_acceptance_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_sample_count int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_time_acceptance_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_volume_acceptance_pct numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_sample_count int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_quality text;
 
 -- ------------------------------------------------------------
 -- 4. 数据质量表：每次抓取每张表一条，记录成功/缺失/滞后/行数
