@@ -53,7 +53,7 @@ Tag 只标识不可移动的代码恢复点，不表示云端已经部署。根�
 | --- | --- | --- |
 | 数据采集 | `daily_pre_market.py`, `daily_post_close.py`, `auto_review.py` | 抓取并结构化写库 |
 | 盘中监测 | `ib_intraday_sniper.py` | 盘中战术指标和上下文 |
-| 数据契约 | `data_contracts.py`, `pre_market_metrics.py` | 缺失值、单位、口径和来源追溯 |
+| 数据契约 | `data_contracts.py`, `pre_market_metrics.py`, `tactical_stress.py` | 缺失值、单位、口径、来源追溯与盘后压力门控 |
 | 异常判定 | `anomaly_engine.py`, `market_sentinel.py` | 单指标、多窗口和跨资产共振 |
 | 环境观察 | `environment_indices.py`, `environment_report.py` | 长周期环境指数和 PNG |
 | 流动性观察 | `liquidity_sources.py`, `liquidity_monitor.py`, `liquidity_report.py` | 六柱流动性水位和 PNG |

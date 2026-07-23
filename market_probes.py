@@ -23,11 +23,26 @@ def scan_macro_regime(supabase, cutoff_date):
     alert_level = 0
 
     mac_score = today.get('macro_score', 'N/A')
-    mic_score = today.get('micro_score', 'N/A')
+    if 'eod_stress_score' in today.index:
+        stress_score = today.get('eod_stress_score')
+    else:
+        stress_score = today.get('micro_score')
+    stress_score = 'N/A' if pd.isna(stress_score) else stress_score
+    coverage = today.get('stress_coverage')
+    coverage_text = ('N/A' if pd.isna(coverage)
+                     else f"{float(coverage):.0%}")
+    stress_status = today.get('stress_components') or {}
+    if isinstance(stress_status, dict):
+        stress_status = stress_status.get('_meta', {}).get('status', 'N/A')
+    else:
+        stress_status = 'N/A'
     regime = today.get('regime', '未知')
     skeleton = today.get('skeleton', '未知')
 
-    report_lines.append(f"🎯 【系统量化评分】 宏观压力得分: {mac_score}/100 | 微观战术得分: {mic_score}/100")
+    report_lines.append(
+        f"🎯 【系统量化评分】 宏观压力得分: {mac_score}/100 | "
+        f"盘后跨资产战术压力观察值: {stress_score}/100 "
+        f"(状态={stress_status}, 覆盖率={coverage_text})")
     report_lines.append(f"📍 宏观象限判定: {regime} | 市场骨架评级: {skeleton}")
 
     # --- 区分真正的恐慌与底部推力 ---

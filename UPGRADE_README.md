@@ -55,6 +55,7 @@
    - `metric_daily`（按 PRE/INTRADAY/EOD 分会话的每日全指标快照）
    - `environment_daily`（环境指数影子台账，不参与正式预警）
    - `liquidity_daily`（六柱流动性水位、覆盖率、状态和可解释明细）
+   - `market_history` 新增盘后跨资产战术压力值、覆盖率、置信度、版本与分项 JSON
    - `option_gamma_buckets`（盘前Gamma分期限净值、全部零点与实际采样到期日）
    - 现有表补 `source_date` / `as_of_time` / `ingested_at` 三列
 
@@ -69,6 +70,7 @@
    | `market_utils.py` | 新增（**必须**放这里） |
    | `data_contracts.py` | 新增（纯数据契约与 fail-closed 计算，**必须**放这里） |
    | `pre_market_metrics.py` | 新增（盘前纯计算引擎，**必须**放这里） |
+   | `tactical_stress.py` | 新增（盘后压力纯计算与 fail-closed 门控，**必须**放这里） |
    | `anomaly_engine.py` | 新增（**必须**放这里） |
    | `environment_indices.py` | 新增（影子指数，**必须**放这里） |
    | `environment_report.py` | 新增（盘后PNG，**必须**放这里） |

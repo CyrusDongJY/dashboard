@@ -30,6 +30,8 @@ from data_contracts import (
     classify_hyg_tlt,
     compute_etf_share_metrics,
 )
+from market_utils import lag_trading_days
+from tactical_stress import StressInput, nullable_int, score_eod_stress
 
 class UltimateDashboard:
     def __init__(self):
@@ -56,6 +58,8 @@ class UltimateDashboard:
         self.num = {}
         self.fred_source_dates = {}
         self.liquidity_source_names = {}
+        self.market_source_dates = {}
+        self.stress_details = {}
 
     def log(self, msg):
         print(msg)
@@ -90,11 +94,18 @@ class UltimateDashboard:
                 recent_df.index = pd.to_datetime(recent_df.index).normalize().tz_localize(None)
                 self.data_cache['raw_close'] = recent_df
                 self.data_cache['close'] = recent_df.ffill()
+                for symbol in recent_df.columns:
+                    native = recent_df[symbol].dropna()
+                    if not native.empty:
+                        self.market_source_dates[str(symbol)] = (
+                            native.index.max().strftime('%Y-%m-%d'))
             
             vol_data = yf.download(['QQQ'], period="2y", interval="1d", progress=False).dropna(how='all')
             if not vol_data.empty:
                 vol_data.index = pd.to_datetime(vol_data.index).normalize().tz_localize(None)
                 self.data_cache['qqq_full'] = vol_data[~vol_data.index.duplicated(keep='last')]
+                self.market_source_dates['QQQ_OHLCV'] = (
+                    vol_data.index.max().strftime('%Y-%m-%d'))
         except Exception: pass
 
     def fetch_fred_data_direct(self):
@@ -433,7 +444,11 @@ class UltimateDashboard:
         df, raw_df = self.data_cache.get('close', pd.DataFrame()), self.data_cache.get('raw_close', pd.DataFrame())
         fh = self.data_cache.get('fred_historical', pd.DataFrame())
         
-        self.score_details.update({'macro_score': 0, 'micro_score': 0, 'vix': '-', 'move': '-', 'pcr': '-', 'cmf': '-'})
+        self.score_details.update({
+            'macro_score': 0, 'micro_score': None,
+            'eod_stress_score': None, 'vix': '-', 'move': '-',
+            'pcr': '-', 'cmf': '-',
+        })
         self.regime = {'desc': '不明朗', 'spread': self.regime.get('spread', '-'), 'cg_ratio': '-', 'hyg': '-', 'oil': '-', 'dxy': '-', 'btc': '-', 'gold': '-', 'jpy': '-'}
 
         mag7_symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA']
@@ -486,7 +501,12 @@ class UltimateDashboard:
                 cl, hi, lo, vo = (h['Close']['QQQ'], h['High']['QQQ'], h['Low']['QQQ'], h['Volume']['QQQ']) if isinstance(h.columns, pd.MultiIndex) else (h['Close'], h['High'], h['Low'], h['Volume'])
                 range_hl = (hi - lo).replace(0, 0.01)
                 mfv = (((cl - lo) - (hi - cl)) / range_hl) * vo
-                self.score_details['cmf'] = round((mfv.rolling(21).sum() / vo.rolling(21).sum()).dropna().iloc[-1], 2)
+                cmf_series = (mfv.rolling(21).sum() / vo.rolling(21).sum())
+                cmf_series = cmf_series.replace([np.inf, -np.inf], np.nan).dropna()
+                if not cmf_series.empty:
+                    self.score_details['cmf'] = round(cmf_series.iloc[-1], 2)
+                    self.num['cmf_source_date'] = pd.Timestamp(
+                        cmf_series.index[-1]).strftime('%Y-%m-%d')
         except: pass
 
         try:
@@ -498,7 +518,10 @@ class UltimateDashboard:
                     chain = tk_qqq.option_chain(valid_exps[0])
                     c_vol = pd.to_numeric(chain.calls['volume'], errors='coerce').fillna(0).sum()
                     p_vol = pd.to_numeric(chain.puts['volume'], errors='coerce').fillna(0).sum()
-                    if c_vol > 0: self.score_details['pcr'] = round(p_vol / c_vol, 2)
+                    if c_vol > 0:
+                        self.score_details['pcr'] = round(p_vol / c_vol, 2)
+                        self.num['pcr_source_date'] = pd.Timestamp.now(
+                            tz="America/New_York").strftime('%Y-%m-%d')
         except: pass
 
         self.vol_metrics = {'vix': '-', 'move': '-', 'vix_term': '-', 'vrp': '-', 'vvix': '-', 'skew': '-'}
@@ -656,56 +679,104 @@ class UltimateDashboard:
         self.score_details['macro_score'] = min(100, m_score)
         # ==================== 修复的宏观打分引擎结束 ====================
 
-        # ==================== V8.6 微观评分引擎整合开始 ====================
+        # ==================== EOD跨资产战术压力（V8.6公式可靠性加固） ====================
         try:
-            # 1. 安全提取各维度核心数据
-            v_vix = float(self.vol_metrics.get('vix', 14.0)) if self.vol_metrics.get('vix') != '-' else 14.0
-            v_move = float(self.score_details.get('move', 0)) if self.score_details.get('move') != '-' else 0
-            v_cred = float(self.liquidity.get('credit', 0)) if self.liquidity.get('credit') != '-' else 0
-            v_trin = float(self.score_details.get('trin', 1.0)) if self.score_details.get('trin') != '-' else 1.0
-            v_pcr  = float(self.score_details.get('pcr', 0.8)) if self.score_details.get('pcr') != '-' else 0.8
-            v_cmf  = float(self.score_details.get('cmf', 0)) if self.score_details.get('cmf') != '-' else 0
-            
-            # 判定标普大盘是否收跌 (用于 TRIN 逻辑的交叉验证)
+            report_date = pd.Timestamp.now(
+                tz="America/New_York").strftime('%Y-%m-%d')
+
+            def component_lag(source_date):
+                return (lag_trading_days(source_date, report_date)
+                        if source_date else None)
+
+            # 只有当日 SPY 截面有效时，才允许 TRIN 获得下跌确认加分。
             spy_down = False
-            if 'SPY' in df.columns:
+            spy_source_date = self.market_source_dates.get('SPY')
+            spy_down_available = component_lag(spy_source_date) == 0
+            if spy_down_available and 'SPY' in df.columns:
                 spy_s = self.clean_trading_days(df['SPY'])
                 if len(spy_s) >= 2 and spy_s.iloc[-1] < spy_s.iloc[-2]:
                     spy_down = True
 
-            # 2. 计算 VIX 基础分 (牛市自适应平滑机制，封顶 60 分)
-            base_s = 0
-            if v_vix >= 35: base_s = 60
-            elif 25 <= v_vix < 35: base_s = 40 + ((v_vix - 25) / 10.0) * 20
-            elif 18 <= v_vix < 25: base_s = 20 + ((v_vix - 18) / 7.0) * 20
-            elif 12 <= v_vix < 18: base_s = ((v_vix - 12) / 6.0) * 20
+            trin_as_of = self.score_details.get('trin_as_of')
+            trin_source_date = str(trin_as_of)[:10] if trin_as_of else None
+            credit_source_date = self.fred_source_dates.get('Credit_Spread')
+            inputs = {
+                'vix': StressInput(
+                    self.vol_metrics.get('vix'),
+                    self.market_source_dates.get('^VIX'),
+                    component_lag(self.market_source_dates.get('^VIX')),
+                    'yfinance:^VIX'),
+                'move': StressInput(
+                    self.score_details.get('move'),
+                    self.market_source_dates.get('^MOVE'),
+                    component_lag(self.market_source_dates.get('^MOVE')),
+                    'yfinance:^MOVE'),
+                'credit_spread': StressInput(
+                    self.liquidity.get('credit'), credit_source_date,
+                    component_lag(credit_source_date),
+                    self.liquidity_source_names.get('Credit_Spread')),
+                'trin': StressInput(
+                    self.score_details.get('trin'), trin_source_date,
+                    component_lag(trin_source_date),
+                    self.score_details.get('trin_source')),
+                'pcr': StressInput(
+                    self.score_details.get('pcr'),
+                    self.num.get('pcr_source_date'),
+                    component_lag(self.num.get('pcr_source_date')),
+                    'yfinance:QQQ nearest-expiry option volume'),
+                'cmf': StressInput(
+                    self.score_details.get('cmf'),
+                    self.num.get('cmf_source_date'),
+                    component_lag(self.num.get('cmf_source_date')),
+                    'yfinance:QQQ OHLCV'),
+            }
 
-            # 3. 跨资产惩罚与防骗奖励机制
-            add_s = 0
-            
-            # 债市与信用惩罚
-            if v_move >= 120: add_s += 15
-            elif v_move >= 100: add_s += 10
-            if v_cred > 5.0: add_s += 15
-            
-            # 广度动能与假摔防骗
-            if v_trin > 1.5 and spy_down: add_s += 15
-            elif v_trin > 1.2: add_s += 10
-            elif v_trin < 0.7 and spy_down: add_s -= 10 # 缩量空跌(假摔奖励)
-            
-            # 期权与现货抛压
-            if v_pcr > 1.0: add_s += 10
-            if v_cmf < -0.05: add_s += 10
+            raw_vix = (self.clean_trading_days(raw_df['^VIX'])
+                       if '^VIX' in raw_df.columns
+                       else pd.Series(dtype=float))
+            vix_chg_5d = (float(raw_vix.iloc[-1] - raw_vix.iloc[-6])
+                          if len(raw_vix) >= 6 else None)
+            vix_history = raw_vix.tail(252)
+            vix_percentile = (float(
+                (vix_history <= vix_history.iloc[-1]).mean() * 100.0)
+                if len(vix_history) >= 60 else None)
 
-            # DIX不再直接加减风险分，避免把场外短售量确定性解释为机构吸筹。
-
-            # 5. 总分核算 (严格限制在 0-100 区间)
-            self.score_details['micro_score'] = max(0, min(int(base_s + add_s), 100))
+            result = score_eod_stress(
+                inputs, spy_down=spy_down,
+                context={
+                    'spy_down_available': spy_down_available,
+                    'spy_source_date': spy_source_date,
+                    'trin_scope': self.score_details.get('trin_scope'),
+                    'trin_closing_auction_inclusion': self.score_details.get(
+                        'trin_closing_auction_inclusion'),
+                    'vix_5d_change': round(vix_chg_5d, 4)
+                    if vix_chg_5d is not None else None,
+                    'vix_percentile_252': round(vix_percentile, 2)
+                    if vix_percentile is not None else None,
+                    'vix_term_ratio': self.num.get('vix_term_ratio'),
+                },
+                computed_at=pd.Timestamp.now(tz='UTC').isoformat(),
+            )
+            self.stress_details = result.to_dict()
+            self.score_details['eod_stress_score'] = result.score
+            # 兼容旧列；不可用时同样保持 NULL，禁止回退成 0。
+            self.score_details['micro_score'] = result.score
+            if result.score is None:
+                self.log(
+                    "⚠️ 盘后跨资产战术压力不可用: "
+                    + ", ".join(result.reasons))
 
         except Exception as e:
-            self.log(f"⚠️ V8.6 微观打分系统异常: {e}")
-            self.score_details['micro_score'] = 0
-        # ==================== V8.6 微观评分引擎整合结束 ====================
+            self.log(f"⚠️ 盘后跨资产战术压力引擎异常: {e}")
+            self.score_details['micro_score'] = None
+            self.score_details['eod_stress_score'] = None
+            self.stress_details = {
+                'score': None, 'coverage': 0.0, 'confidence': 0.0,
+                'status': 'UNAVAILABLE', 'reasons': ['INTERNAL_ERROR'],
+                'components': {}, 'calc_version': 'eod_stress_v1.1-shadow',
+                'computed_at': pd.Timestamp.now(tz='UTC').isoformat(),
+            }
+        # ==================== EOD跨资产战术压力结束 ====================
 
         p200 = self.score_details.get('pct_200ma', 0)
         if p200 != '-':
@@ -753,6 +824,15 @@ class UltimateDashboard:
 
     def generate_outputs(self):
         mac_s, mic_s = self.score_details.get('macro_score', 0), self.score_details.get('micro_score', 0)
+        stress_score_text = "N/A" if mic_s is None else str(mic_s)
+        stress_coverage = self.stress_details.get('coverage')
+        stress_confidence = self.stress_details.get('confidence')
+        stress_quality_text = (
+            f"status={self.stress_details.get('status', 'UNAVAILABLE')} | "
+            f"coverage={stress_coverage:.0%} | confidence={stress_confidence:.0%} | "
+            f"version={self.stress_details.get('calc_version', 'NA')}"
+            if stress_coverage is not None and stress_confidence is not None
+            else "status=UNAVAILABLE")
         m_val = lambda k: self.macro_engines.get(k, '-')
         etf_lines = []
         for ticker in ETF_FLOW_TICKERS:
@@ -866,7 +946,8 @@ class UltimateDashboard:
 
 ==== 附加数据 ====
 [宏观压力得分]: {mac_s}
-[微观战术得分]: {mic_s}
+[盘后跨资产战术压力观察值]: {stress_score_text}
+[压力评分质量]: {stress_quality_text}
 【判定象限】: {self.regime.get('desc', '-')}
 [SPY份额]: {self.smf.get('spy_sh', '-')}
 [QQQ份额]: {self.smf.get('qqq_sh', '-')}
@@ -920,12 +1001,24 @@ class UltimateDashboard:
                 return None
 
         liq, sd, sm, rg, vm, num = self.liquidity, self.score_details, self.smf, self.regime, self.vol_metrics, self.num
+        stress = self.stress_details
         net_nh_nl = sd.get('net_nh_nl', '-')
+        stress_components = dict(stress.get('components') or {})
+        stress_components['_meta'] = {
+            'status': stress.get('status', 'UNAVAILABLE'),
+            'reasons': stress.get('reasons', []),
+        }
 
         payload = {
             "record_date": date_str,
             "macro_score": int(sd.get('macro_score', 0) or 0),
-            "micro_score": int(sd.get('micro_score', 0) or 0),
+            "micro_score": nullable_int(sd.get('micro_score')),
+            "eod_stress_score": nullable_int(sd.get('eod_stress_score')),
+            "stress_components": stress_components,
+            "stress_coverage": stress.get('coverage'),
+            "stress_confidence": stress.get('confidence'),
+            "stress_calc_version": stress.get('calc_version'),
+            "stress_computed_at": stress.get('computed_at'),
             "regime": rg.get('desc'),
             "skeleton": sd.get('skeleton', '未知'),
             "breadth_thrust": sd.get('breadth_thrust'),
@@ -1007,7 +1100,11 @@ class UltimateDashboard:
         # 本地 CSV 备份用的中文表头行（保持既有格式）
         cn_row = {
             '日期': date_str, '[总评]宏观象限': payload['regime'],
-            '[总评]宏观压力得分': payload['macro_score'], '[总评]微观战术得分': payload['micro_score'],
+            '[总评]宏观压力得分': payload['macro_score'],
+            '[总评]盘后跨资产战术压力观察值': payload['eod_stress_score'],
+            '[总评]压力评分覆盖率': payload['stress_coverage'],
+            '[总评]压力评分置信度': payload['stress_confidence'],
+            '[总评]压力评分版本': payload['stress_calc_version'],
             '[价格]QQQ': self.current_prices.get('NDX 100 (QQQ)', '-'),
             '[价格]SPY': self.current_prices.get('S&P 500 (SPY)', '-'),
             '[总评]大盘骨架': payload['skeleton'], '[广度]净新高-新低': payload['net_nh_nl'],

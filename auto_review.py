@@ -38,7 +38,9 @@ from market_utils import (
 
 # 落库后用于数据质量审计的关键字段
 CRITICAL_FIELDS = [
-    'macro_score', 'micro_score', 'vix', 'move', 'credit_spread',
+    'macro_score', 'micro_score', 'eod_stress_score',
+    'stress_coverage', 'stress_confidence', 'stress_calc_version',
+    'vix', 'move', 'credit_spread',
     'pct_200ma', 'trin', 'dix', 'gex', 'hyg_tlt_ratio', 'credit_z', 'cg_z',
     'dix_gex_source_date', 'cot_report_date', 'concentration_quality',
 ]
@@ -103,7 +105,7 @@ def generate_ai_report(market_data):
     如果你在输出中包含了上述任何词汇，报告将被视为不合格。
 
     严格要求：总字数控制在 400-500 字左右。必须且只能输出以下三个板块（禁止自己编造新板块）：
-    一、核心定性：一句话定性当前宏观象限。必须结合【宏观压力得分】和全新的【微观战术得分】（注：微观得分越高代表底层流动性挤兑和恐慌越严重）。
+    一、核心定性：一句话定性当前宏观象限。结合【宏观压力得分】与【盘后跨资产战术压力观察值】；后者只反映EOD跨资产压力证据，不等同于底层流动性挤兑，也不单独确认行情方向或反转。若其为N/A或质量状态为UNAVAILABLE，必须明确写“压力评分数据不足”，不得按0分解释；若状态为PARTIAL，必须披露覆盖率并降低结论强度。
     二、异动盘点：挑出最具警告意味的 2-3 个核心数据进行关联分析（只看资金流向、避险剪刀差、NFCI、以及大资金净持仓）。
     三、底顶雷达与机构防御：扫视【深度广度推力信号】、【机构暗池背离信号】及【VRP风险溢价】明确有无抄底机会。结合 11大 GICS 行业表现，指出目前应该配置防御型还是进攻型板块。
 

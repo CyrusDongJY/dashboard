@@ -290,6 +290,14 @@ ALTER TABLE market_history ADD COLUMN IF NOT EXISTS cot_report_date date;
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS cot_category text;
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS cot_metadata jsonb;
 
+-- EOD跨资产战术压力：稳定列名 + 独立版本字段。旧 micro_score 仅作迁移兼容。
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS eod_stress_score numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS stress_components jsonb;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS stress_coverage numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS stress_confidence numeric;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS stress_calc_version text;
+ALTER TABLE market_history ADD COLUMN IF NOT EXISTS stress_computed_at timestamptz;
+
 -- 盘后现金市场接受度与集中度影子指标。
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_qqqe_spread_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_rsp_spread_pct numeric;
