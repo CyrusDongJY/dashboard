@@ -1052,7 +1052,6 @@ class UltimateDashboard:
             "qqq_qqqe_spread_pct": num.get('qqq_qqqe_spread_pct'),
             "spy_rsp_spread_pct": num.get('spy_rsp_spread_pct'),
             "mag7_rsp_spread_pct": num.get('mag7_rsp_spread_pct'),
-            "breadth_diff_pct": num.get('mag7_rsp_spread_pct'),
             "concentration_quality": num.get('concentration_quality'),
             "sp500_net": nz(sm.get('sp500_net')), "nasdaq_net": nz(sm.get('nasdaq_net')),
             "dxy": nz(rg.get('dxy')), "jpy": nz(rg.get('jpy')), "oil": nz(rg.get('oil')),
