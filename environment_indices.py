@@ -16,7 +16,7 @@ ENV_CALC_VERSION = "env_v2.1"
 MIN_EFFECTIVE_OBS = 60
 MIN_INDEX_COVERAGE = 0.50
 MIN_STATE_COVERAGE = 0.65
-MIN_INDEX_MATURITY = 0.35
+MIN_INDEX_MATURITY = round(MIN_EFFECTIVE_OBS / BASELINE, 3)
 MIN_STATE_MATURITY = 0.50
 HISTORY_CALENDAR_DAYS = 1200
 
@@ -480,7 +480,8 @@ def format_env_summary(idx):
         "INSUFFICIENT_SAMPLE": "有效样本不足",
     }
     blockers = []
-    for key in ("idx_risk_pressure", "idx_liquidity_stress", "idx_breadth_decay"):
+    core_keys = ("idx_risk_pressure", "idx_liquidity_stress", "idx_breadth_decay")
+    for key in core_keys:
         for item in diagnostics.get(key, []):
             if item.get("status") == "OK":
                 continue
@@ -493,6 +494,23 @@ def format_env_summary(idx):
             if item.get("status") == "INSUFFICIENT_SAMPLE":
                 status_text += f" {sample}/{required}"
             blockers.append(f"{metric_label}：{status_text}")
+    for key in core_keys:
+        label = labels[key]
+        cov = coverage.get(key, 0.0)
+        mature = maturity.get(key, 0.0)
+        if cov < MIN_INDEX_COVERAGE:
+            blockers.append(
+                f"{label}：分量覆盖 {cov:.0%}/{MIN_INDEX_COVERAGE:.0%}")
+        elif mature < MIN_INDEX_MATURITY:
+            blockers.append(
+                f"{label}：样本成熟度 {mature:.0%}/{MIN_INDEX_MATURITY:.0%}")
+    core_maturity = [maturity.get(key, 0.0) for key in core_keys]
+    mean_core_maturity = float(np.mean(core_maturity)) if core_maturity else 0.0
+    if (all(coverage.get(key, 0.0) >= MIN_INDEX_COVERAGE for key in core_keys) and
+            mean_core_maturity < MIN_STATE_MATURITY):
+        blockers.append(
+            f"核心面板平均样本成熟度：{mean_core_maturity:.0%}/"
+            f"{MIN_STATE_MATURITY:.0%}")
     if blockers:
         lines.append("分类阻塞项：" + "；".join(blockers))
 

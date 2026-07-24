@@ -62,6 +62,27 @@ class EnvironmentIndexTests(unittest.TestCase):
         state, _ = classify_state(scores, coverage, 0, False)
         self.assertEqual(state, "数据不足")
 
+    def test_core_maturity_gate_matches_sixty_observation_entry_rule(self):
+        scores = {"idx_risk_pressure": 76.0, "idx_liquidity_stress": 20.0,
+                  "idx_breadth_decay": 45.0}
+        coverage = {"idx_risk_pressure": 1.0, "idx_liquidity_stress": 1.0,
+                    "idx_breadth_decay": 1.0}
+        maturity = {"idx_risk_pressure": 1.0, "idx_liquidity_stress": 0.72,
+                    "idx_breadth_decay": 0.34}
+        state, _ = classify_state(
+            scores, coverage, 0, False, maturity=maturity)
+        self.assertEqual(state, "脆弱观察")
+
+    def test_low_average_core_maturity_still_fails_closed(self):
+        scores = {"idx_risk_pressure": 76.0, "idx_liquidity_stress": 20.0,
+                  "idx_breadth_decay": 45.0}
+        coverage = {"idx_risk_pressure": 1.0, "idx_liquidity_stress": 1.0,
+                    "idx_breadth_decay": 1.0}
+        maturity = {key: 0.238 for key in coverage}
+        state, _ = classify_state(
+            scores, coverage, 0, False, maturity=maturity)
+        self.assertEqual(state, "数据不足")
+
     def test_low_sample_component_is_excluded(self):
         frame = pd.DataFrame([metric_row("vix", 99, sample=30)])
         scores, coverage = score_frame(frame)
