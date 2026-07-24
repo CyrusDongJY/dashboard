@@ -4,7 +4,12 @@ import os
 
 import pandas as pd
 
-from environment_indices import INDEX_DEFS, composite_score, score_frame
+from environment_indices import (
+    INDEX_DEFS,
+    composite_score,
+    rebuild_latest_statistics,
+    score_frame_details,
+)
 from market_utils import trading_days_back
 
 
@@ -12,7 +17,8 @@ def _fetch_metric_rows(supabase, start_date, end_date, session="EOD", page_size=
     rows, offset = [], 0
     while True:
         result = (supabase.table("metric_daily")
-                  .select("report_date,metric,scope,percentile,sample_len,effective_obs_count,lag_days")
+                  .select("report_date,metric,scope,value,percentile,sample_len,"
+                          "effective_obs_count,source_date,source_name,lag_days")
                   .eq("session", session)
                   .neq("scope", "COMPOSITE")
                   .gte("report_date", start_date)
@@ -28,14 +34,18 @@ def _fetch_metric_rows(supabase, start_date, end_date, session="EOD", page_size=
     return pd.DataFrame(rows)
 
 
-def build_history(df):
+def build_history(df, repair_latest=False):
     if df.empty:
         return pd.DataFrame()
     records = []
+    latest_date = str(df["report_date"].max())
     for report_date, group in df.groupby("report_date", sort=True):
-        scores, coverage = score_frame(group)
+        if repair_latest and str(report_date) == latest_date:
+            group = rebuild_latest_statistics(df, report_date)
+        scores, coverage, maturity, _diagnostics = score_frame_details(group)
         record = {"report_date": pd.to_datetime(report_date), **scores}
-        record["composite"] = composite_score(scores, coverage)
+        record["composite"] = composite_score(
+            scores, coverage, maturity=maturity)
         records.append(record)
     return pd.DataFrame(records).sort_values("report_date")
 
@@ -43,7 +53,9 @@ def build_history(df):
 def generate_environment_chart(supabase, report_date, lookback_days=252, output_path=None):
     """生成并持久化环境影子图；无可用数据时返回 None。"""
     start_date = trading_days_back(lookback_days, end_date=report_date)
-    history = build_history(_fetch_metric_rows(supabase, start_date, report_date))
+    history = build_history(
+        _fetch_metric_rows(supabase, start_date, report_date),
+        repair_latest=True)
     if history.empty:
         return None
 

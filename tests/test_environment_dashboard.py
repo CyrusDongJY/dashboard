@@ -29,7 +29,10 @@ from environment_indices import (  # noqa: E402
     INDEX_DEFS,
     classify_state,
     composite_score,
+    format_env_summary,
+    rebuild_latest_statistics,
     score_frame,
+    score_frame_details,
 )
 from environment_report import build_history, generate_environment_chart  # noqa: E402
 
@@ -65,6 +68,63 @@ class EnvironmentIndexTests(unittest.TestCase):
         self.assertIsNone(scores["idx_risk_pressure"])
         self.assertEqual(coverage["idx_risk_pressure"], 0.0)
 
+    def test_coverage_and_sample_maturity_are_separate(self):
+        frame = pd.DataFrame([
+            metric_row("vix", 95, sample=60),
+            metric_row("vvix", 90, sample=60),
+            metric_row("move", 92, sample=60),
+            metric_row("vix_contango_pct", 5, sample=60),
+        ])
+        scores, coverage, maturity, _ = score_frame_details(frame)
+        self.assertIsNotNone(scores["idx_risk_pressure"])
+        self.assertEqual(coverage["idx_risk_pressure"], 1.0)
+        self.assertAlmostEqual(maturity["idx_risk_pressure"], 0.238)
+
+    def test_backfilled_native_dates_repair_sparse_current_snapshot(self):
+        dates = pd.bdate_range(end="2026-07-14", periods=80)
+        rows = []
+        for index, date in enumerate(dates):
+            rows.append({
+                "report_date": date.strftime("%Y-%m-%d"),
+                "source_date": date.strftime("%Y-%m-%d"),
+                "metric": "vix",
+                "scope": "MACRO",
+                "value": float(index + 1),
+                "percentile": None,
+                "sample_len": 10 if index == len(dates) - 1 else index + 1,
+                "effective_obs_count": 10 if index == len(dates) - 1 else index + 1,
+                "lag_days": 0,
+            })
+        rebuilt = rebuild_latest_statistics(pd.DataFrame(rows), "2026-07-14")
+        self.assertEqual(len(rebuilt), 1)
+        self.assertEqual(int(rebuilt.iloc[0]["effective_obs_count"]), 80)
+        self.assertGreater(float(rebuilt.iloc[0]["percentile"]), 98.0)
+
+    def test_weekly_fill_is_deduplicated_by_native_source_date(self):
+        rows = []
+        report_dates = pd.bdate_range(end="2026-07-14", periods=160)
+        native_dates = set()
+        for index, report_date in enumerate(report_dates):
+            native_date = report_date - pd.Timedelta(days=report_date.weekday())
+            native_dates.add(native_date.strftime("%Y-%m-%d"))
+            rows.append({
+                "report_date": report_date.strftime("%Y-%m-%d"),
+                "source_date": native_date.strftime("%Y-%m-%d"),
+                "metric": "nfci",
+                "scope": "MACRO",
+                "value": float(index // 5),
+                "percentile": None,
+                "sample_len": 5,
+                "effective_obs_count": 5,
+                "lag_days": 0,
+            })
+        rebuilt = rebuild_latest_statistics(
+            pd.DataFrame(rows), report_dates[-1].strftime("%Y-%m-%d"))
+        self.assertEqual(
+            int(rebuilt.iloc[0]["effective_obs_count"]), len(native_dates))
+        self.assertLess(
+            int(rebuilt.iloc[0]["effective_obs_count"]), len(report_dates))
+
     def test_composite_requires_eligible_coverage(self):
         scores = {key: None for key in INDEX_DEFS}
         coverage = {key: 0.0 for key in INDEX_DEFS}
@@ -80,6 +140,31 @@ class EnvironmentIndexTests(unittest.TestCase):
         history = build_history(pd.DataFrame(rows))
         self.assertEqual(len(history), 1)
         self.assertGreater(history.iloc[0]["idx_risk_pressure"], 85)
+
+    def test_summary_explains_reference_score_and_zero_resonance(self):
+        text = format_env_summary({
+            "state": "数据不足",
+            "state_desc": "核心维度覆盖不足，继续积累；本日不作环境分类",
+            "idx_risk_pressure": 82.0,
+            "idx_liquidity_stress": None,
+            "idx_breadth_decay": None,
+            "idx_options_fragility": None,
+            "idx_flow_behavior": None,
+            "coverage": {"idx_risk_pressure": 1.0},
+            "maturity": {"idx_risk_pressure": 1.0},
+            "diagnostics": {
+                "idx_liquidity_stress": [{
+                    "metric": "nfci", "status": "INSUFFICIENT_SAMPLE",
+                    "effective_obs_count": 40, "required_obs_count": 60,
+                }],
+            },
+            "composite": 82.0,
+            "resonance_count": 0,
+            "resonance_themes": [],
+        })
+        self.assertIn("可用面板参考值：82.0/100（不代表整体环境）", text)
+        self.assertIn("有效样本不足 40/60", text)
+        self.assertIn("不代表环境健康", text)
 
 
 class SnapshotTests(unittest.TestCase):

@@ -6,6 +6,7 @@ gates, weighted coverage, explainable contributions, and versioned output.
 """
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import json
 import math
 from typing import Optional
 
@@ -63,6 +64,114 @@ def nullable_int(value):
     except (TypeError, ValueError):
         return None
     return int(number) if math.isfinite(number) else None
+
+
+def _mapping(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
+def _display_number(value, digits=2, suffix=""):
+    number = _finite_number(value)
+    if number is None:
+        return "数据缺失"
+    return f"{number:.{digits}f}{suffix}"
+
+
+def format_tactical_stress_summary(row):
+    """Render the persisted stress contract as a standalone email section."""
+    row = _mapping(row)
+    components = _mapping(row.get("stress_components"))
+    meta = _mapping(components.get("_meta"))
+    context = _mapping(components.get("_context"))
+
+    score_value = (row.get("eod_stress_score")
+                   if "eod_stress_score" in row else row.get("micro_score"))
+    score = nullable_int(score_value)
+    status = meta.get("status") or ("UNAVAILABLE" if score is None else "OK")
+    status_cn = {
+        "OK": "完整可用",
+        "PARTIAL": "部分覆盖，可用",
+        "UNAVAILABLE": "不可计算",
+    }.get(str(status), str(status))
+    coverage = _finite_number(row.get("stress_coverage"))
+    confidence = _finite_number(row.get("stress_confidence"))
+
+    lines = [
+        "=== 盘后跨资产战术压力观察（影子观察，不触发预警） ===",
+        f"状态：{status_cn}",
+        f"观察值：{f'{score}/100' if score is not None else '数据不足'}",
+        "有效覆盖：" + (f"{coverage:.0%}" if coverage is not None else "数据缺失"),
+        "数据置信度：" + (f"{confidence:.0%}" if confidence is not None else "数据缺失"),
+        f"计算版本：{row.get('stress_calc_version') or '未记录'}",
+    ]
+
+    reasons = meta.get("reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    reason_labels = {
+        "VIX_CORE_UNAVAILABLE": "VIX 核心分量不可用",
+        "NO_CROSS_ASSET_CONFIRMATION": "缺少跨资产确认",
+        "NO_MARKET_INTERNAL_CONFIRMATION": "缺少市场内部确认",
+        "INSUFFICIENT_WEIGHTED_COVERAGE": "有效加权覆盖不足",
+        "INTERNAL_ERROR": "计算过程异常",
+    }
+    if reasons:
+        lines.append("不可用原因：" + "；".join(
+            reason_labels.get(reason, str(reason)) for reason in reasons))
+
+    context_parts = [
+        f"VIX 5日变化 {_display_number(context.get('vix_5d_change'))}",
+        f"VIX 252日分位 {_display_number(context.get('vix_percentile_252'), 1, '%')}",
+        f"VIX/VIX3M {_display_number(context.get('vix_term_ratio'), 3)}",
+    ]
+    if context.get("spy_down_available") is False:
+        context_parts.append("SPY方向 数据缺失")
+    elif "spy_down" in context:
+        context_parts.append("SPY当日下跌" if context.get("spy_down") else "SPY当日未下跌")
+    lines.append("VIX与价格背景：" + " | ".join(context_parts))
+
+    component_labels = {
+        "vix": "VIX",
+        "move": "MOVE",
+        "credit_spread": "信用利差",
+        "trin": "TRIN",
+        "pcr": "Put/Call 成交量比",
+        "cmf": "QQQ CMF",
+    }
+    status_labels = {
+        "OK": "有效",
+        "MISSING_VALUE": "数值缺失",
+        "OUT_OF_DOMAIN": "数值越界",
+        "MISSING_SOURCE_DATE": "来源日期缺失",
+        "MISSING_LAG": "滞后信息缺失",
+        "STALE_SOURCE": "来源过期",
+    }
+    lines.append("分项数据与贡献：")
+    for name in COMPONENT_SPECS:
+        item = _mapping(components.get(name))
+        state = status_labels.get(item.get("status"), item.get("status") or "未记录")
+        contribution = _finite_number(item.get("contribution"))
+        contribution_text = (f"{contribution:+.1f}分"
+                             if contribution is not None else "不计分")
+        lag = item.get("lag_days")
+        lag_text = f"滞后{lag}个交易日" if lag is not None else "滞后未知"
+        source = item.get("source_name") or "来源未记录"
+        source_date = item.get("source_date") or "日期未记录"
+        lines.append(
+            f"- {component_labels[name]}：{_display_number(item.get('value'))} | "
+            f"{contribution_text} | {state} | {source_date}，{lag_text} | {source}")
+
+    lines.append(
+        "口径：这是 EOD 跨资产压力证据汇总；不等同于市场流动性、趋势方向或反转确认。")
+    return "\n".join(lines)
 
 
 def _finite_number(value):

@@ -29,6 +29,7 @@ try:
     from liquidity_monitor import compute_liquidity_monitor, format_liquidity_summary
     from liquidity_report import build_liquidity_history, generate_liquidity_chart
     from liquidity_sources import OfficialLiquiditySources
+    from tactical_stress import format_tactical_stress_summary
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -286,6 +287,7 @@ if __name__ == "__main__":
     macro_text, macro_alert, macro_raw = scan_macro_regime(supabase, cutoff_date)
     vol_text, vol_alert, vol_raw = scan_volatility_spot(supabase, cutoff_date)
     micro_text, micro_alert, micro_raw_list = scan_micro_options(supabase, cutoff_date)
+    tactical_stress_text = format_tactical_stress_summary(macro_raw)
 
     macro_info = {"text": macro_text, "alert_text": f"(危险指数: {macro_alert}/5)"}
     vol_info = {"text": vol_text, "alert_text": f"(危险指数: {vol_alert}/5)"}
@@ -298,12 +300,13 @@ if __name__ == "__main__":
     raw_appendix = format_raw_appendix(macro_raw, vol_raw, micro_raw_list)
     raw_appendix = (
         f"{environment_text}\n\n" + "="*50 +
-        f"\n\n{liquidity_text}\n\n" + "="*50 + f"\n\n{raw_appendix}"
+        f"\n\n{liquidity_text}\n\n" + "="*50 +
+        f"\n\n{tactical_stress_text}\n\n" + "="*50 + f"\n\n{raw_appendix}"
     )
     
     logging.info("🚀 推送最终战报...")
     email_sent = send_email(
-        f"🚨 机构级全域交叉复盘 (V9.2 环境与流动性影子监测) [{report_date}]",
+        f"🚨 机构级全域交叉复盘 (V9.2 环境、流动性与战术压力影子监测) [{report_date}]",
         ai_report, raw_data_feed, raw_appendix,
         image_paths=[environment_chart, liquidity_chart])
     if not email_sent:

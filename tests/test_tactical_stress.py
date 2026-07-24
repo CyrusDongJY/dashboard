@@ -1,7 +1,12 @@
 import json
 import unittest
 
-from tactical_stress import StressInput, nullable_int, score_eod_stress
+from tactical_stress import (
+    StressInput,
+    format_tactical_stress_summary,
+    nullable_int,
+    score_eod_stress,
+)
 
 
 REPORT_DATE = "2026-07-23"
@@ -81,6 +86,51 @@ class TacticalStressReliabilityTests(unittest.TestCase):
         self.assertIsNone(nullable_int(None))
         self.assertIsNone(nullable_int(float("nan")))
         self.assertEqual(nullable_int(0), 0)
+
+    def test_standalone_email_section_lists_score_context_and_components(self):
+        result = score_eod_stress(
+            complete_inputs(),
+            context={
+                "vix_5d_change": 1.25,
+                "vix_percentile_252": 78.4,
+                "vix_term_ratio": 0.92,
+                "spy_down_available": True,
+            },
+        )
+        components = dict(result.components)
+        components["_meta"] = {
+            "status": result.status,
+            "reasons": result.reasons,
+        }
+        text = format_tactical_stress_summary({
+            "eod_stress_score": result.score,
+            "stress_coverage": result.coverage,
+            "stress_confidence": result.confidence,
+            "stress_calc_version": result.calc_version,
+            "stress_components": components,
+        })
+        self.assertIn("盘后跨资产战术压力观察", text)
+        self.assertIn(f"观察值：{result.score}/100", text)
+        self.assertIn("VIX 252日分位 78.4%", text)
+        for label in ("VIX", "MOVE", "信用利差", "TRIN", "Put/Call", "QQQ CMF"):
+            self.assertIn(label, text)
+
+    def test_standalone_email_section_explains_unavailable_score(self):
+        result = score_eod_stress({})
+        components = dict(result.components)
+        components["_meta"] = {
+            "status": result.status,
+            "reasons": result.reasons,
+        }
+        text = format_tactical_stress_summary({
+            "eod_stress_score": None,
+            "stress_coverage": result.coverage,
+            "stress_confidence": result.confidence,
+            "stress_calc_version": result.calc_version,
+            "stress_components": components,
+        })
+        self.assertIn("观察值：数据不足", text)
+        self.assertIn("VIX 核心分量不可用", text)
 
 
 class TacticalStressFormulaCompatibilityTests(unittest.TestCase):
