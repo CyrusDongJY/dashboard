@@ -266,6 +266,32 @@ ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS trin_source text;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS context_quality text;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS context_metadata jsonb;
 
+-- 2026-07-24: ADV/DECL/UVOL/DVOL were never valid IBKR contracts.  Older
+-- collectors stored their missing zeros as a neutral-looking U/D=1.00.  Null
+-- the fabricated values and retain an explicit, idempotent quality marker.
+DO $$
+BEGIN
+    IF to_regclass('public.intraday_logs') IS NOT NULL THEN
+        UPDATE intraday_logs
+        SET add_val = NULL,
+            uvol = NULL,
+            dvol = NULL,
+            vol_ratio = NULL,
+            vol_ratio_status = 'LEGACY_INVALID_IBKR_CONTRACT',
+            context_metadata = COALESCE(context_metadata, '{}'::jsonb) ||
+                jsonb_build_object(
+                    'legacy_breadth_quality', 'INVALID_IBKR_CONTRACT',
+                    'legacy_breadth_remediated_at', '2026-07-24'
+                )
+        WHERE record_time < '2026-07-24 00:00:00'
+          AND COALESCE(uvol, 0) = 0
+          AND COALESCE(dvol, 0) = 0
+          AND (vol_ratio = 1 OR vol_ratio IS NULL)
+          AND COALESCE(vol_ratio_status, '') IN
+              ('', 'OK', 'MISSING_UVOL_DVOL');
+    END IF;
+END $$;
+
 -- 广度字段保留数值、样本和截面，hindenburg 仅作旧字段兼容。
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS new_highs numeric;
 ALTER TABLE market_history ADD COLUMN IF NOT EXISTS new_lows numeric;

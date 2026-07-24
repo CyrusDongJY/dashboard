@@ -44,6 +44,19 @@
 - 集中度贡献采用点时权重差乘收益的互斥分组算法；权重源未通过验收时
   返回 `POINT_IN_TIME_WEIGHTS_UNAVAILABLE`，不生成伪精确归因。
 
+2026-07-24 盘中NYSE广度合约修正：
+
+- 云端IBKR探针确认 `ADV-NYSE`、`DECL-NYSE`、`UVOL-NYSE`、`DVOL-NYSE`
+  均返回错误码200（无证券定义），并非行情权限问题；
+- 净上涨−下跌家数改用有效合约 `AD-NYSE`（conId 33887584），不再拼接
+  两个不存在的合约；
+- IBKR没有可用的UVOL/DVOL指数合约，U/D固定返回NULL并标记
+  `UNSUPPORTED_BY_IBKR_CONTRACT`，相关信号继续fail-closed；
+- IB错误码、合约conId和资格状态写入盘中上下文；合法的AD/TICK零值不再被
+  误判为缺失；
+- 历史伪中性 `U/D=1.00` 与无效 `ADD=0` 置NULL并标记
+  `LEGACY_INVALID_IBKR_CONTRACT`。
+
 ## 一、部署步骤（按顺序）
 
 1. **执行数据库迁移**：在 Supabase SQL Editor 中运行 [migrations.sql](migrations.sql)。

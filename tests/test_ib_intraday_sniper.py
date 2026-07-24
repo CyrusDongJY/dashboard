@@ -26,7 +26,6 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
             stubs.mkdir()
 
             shutil.copy2(SNIPER_SCRIPT, radar)
-            shutil.copy2(ROOT / "data_contracts.py", shared)
             (shared / "market_config.py").write_text(textwrap.dedent("""
                 SUPABASE_URL = "https://example.invalid"
                 SUPABASE_KEY = "test-key"
@@ -79,13 +78,96 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
             return result.stdout
 
-    def test_imports_shared_contract_from_cloud_directory_layout(self):
+    def test_imports_shared_config_from_cloud_directory_layout(self):
         output = self._isolated_run("""
             import runpy
             runpy.run_path("ib_intraday_sniper.py", run_name="bootstrap_test")
             print("BOOTSTRAP_OK")
         """)
         self.assertIn("BOOTSTRAP_OK", output)
+
+    def test_uses_valid_ad_contract_and_disables_phantom_ud_contracts(self):
+        output = self._isolated_run("""
+            import runpy
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="contract_plan_test")
+            assert module["IBKR_BREADTH_CONTRACTS"] == {
+                "TICK": ("TICK-NYSE", "NYSE"),
+                "TRIN": ("TRIN-NYSE", "NYSE"),
+                "AD": ("AD-NYSE", "NYSE"),
+            }
+            assert module["UD_UNSUPPORTED_STATUS"] == (
+                "UNSUPPORTED_BY_IBKR_CONTRACT")
+            serialized = repr(module["IBKR_BREADTH_CONTRACTS"])
+            for invalid in ("ADV-NYSE", "DECL-NYSE", "UVOL-NYSE",
+                            "DVOL-NYSE"):
+                assert invalid not in serialized
+            print("CONTRACT_PLAN_OK")
+        """)
+        self.assertIn("CONTRACT_PLAN_OK", output)
+
+    def test_zero_breadth_is_valid_and_missing_stays_none(self):
+        output = self._isolated_run("""
+            import runpy
+            from types import SimpleNamespace
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="zero_semantics_test")
+            sentinel = module["GlobalSentinel"].__new__(
+                module["GlobalSentinel"])
+            sentinel.log = lambda _message: None
+            sentinel.ib = SimpleNamespace(reqHistoricalData=lambda *a, **k: [])
+            contract = SimpleNamespace(symbol="AD-NYSE")
+            zero_ticker = SimpleNamespace(
+                last=0.0,
+                close=float("nan"),
+                marketPrice=lambda: float("nan"),
+            )
+            assert sentinel.get_robust_index_val(
+                contract, zero_ticker, allow_zero=True,
+                allow_history=False) == 0.0
+            assert sentinel.get_robust_index_val(
+                contract, zero_ticker, allow_zero=False,
+                allow_history=False) is None
+            stale_close_ticker = SimpleNamespace(
+                last=float("nan"),
+                close=0.0,
+                marketPrice=lambda: float("nan"),
+            )
+            assert sentinel.get_robust_index_val(
+                contract, stale_close_ticker, allow_zero=True,
+                allow_history=False) is None
+            assert sentinel.get_robust_index_val(
+                contract, None, allow_zero=True,
+                allow_history=False) is None
+            print("ZERO_SEMANTICS_OK")
+        """)
+        self.assertIn("ZERO_SEMANTICS_OK", output)
+
+    def test_actionable_ib_errors_are_persisted(self):
+        output = self._isolated_run("""
+            import runpy
+            from types import SimpleNamespace
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="ib_error_test")
+            sentinel = module["GlobalSentinel"].__new__(
+                module["GlobalSentinel"])
+            sentinel.ib_errors = []
+            sentinel.log = lambda _message: None
+            contract = SimpleNamespace(symbol="BAD-NYSE")
+            sentinel._capture_ib_error(7, 200, "No security definition", contract)
+            sentinel._capture_ib_error(-1, 2104, "farm is OK", None)
+            assert sentinel.ib_errors == [{
+                "req_id": 7,
+                "code": 200,
+                "symbol": "BAD-NYSE",
+                "message": "No security definition",
+            }]
+            print("IB_ERROR_CAPTURE_OK")
+        """)
+        self.assertIn("IB_ERROR_CAPTURE_OK", output)
 
     def test_send_email_returns_delivery_status(self):
         output = self._isolated_run("""

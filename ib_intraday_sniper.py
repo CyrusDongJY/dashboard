@@ -23,7 +23,6 @@ import requests
 from ib_insync import *
 from supabase import create_client, Client
 import pandas_market_calendars as mcal  
-from data_contracts import up_down_volume_ratio
 
 # ================= 🔐 安全挂载全局金库 =================
 try:
@@ -35,6 +34,14 @@ except ImportError:
 # ================= 全局常量与环境配置 =================
 NY_TZ = pytz.timezone('America/New_York')
 DB_MAX_RETRIES = 3
+IB_INFORMATION_CODES = {2104, 2106, 2107, 2108, 2158}
+IBKR_BREADTH_CONTRACTS = {
+    'TICK': ('TICK-NYSE', 'NYSE'),
+    'TRIN': ('TRIN-NYSE', 'NYSE'),
+    'AD': ('AD-NYSE', 'NYSE'),
+}
+UD_UNSUPPORTED_STATUS = 'UNSUPPORTED_BY_IBKR_CONTRACT'
+UD_UNSUPPORTED_SOURCE = 'UNAVAILABLE:IBKR_NO_UVOL_DVOL_INDEX_CONTRACT'
 
 # 日志防干扰设置
 logging.getLogger('ib_insync').setLevel(logging.CRITICAL)
@@ -84,6 +91,25 @@ class GlobalSentinel:
         self.opt_ctx = {}
         self.spot_ctx = {}
         self.context_quality = "MISSING"
+        self.ib_errors = []
+        self.ib.errorEvent += self._capture_ib_error
+
+    def _capture_ib_error(self, req_id, error_code, error_string,
+                          contract=None):
+        """Persist actionable IB errors instead of suppressing their cause."""
+        if error_code in IB_INFORMATION_CODES:
+            return
+        error = {
+            'req_id': req_id,
+            'code': error_code,
+            'symbol': getattr(contract, 'symbol', None) if contract else None,
+            'message': error_string,
+        }
+        self.ib_errors.append(error)
+        self.ib_errors = self.ib_errors[-50:]
+        self.log(
+            f"⚠️ IB错误 code={error_code} "
+            f"symbol={error['symbol'] or 'NA'}: {error_string}")
 
     def is_trading_day(self):
         try:
@@ -215,55 +241,79 @@ class GlobalSentinel:
         except Exception as e:
             self.log(f"⚠️ 装载全局视野失败: {e}")
 
-    def get_robust_index_val(self, contract, ticker):
-        """
-        ✅ 终极双重抓取护盾：
-        1. 流式探测：探测 last, close, marketPrice
-        2. 历史兜底（重武器）：如果流式返回 0 或 NaN，立刻强行拉取 15 分钟 K 线图找数据
-        """
-        val = 0.0
-        # --- 第一层护盾：流式提取 ---
-        for attr in ['last', 'close', 'bid', 'ask']:
-            v = getattr(ticker, attr, None)
-            if v is not None and not math.isnan(v) and v != 0:
-                val = float(v)
-                break
-        
-        if val == 0.0 and callable(getattr(ticker, 'marketPrice', None)):
-            try: 
-                v = ticker.marketPrice()
-                if not math.isnan(v) and v != 0: val = float(v)
-            except: pass
+    def get_robust_index_val(self, contract, ticker, *, allow_zero=False,
+                             positive_only=False, allow_bid_ask=False,
+                             allow_history=True):
+        """Read a quote without turning a legitimate zero into missing data."""
+        symbol = getattr(contract, 'symbol', 'UNKNOWN')
+        if ticker is None:
+            self.log(f"⚠️ {symbol} 未建立有效行情订阅，返回缺失")
+            return None
 
-        if val != 0.0:
-            return val
+        def valid_number(value, *, zero_allowed=None):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(number):
+                return None
+            if positive_only:
+                return number if number > 0 else None
+            if zero_allowed is None:
+                zero_allowed = allow_zero
+            if not zero_allowed and number == 0:
+                return None
+            return number
 
-        # --- 第二层护盾：重武器 (历史 K 线回溯) ---
-        try:
-            # 向物理服务器索要最近 15 分钟的 1分钟 K线
-            bars = self.ib.reqHistoricalData(
-                contract,
-                endDateTime='',
-                durationStr='900 S',
-                barSizeSetting='1 min',
-                whatToShow='TRADES',
-                useRTH=False
-            )
-            if bars:
-                return float(bars[-1].close)
-        except Exception:
-            self.log(
-                f"⚠️ {getattr(contract, 'symbol', 'UNKNOWN')} 历史行情兜底失败")
-            
-        self.log(
-            f"⚠️ {getattr(contract, 'symbol', 'UNKNOWN')} 行情不可用，返回缺失")
-        return 0.0
+        attributes = ['last', 'close']
+        if allow_bid_ask:
+            attributes.extend(['bid', 'ask'])
+        for attr in attributes:
+            # AD-NYSE/TICK-NYSE can legitimately print zero as a live last
+            # tick.  Their prior close is structurally zero, so close=0 is not
+            # evidence that the current stream is healthy.
+            zero_allowed = allow_zero and attr == 'last'
+            value = valid_number(
+                getattr(ticker, attr, None), zero_allowed=zero_allowed)
+            if value is not None:
+                return value
+
+        if callable(getattr(ticker, 'marketPrice', None)):
+            try:
+                value = valid_number(ticker.marketPrice())
+                if value is not None:
+                    return value
+            except Exception:
+                pass
+
+        if allow_history:
+            try:
+                bars = self.ib.reqHistoricalData(
+                    contract,
+                    endDateTime='',
+                    durationStr='900 S',
+                    barSizeSetting='1 min',
+                    whatToShow='TRADES',
+                    useRTH=False,
+                )
+                if bars:
+                    value = valid_number(bars[-1].close)
+                    if value is not None:
+                        return value
+            except Exception as exc:
+                self.log(
+                    f"⚠️ {symbol} 历史行情兜底失败: "
+                    f"{type(exc).__name__}: {exc}")
+
+        self.log(f"⚠️ {symbol} 行情不可用，返回缺失")
+        return None
 
     def run_scan(self):
         if not self.is_trading_day():
             self.log("🛑 拦截：今天是美股休市日，哨兵休眠。")
             return
 
+        self.ib_errors = []
         self.load_sentinel_context()
         
         def optional_float(val):
@@ -275,6 +325,9 @@ class GlobalSentinel:
 
         def display_number(value, digits=2, prefix=''):
             return f"{prefix}{value:.{digits}f}" if value is not None else "NA"
+
+        def display_signed(value, digits=0):
+            return f"{value:+.{digits}f}" if value is not None else "NA"
 
         zgl = optional_float(
             self.opt_ctx.get('gamma_flip_all', self.opt_ctx.get('zgl_price')))
@@ -325,70 +378,110 @@ class GlobalSentinel:
             self.ib.connect('127.0.0.1', 4001, clientId=888, readonly=True)
             self.ib.reqMarketDataType(1)
 
-            # ✅ 避开 IBKR 符号陷阱：直接抓取 ADV 和 DECL 进行相减，杜绝 ADD 无法识别的尴尬
             contracts = {
                 'SPY': Stock('SPY', 'SMART', 'USD'),
-                'TICK': Index('TICK-NYSE', 'NYSE'),
-                'TRIN': Index('TRIN-NYSE', 'NYSE'),
-                'ADV': Index('ADV-NYSE', 'NYSE'),   # 上涨家数
-                'DECL': Index('DECL-NYSE', 'NYSE'), # 下跌家数
-                'UVOL': Index('UVOL-NYSE', 'NYSE'),
-                'DVOL': Index('DVOL-NYSE', 'NYSE')
             }
+            contracts.update({
+                key: Index(symbol, exchange)
+                for key, (symbol, exchange) in
+                IBKR_BREADTH_CONTRACTS.items()
+            })
             self.ib.qualifyContracts(*contracts.values())
-            
-            with market_data_subscription(self.ib, contracts.values(), 4) as tickers:
+
+            contract_status = {}
+            qualified_contracts = {}
+            for key, contract in contracts.items():
+                con_id = int(getattr(contract, 'conId', 0) or 0)
+                qualified = con_id > 0
+                contract_status[key] = {
+                    'requested_symbol': getattr(contract, 'symbol', None),
+                    'con_id': con_id or None,
+                    'qualified': qualified,
+                }
+                if qualified:
+                    qualified_contracts[key] = contract
+                else:
+                    self.log(
+                        f"⚠️ {key}合约资格失败："
+                        f"{getattr(contract, 'symbol', 'UNKNOWN')} conId=0")
+
+            if 'SPY' not in qualified_contracts:
+                self.log("⚠️ SPY 合约资格失败，跳过本次扫描。")
+                return
+
+            with market_data_subscription(
+                    self.ib, qualified_contracts.values(), 8) as tickers:
                 t_dict = {
                     getattr(t.contract, 'conId', None): t for t in tickers
                     if getattr(t, 'contract', None) is not None
                 }
 
                 def ticker_for(key):
-                    return t_dict.get(getattr(contracts[key], 'conId', None))
+                    contract = qualified_contracts.get(key)
+                    return t_dict.get(getattr(contract, 'conId', None))
 
-                # 提取数据，全部过一遍 "重武器" 函数
                 spy_px = self.get_robust_index_val(
-                    contracts['SPY'], ticker_for('SPY'))
-                if spy_px == 0: 
+                    qualified_contracts['SPY'], ticker_for('SPY'),
+                    positive_only=True, allow_bid_ask=True)
+                if spy_px is None:
                     self.log("⚠️ SPY 现价获取失败，跳过本次扫描。")
                     return
 
-                adv_val = self.get_robust_index_val(
-                    contracts['ADV'], ticker_for('ADV'))
-                decl_val = self.get_robust_index_val(
-                    contracts['DECL'], ticker_for('DECL'))
-                add_val = adv_val - decl_val  # ✅ 完美算出真实的 ADD
-                
-                uvol_val = self.get_robust_index_val(
-                    contracts['UVOL'], ticker_for('UVOL'))
-                dvol_val = self.get_robust_index_val(
-                    contracts['DVOL'], ticker_for('DVOL'))
-                trin_raw = self.get_robust_index_val(
-                    contracts['TRIN'], ticker_for('TRIN'))
-                trin_val = trin_raw if trin_raw > 0 else None
-                tick_now = self.get_robust_index_val(
-                    contracts['TICK'], ticker_for('TICK'))
+                ad_contract = qualified_contracts.get('AD')
+                add_val = (
+                    self.get_robust_index_val(
+                        ad_contract, ticker_for('AD'), allow_zero=True,
+                        allow_history=False)
+                    if ad_contract is not None else None
+                )
+                trin_contract = qualified_contracts.get('TRIN')
+                trin_raw = (
+                    self.get_robust_index_val(
+                        trin_contract, ticker_for('TRIN'), positive_only=True)
+                    if trin_contract is not None else None
+                )
+                trin_val = trin_raw if trin_raw is not None and trin_raw > 0 else None
+                tick_contract = qualified_contracts.get('TICK')
+                tick_now = (
+                    self.get_robust_index_val(
+                        tick_contract, ticker_for('TICK'), allow_zero=True)
+                    if tick_contract is not None else None
+                )
 
-            # 防除零错：计算量比
-            vol_ratio, vol_ratio_status = up_down_volume_ratio(
-                uvol_val, dvol_val)
-            if vol_ratio is None:
-                self.log(
-                    "⚠️ NYSE U/D不可用：请核对UVOL-NYSE/DVOL-NYSE合约、"
-                    "IBKR行情权限及指数历史数据能力")
+            # IBKR没有UVOL/DVOL指数合约。保持NULL，禁止用1.00伪造中性。
+            uvol_val = None
+            dvol_val = None
+            vol_ratio = None
+            vol_ratio_status = UD_UNSUPPORTED_STATUS
+            add_status = 'OK' if add_val is not None else 'MISSING_STREAM'
             context_metadata.update({
-                "uvol_raw": uvol_val if uvol_val > 0 else None,
-                "dvol_raw": dvol_val if dvol_val > 0 else None,
+                "add_raw": add_val,
+                "add_status": add_status,
+                "add_source": "IBKR:AD-NYSE",
+                "uvol_raw": None,
+                "dvol_raw": None,
                 "vol_ratio_status": vol_ratio_status,
-                "ud_source": "IBKR:UVOL-NYSE/DVOL-NYSE",
+                "ud_source": UD_UNSUPPORTED_SOURCE,
+                "ud_contract_validation": "IBKR_ERROR_200_CONFIRMED_2026-07-24",
+                "ib_contracts": contract_status,
             })
             
             # 计算 15 分钟累积 TICK
             ctick_15m_avg = tick_now
-            try:
-                tick_bars = self.ib.reqHistoricalData(contracts['TICK'], endDateTime='', durationStr='900 S', barSizeSetting='1 min', whatToShow='TRADES', useRTH=False)
-                if tick_bars: ctick_15m_avg = sum([b.close for b in tick_bars]) / len(tick_bars)
-            except: pass
+            if tick_contract is not None:
+                try:
+                    tick_bars = self.ib.reqHistoricalData(
+                        tick_contract, endDateTime='', durationStr='900 S',
+                        barSizeSetting='1 min', whatToShow='TRADES',
+                        useRTH=False)
+                    if tick_bars:
+                        ctick_15m_avg = (
+                            sum([b.close for b in tick_bars]) /
+                            len(tick_bars))
+                except Exception as exc:
+                    self.log(
+                        f"⚠️ TICK-NYSE 15分钟历史均值失败: "
+                        f"{type(exc).__name__}: {exc}")
 
             # 计算 VWAP
             vwap_now, vwap_30m = spy_px, spy_px 
@@ -419,13 +512,16 @@ class GlobalSentinel:
             # 判断警报
             if (lower_bound is not None and trin_val is not None
                     and spy_px <= lower_bound * 1.002 and trin_val >= 1.5):
-                if vol_ratio is not None and vol_ratio >= 2.0 and ctick_15m_avg > 0:
+                if (vol_ratio is not None and vol_ratio >= 2.0
+                        and ctick_15m_avg is not None and ctick_15m_avg > 0):
                     fire = True; title = "🥇【深海核爆】极值恐慌底反转！散户止损，机构扫货，绝佳做多点！"
             elif (
                 gamma_flip_alert_enabled and zgl is not None and zgl > 0
                 and spy_px < zgl and spy_px < vwap_now
             ):
-                if vol_ratio is not None and vol_ratio <= 0.25 and ctick_15m_avg < -300:
+                if (vol_ratio is not None and vol_ratio <= 0.25
+                        and ctick_15m_avg is not None
+                        and ctick_15m_avg < -300):
                     fire = True
                     title = "🥈【结构确认】Gamma Flip观察位失守且广度、成交同步恶化"
             elif vol_ratio is not None and vol_ratio >= 4.0 and spy_px > vwap_now:
@@ -464,9 +560,16 @@ class GlobalSentinel:
             )
             r += f"【日内高频刺客】\n"
             r += f"SPY 现价: ${spy_px:.2f} (VWAP: ${vwap_now:.2f})\n"
-            r += f"NYSE上涨/下跌成交量比 (U/D): {display_number(vol_ratio)} ({vol_ratio_status})\n"
+            r += (
+                f"NYSE净上涨−下跌家数 (AD-NYSE): "
+                f"{display_signed(add_val)} ({add_status})\n"
+            )
+            r += (
+                f"NYSE上涨/下跌成交量比 (U/D): NA "
+                f"({vol_ratio_status}; IBKR无UVOL/DVOL指数合约)\n"
+            )
             r += f"NYSE TRIN: {display_number(trin_val)} (IBKR TRIN-NYSE, 截面={ny_timestamp_str}, 收盘竞价=UNVERIFIED)\n"
-            r += f"15m累积暗流 (CTICK): {ctick_15m_avg:+.0f}\n"
+            r += f"15m累积暗流 (CTICK): {display_signed(ctick_15m_avg)}\n"
 
             print(r)
 
@@ -477,6 +580,7 @@ class GlobalSentinel:
                 self.send_alert(title, r)
 
             # ✅ 写入纯粹的 NY 字符串时间，屏蔽 Supabase 时区错乱
+            context_metadata["ib_errors"] = self.ib_errors[-20:]
             db_payload = {
                 "record_time": ny_timestamp_str,
                 "spy_px": spy_px, "sma20": sma20, "vwap_now": vwap_now, "vwap_30m": vwap_30m,
