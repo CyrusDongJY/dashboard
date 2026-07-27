@@ -42,6 +42,133 @@ def distance_pct(level, spot):
     return (level - spot) / spot * 100.0
 
 
+def _compact_number(value, digits=2, prefix="", signed=False):
+    number = finite_number(value)
+    if number is None:
+        return "NA"
+    sign = "+" if signed else ""
+    return f"{prefix}{number:{sign}.{digits}f}"
+
+
+def format_premarket_symbol_summary(
+        symbol, reference_price, price_source, market_label, previous_close,
+        expected_move, oi_pcr, iv_skew, gamma, gamma_flip_quality):
+    """Render a concise email view without reducing persisted diagnostics."""
+    source_labels = {
+        "PREMARKET_MID": "盘前中间价",
+        "PREMARKET_LAST": "盘前成交",
+        "PREVIOUS_CLOSE_FALLBACK": "昨收回退",
+        "MISSING": "缺失",
+    }
+    source_text = source_labels.get(price_source, price_source or "未知")
+    em_pct = expected_move.get("pct") if expected_move else None
+    em_quality = expected_move.get("quality") if expected_move else "MISSING"
+
+    skew = finite_number(iv_skew)
+    skew_text = _compact_number(
+        skew * 100 if skew is not None else None, signed=True)
+    headline = (
+        f"{symbol} | 参考 {_compact_number(reference_price, prefix='$')} "
+        f"({source_text}/{market_label}) | "
+        f"昨收 {_compact_number(previous_close, prefix='$')} | "
+        f"预期 ±{_compact_number(em_pct)}% | "
+        f"PCR {_compact_number(oi_pcr)} | "
+        f"Skew {skew_text}%"
+    )
+
+    flip = gamma.get("ALL", {}).get("primary_flip")
+    if gamma.get("pin_strike") is not None:
+        structure_parts = [
+            "Pin " + _compact_number(gamma.get("pin_strike"), prefix="$"),
+        ]
+    else:
+        structure_parts = [
+            "C " + _compact_number(gamma.get("call_wall"), prefix="$"),
+            "P " + _compact_number(gamma.get("put_wall"), prefix="$"),
+        ]
+    structure_parts.append("Flip " + _compact_number(flip, prefix="$"))
+    distance_values = [
+        distance_pct(gamma.get("call_wall"), reference_price),
+        distance_pct(gamma.get("put_wall"), reference_price),
+        distance_pct(flip, reference_price),
+    ]
+    distance_text = "/".join(
+        _compact_number(value, signed=True) + "%" for value in distance_values)
+    structure_line = (
+        "  关键位 " + " / ".join(structure_parts)
+        + f" | C/P/Flip距离 {distance_text}"
+    )
+
+    bucket_labels = (
+        ("0DTE", "0D"), ("1-7D", "1-7D"),
+        ("8-30D", "8-30D"), ("ALL", "全期"),
+    )
+    gamma_parts = []
+    bad_gamma = []
+    for bucket, label in bucket_labels:
+        metrics = gamma.get(bucket, {})
+        quality = metrics.get("quality", "MISSING")
+        if quality == "OK":
+            value = _compact_number(
+                metrics.get("net_gamma_m"), signed=True) + "M"
+        else:
+            value = f"NA[{quality}]"
+            bad_gamma.append(f"{label}:{quality}")
+        gamma_parts.append(f"{label} {value}")
+    gamma_line = "  Gamma " + " | ".join(gamma_parts)
+
+    notices = []
+    if price_source == "PREVIOUS_CLOSE_FALLBACK":
+        notices.append("未取得盘前价")
+    elif market_label != "实时":
+        notices.append(f"行情={market_label}")
+    if em_quality != "OK":
+        notices.append(f"预期振幅={em_quality}")
+    if bad_gamma:
+        notices.append("Gamma=" + ",".join(bad_gamma))
+    if gamma_flip_quality not in (None, "OK", "BASELINE_RESET", "NO_CROSSING"):
+        notices.append(f"Flip={gamma_flip_quality}")
+
+    lines = [headline, structure_line, gamma_line]
+    if notices:
+        lines.append("  注意 " + "；".join(notices))
+    return "\n".join(lines)
+
+
+def format_premarket_quality_summary(rows_written, total_symbols, issues):
+    """Collapse detailed quality keys into a short operational email footer."""
+    unique_issues = sorted(set(issues or []))
+    if not unique_issues:
+        return f"入库 {rows_written}/{total_symbols} | 无数据质量告警"
+
+    categories = {}
+    for issue in unique_issues:
+        key = str(issue).split(":", 1)[0]
+        if key.startswith("gamma_"):
+            label = "Gamma"
+        elif key.startswith("db_"):
+            label = "数据库"
+        elif key in ("price", "premarket_quote", "premarket_not_live"):
+            label = "行情"
+        elif key == "expected_move":
+            label = "预期振幅"
+        elif key == "futures_ref":
+            label = "期货映射"
+        elif key == "dpsv":
+            label = "FINRA"
+        elif key in ("expirations", "strikes", "option_qualification", "option_rows"):
+            label = "期权链"
+        else:
+            label = "其他"
+        categories[label] = categories.get(label, 0) + 1
+    category_text = "，".join(
+        f"{label}{count}" for label, count in sorted(categories.items()))
+    return (
+        f"入库 {rows_written}/{total_symbols} | "
+        f"质量项 {len(unique_issues)}（{category_text}）"
+    )
+
+
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 

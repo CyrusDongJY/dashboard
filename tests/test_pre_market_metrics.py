@@ -8,6 +8,8 @@ from pre_market_metrics import (
     apply_gamma_quality_gate,
     distance_pct,
     expected_move_metrics,
+    format_premarket_quality_summary,
+    format_premarket_symbol_summary,
     gamma_structure,
     max_oi_metrics,
     put_call_oi_ratio,
@@ -154,6 +156,65 @@ class StructureTests(unittest.TestCase):
         self.assertEqual(result["right"], "P")
         self.assertAlmostEqual(result["delta"], -0.61)
         self.assertIsNotNone(result["gamma_dollar_m"])
+
+
+class EmailSummaryTests(unittest.TestCase):
+    @staticmethod
+    def gamma_fixture(low_quality=False):
+        result = {
+            "call_wall": 105,
+            "put_wall": 95,
+            "pin_strike": None,
+        }
+        for bucket, value in (
+                ("0DTE", 1.2), ("1-7D", 2.4),
+                ("8-30D", -0.8), ("ALL", 2.8)):
+            result[bucket] = {
+                "net_gamma_m": value,
+                "primary_flip": 101 if bucket == "ALL" else None,
+                "quality": (
+                    "LOW_COVERAGE"
+                    if low_quality and bucket == "0DTE" else "OK"),
+            }
+        return result
+
+    def test_symbol_email_is_compact_but_keeps_decision_fields(self):
+        text = format_premarket_symbol_summary(
+            "SPY", 100, "PREMARKET_MID", "实时", 99,
+            {"pct": 1.25, "quality": "OK"},
+            0.92, 0.015, self.gamma_fixture(), "OK")
+
+        self.assertEqual(len(text.splitlines()), 3)
+        self.assertIn("SPY | 参考 $100.00", text)
+        self.assertIn("C $105.00 / P $95.00 / Flip $101.00", text)
+        self.assertIn("C/P/Flip距离 +5.00%/-5.00%/+1.00%", text)
+        self.assertIn("Gamma 0D +1.20M", text)
+        self.assertNotIn("全部零点", text)
+        self.assertNotIn("最大OI", text)
+        self.assertNotIn("符号假设", text)
+
+    def test_symbol_email_surfaces_quality_degradation(self):
+        text = format_premarket_symbol_summary(
+            "QQQ", 500, "PREVIOUS_CLOSE_FALLBACK", "延迟冻结", 500,
+            {"pct": None, "quality": "MISSING"},
+            None, None, self.gamma_fixture(low_quality=True), "JUMP_REVIEW")
+
+        self.assertIn("昨收回退", text)
+        self.assertIn("0D NA[LOW_COVERAGE]", text)
+        self.assertIn("未取得盘前价", text)
+        self.assertIn("预期振幅=MISSING", text)
+        self.assertIn("Flip=JUMP_REVIEW", text)
+
+    def test_quality_footer_groups_internal_issue_keys(self):
+        text = format_premarket_quality_summary(
+            9, 10,
+            ["gamma_0dte:QQQ:LOW_COVERAGE", "dpsv:QQQ",
+             "dpsv:QQQ", "db_main:TSLA"])
+        self.assertIn("入库 9/10", text)
+        self.assertIn("质量项 3", text)
+        self.assertIn("Gamma1", text)
+        self.assertIn("FINRA1", text)
+        self.assertIn("数据库1", text)
 
 
 if __name__ == "__main__":

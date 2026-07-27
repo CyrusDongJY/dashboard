@@ -31,6 +31,8 @@ from pre_market_metrics import (
     expected_move_metrics,
     expiration_bucket,
     finite_number,
+    format_premarket_quality_summary,
+    format_premarket_symbol_summary,
     gamma_structure,
     implied_volatility,
     max_oi_metrics,
@@ -408,7 +410,7 @@ def get_finra_darkpool(tickers):
     return None
 
 def get_gex_dix():
-    report = "\n【模块一：暗池与做市商宏观敞口 (GEX & DIX)】\n"
+    report = "\n【市场背景】\n"
     try:
         df = pd.read_csv("https://squeezemetrics.com/monitor/static/DIX.csv")
         last_row = df.iloc[-1]
@@ -416,7 +418,9 @@ def get_gex_dix():
         dix = float(last_row['dix']) * 100
         gex = float(last_row['gex']) / 1e9 
 
-        report += f"📊 隔夜数据更新日期: {date_str}\n   - 暗池指数 (DIX): {dix:.1f}%\n   - 做市商敞口 (GEX): {gex:.2f} 十亿\n"
+        report += (
+            f"DIX {dix:.1f}% | GEX {gex:.2f}十亿 | "
+            f"源日期 {date_str}\n")
         
         try:
             today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
@@ -443,7 +447,9 @@ def get_report():
     ny_today_date = ny_now.date() 
     today_str = ny_now.strftime('%Y-%m-%d')
     
-    report = f"📊 美股战略日报 [轨道二] 盘前 GEX 与期权微观阵地\n生成时间: {ny_now.strftime('%Y-%m-%d %H:%M')}\n" + "="*55 + "\n"
+    report = (
+        f"美股盘前监测摘要 | {ny_now.strftime('%Y-%m-%d %H:%M')} ET\n"
+        "说明：正距离表示关键位在参考价上方；完整明细已写入数据库。\n")
     
     try:
         ib.connect('127.0.0.1', 4001, clientId=319, readonly=True, account='')
@@ -457,38 +463,37 @@ def get_report():
         
         # 个股FINRA场外短售成交量代理
         darkpool_data = get_finra_darkpool(SYMBOLS)
-        report += "\n【模块二：核心个股FINRA场外短售量代理 (DPSV)】\n"
+        report += "\n【FINRA场外短售量代理】\n"
         if darkpool_data:
             # FINRA 日报通常滞后 1-3 个交易日：明示数据真实日期，告警端按新鲜度降权
             finra_date_raw = next(iter(darkpool_data.values()))['Date']
             finra_date = f"{finra_date_raw[:4]}-{finra_date_raw[4:6]}-{finra_date_raw[6:]}"
             finra_lag = lag_trading_days(finra_date)
-            report += f"   📅 FINRA 数据日期: {finra_date} (滞后 {finra_lag} 个交易日)\n"
+            report += f"源日期 {finra_date} | 滞后 {finra_lag} 个交易日\n"
             for sym in ['SPY', 'QQQ', 'TSLA', 'NVDA']:
                 if sym in darkpool_data:
                     dpsv = darkpool_data[sym]['DPSV_%']
                     zone = "高读数" if dpsv > 50 else ("低读数" if dpsv < 40 else "中性区")
-                    report += f"   - {sym:4} FINRA短售量占比: {dpsv:5.2f}% ({zone}，方向待验证)\n"
+                    report += f"{sym} {dpsv:.2f}%({zone}) | "
+            report = report.rstrip(" | ") + "\n"
         else:
             finra_date, finra_lag = None, None
-            report += "   ⚠️ 暗池数据目前暂不可用\n"
+            report += "不可用\n"
 
-        # 模块三（原模块二重命名）：期权数据
-        report += "\n【模块三：期权 Gamma 结构与高级微观敞口】\n"
+        # 邮件只展示决策摘要；全量期权结构继续写入数据库。
+        report += "\n【标的速览】\n"
 
         for sym in SYMBOLS:
-            report += f"\n--- {sym} 关键位与微观结构 ---\n"
-            
             stock_contracts = ib.qualifyContracts(Stock(sym, 'SMART', 'USD'))
             if not stock_contracts:
-                report += f"⚠️ 无法获取 {sym} 合约信息。\n"
+                report += f"{sym} | 合约信息不可用\n"
                 continue
             stock = stock_contracts[0]
 
             price_snapshot = get_price_snapshot(stock, ny_now)
             curr_price = price_snapshot.get("reference_price")
             if curr_price is None:
-                report += f"⚠️ 无法获取 {sym} 昨收或盘前有效报价。\n"
+                report += f"{sym} | 昨收与盘前报价均不可用\n"
                 quality_issues.append(f"price:{sym}")
                 continue
             futures_ref = get_futures_implied_reference(
@@ -497,19 +502,6 @@ def get_report():
             market_label = {
                 1: "实时", 2: "冻结", 3: "延迟", 4: "延迟冻结",
             }.get(market_type, "未知")
-            report += (
-                f"📌 上一日正式收盘: {_fmt(price_snapshot.get('previous_close'), prefix='$')}"
-                f" ({price_snapshot.get('previous_close_date') or 'NA'})\n"
-                f"⏱️ 盘前最新成交: {_fmt(price_snapshot.get('premarket_last'), prefix='$')}\n"
-                f"📖 盘前Bid/Ask/Mid: "
-                f"{_fmt(price_snapshot.get('premarket_bid'), prefix='$')} / "
-                f"{_fmt(price_snapshot.get('premarket_ask'), prefix='$')} / "
-                f"{_fmt(price_snapshot.get('premarket_mid'), prefix='$')}\n"
-                f"🧭 期货映射参考: {_fmt(futures_ref.get('price'), prefix='$')}"
-                f" ({futures_ref.get('symbol') or '不适用'})\n"
-                f"🎯 期权测算参考价: ${curr_price:.2f}"
-                f" ({price_snapshot.get('price_source')}，行情={market_label})\n"
-            )
             if price_snapshot.get("price_source") == "PREVIOUS_CLOSE_FALLBACK":
                 quality_issues.append(f"premarket_quote:{sym}")
             elif market_type != 1:
@@ -519,36 +511,29 @@ def get_report():
             
             chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
             if not chains:
-                report += "⚠️ 未找到可用期权链。\n"
+                report += f"{sym} | 期权链不可用\n"
                 continue
                 
             chain = next((c for c in chains if c.exchange == 'SMART' and getattr(c, 'tradingClass', None) == stock.symbol), None)
             if not chain: chain = next((c for c in chains if c.exchange == 'SMART'), None)
             if not chain or not getattr(chain, 'expirations', None) or not getattr(chain, 'strikes', None):
-                report += "⚠️ 期权链数据缺失。\n"
+                report += f"{sym} | 期权链字段缺失\n"
                 continue
             
             target_exps, expiration_coverage = select_expirations(
                 chain.expirations, ny_today_date, horizon_days=MAX_GAMMA_DTE)
             if not target_exps:
-                report += "⚠️ 无有效未到期合约。\n"
+                report += f"{sym} | 无有效未到期合约\n"
                 quality_issues.append(f"expirations:{sym}")
                 continue
             short_exp = target_exps[0]
-            report += (
-                "🗓️ Gamma采样到期日: "
-                + ", ".join(
-                    f"{bucket}={','.join(values) if values else '无'}"
-                    for bucket, values in expiration_coverage.items())
-                + f"；最长{MAX_GAMMA_DTE}日\n"
-            )
 
             valid_strikes = sorted(
                 s for s in chain.strikes
                 if finite_number(s, positive=True) is not None
                 and curr_price * 0.80 <= float(s) <= curr_price * 1.20)
             if not valid_strikes:
-                report += "⚠️ 现价±20%范围内无有效执行价。\n"
+                report += f"{sym} | 参考价±20%内无有效执行价\n"
                 quality_issues.append(f"strikes:{sym}")
                 continue
             closest_strike = min(valid_strikes, key=lambda x: abs(x - curr_price))
@@ -569,7 +554,7 @@ def get_report():
             except Exception: contracts = []
             
             if not contracts:
-                report += "⚠️ 期权合约资格确认失败。\n"
+                report += f"{sym} | 期权合约资格确认失败\n"
                 quality_issues.append(f"option_qualification:{sym}")
                 continue
 
@@ -737,89 +722,18 @@ def get_report():
                     elif previous_model and previous_model != gamma["sign_model"]:
                         gamma_flip_quality = "METHOD_CHANGED"
 
-                report += f"⚖️ Put/Call持仓结构比: {_fmt(oi_pcr)}\n"
-                report += f"📉 IV Skew: {_fmt(iv_skew * 100 if iv_skew is not None else None, prefix='')}%\n"
-                report += (
-                    f"📏 预期振幅 ({expected_move['source'] or 'NA'}): "
-                    f"±{_fmt(expected_move['value'], prefix='$')} "
-                    f"(±{_fmt(expected_move['pct'])}%, "
-                    f"DTE={_fmt(expected_move['dte'], digits=3)}, "
-                    f"质量={expected_move['quality']})\n"
-                )
-                report += (
-                    f"📚 本次采样最大OI合约: {_fmt(max_oi['strike'], prefix='$')} "
-                    f"{max_oi['right'] or 'NA'} | 到期={max_oi['expiration'] or 'NA'} "
-                    f"| OI={max_oi['oi'] if max_oi['oi'] is not None else 'NA'} "
-                    f"| Delta={_fmt(max_oi['delta'], digits=3)} "
-                    f"| Gamma美元={_fmt(max_oi['gamma_dollar_m'])}M "
-                    f"| 距参考价={_fmt(max_oi['distance_pct'])}%\n"
-                )
-                if gamma["pin_strike"] is not None:
-                    pin_name = (
-                        "双边Pin候选位" if gamma["pin_state"] == "PIN_CANDIDATE"
-                        else "双边突破枢轴"
-                    )
-                    report += (
-                        f"🧲 {pin_name}: ${gamma['pin_strike']:.2f} "
-                        f"(Call/Put Gamma集中于同一执行价)\n"
-                    )
-                else:
-                    report += (
-                        f"🧱 Gamma加权墙: Call {_fmt(call_w, prefix='$')} "
-                        f"/ Put {_fmt(put_w, prefix='$')}\n"
-                    )
-                bucket_labels = {
-                    "0DTE": "0DTE", "1-7D": "1—7日", "8-30D": "8—30日",
-                    "31-60D": "31—60日",
-                    "ALL": f"全采样期限(≤{MAX_GAMMA_DTE}日)",
-                }
-                for bucket in GAMMA_BUCKETS:
-                    metrics = gamma[bucket]
-                    if metrics["quality"] != "OK":
-                        zero_text = "因质量闸门不发布"
-                    else:
-                        zero_text = (
-                            ", ".join(
-                                f"${value:.2f}" for value in metrics["zero_points"])
-                            if metrics["zero_points"] else "区间内无零点"
-                        )
-                    report += (
-                        f"🌊 {bucket_labels[bucket]} Gamma: "
-                        f"{_fmt(metrics['net_gamma_m'])}M | "
-                        f"主Flip={_fmt(metrics['primary_flip'], prefix='$')} | "
-                        f"全部零点(±20%网格)={zero_text} | "
-                        f"质量={metrics['quality']} | "
-                        f"有效={metrics['contract_count']}/请求="
-                        f"{metrics['requested_contract_count']} "
-                        f"({metrics['coverage_pct']:.1f}%) | "
-                        f"Call/Put={metrics['call_count']}/{metrics['put_count']} | "
-                        f"{metrics['expiration_count']}到期\n"
-                    )
-                if gamma_flip_quality == "JUMP_REVIEW":
-                    report += (
-                        f"⚠️ 主Gamma Flip单日跳变待复核: "
-                        f"{_fmt(previous_flip, prefix='$')} → "
-                        f"{_fmt(zgl_strike, prefix='$')} "
-                        f"({_fmt(gamma_flip_change_pct)}%参考价)；"
-                        f"到期采样变化={gamma_roll_changed}。\n"
-                    )
-                elif gamma_flip_quality in ("ROLL_CHANGED", "METHOD_CHANGED"):
-                    report += (
-                        f"ℹ️ 主Gamma Flip连续性状态: {gamma_flip_quality}；"
-                        "仅作观察，不作为硬交易边界。\n"
-                    )
-                report += (
-                    f"📐 关键位相对现价距离(正值=关键位在上方): "
-                    f"Call墙/Put墙/主Flip "
-                    f"{_fmt(distance_pct(call_w, curr_price))}% / "
-                    f"{_fmt(distance_pct(put_w, curr_price))}% / "
-                    f"{_fmt(distance_pct(zgl_strike, curr_price))}%\n"
-                    f"🌪️ 动态对冲代理: Vanna {_fmt(vanna_m)}M | "
-                    f"Charm {_fmt(charm_m)}M/天\n"
-                    f"ℹ️ Gamma曲线版本: {gamma['curve_version']}；"
-                    f"符号假设: {gamma['sign_model']}；"
-                    f"OI为隔夜持仓，方向不是实际做市商净仓。\n"
-                )
+                report += format_premarket_symbol_summary(
+                    sym,
+                    reference_price=curr_price,
+                    price_source=price_snapshot.get("price_source"),
+                    market_label=market_label,
+                    previous_close=price_snapshot.get("previous_close"),
+                    expected_move=expected_move,
+                    oi_pcr=oi_pcr,
+                    iv_skew=iv_skew,
+                    gamma=gamma,
+                    gamma_flip_quality=gamma_flip_quality,
+                ) + "\n"
 
                 try:
                     # ✅ V9.0：写入独立的盘前表 stock_options_pre_market（与盘后现货解耦，避免时点错配）
@@ -959,12 +873,11 @@ def get_report():
                         logger.info(f"✅ [{sym}] 进阶期权阵地数据推送成功！")
                 except Exception as e:
                     logger.warning(f"⚠️ {sym} 入库异常: {e}")
+                    quality_issues.append(f"db_main:{sym}")
 
             else:
                 quality_issues.append(f"option_rows:{sym}")
-                report += f"⚠️ 期权持仓或报价数据获取失败。\n"
-
-        report += "\n" + "="*55 + "\n[声明] 轨道二：盘前期权阵地扫描完毕！"
+                report += f"{sym} | 期权持仓或报价不可用\n"
 
         # 数据质量审计：记录本次抓取覆盖率与 FINRA 滞后
         try:
@@ -986,7 +899,14 @@ def get_report():
         except Exception as e:
             logger.warning(f"⚠️ 数据质量记录失败: {e}")
 
-        if send_email("美股盘前客观数据切片 - 纯净高阶版", report):
+        report += (
+            "\n【运行质量】\n"
+            + format_premarket_quality_summary(
+                rows_written, len(SYMBOLS), quality_issues)
+            + "\n完整期权链、Gamma零点、样本覆盖、最大OI及对冲代理已保留在数据库。"
+        )
+
+        if send_email(f"美股盘前监测摘要 | {today_str}", report):
             logger.info("\n✅ 轨道二运行完毕并发送成功！")
         else:
             logger.warning("\n⚠️ 轨道二数据已处理，但邮件发送失败。")
