@@ -39,6 +39,7 @@ from pre_market_metrics import (
     put_call_oi_ratio,
     quote_midpoint,
     select_expirations,
+    standard_monthly_oi_walls,
     time_to_expiry_years,
 )
 
@@ -635,6 +636,11 @@ def get_report():
                 if oi_pcr is None:
                     quality_issues.append(f"oi_pcr:{sym}")
                 max_oi = max_oi_metrics(df, curr_price)
+                monthly_walls = standard_monthly_oi_walls(
+                    df, today_str, curr_price)
+                if monthly_walls["quality"] != "OK":
+                    quality_issues.append(
+                        f"monthly_wall:{sym}:{monthly_walls['quality']}")
                 oi_valid_counts = {bucket: 0 for bucket in GAMMA_BUCKETS}
                 for bucket in GAMMA_BUCKETS:
                     if bucket == "ALL":
@@ -782,6 +788,17 @@ def get_report():
                         "max_oi_delta": _round_or_none(max_oi["delta"], 6),
                         "max_oi_gamma_dollar_m": _round_or_none(max_oi["gamma_dollar_m"], 6),
                         "max_oi_distance_pct": _round_or_none(max_oi["distance_pct"]),
+                        "monthly_wall_expiry": monthly_walls["expiry"],
+                        "monthly_call_wall": _round_or_none(
+                            monthly_walls["call_wall"], 4),
+                        "monthly_put_wall": _round_or_none(
+                            monthly_walls["put_wall"], 4),
+                        "monthly_call_wall_oi": monthly_walls["call_oi"],
+                        "monthly_put_wall_oi": monthly_walls["put_oi"],
+                        "monthly_wall_oi_source_date": price_snapshot.get(
+                            "previous_close_date"),
+                        "monthly_wall_method": monthly_walls["method"],
+                        "monthly_wall_quality": monthly_walls["quality"],
                         "iv_skew": _round_or_none(iv_skew, 6),
                         "short_gamma_m": _round_or_none(short_gamma_total, 6),
                         "long_gamma_m": _round_or_none(long_gamma_total, 6),

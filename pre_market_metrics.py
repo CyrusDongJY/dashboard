@@ -2,7 +2,7 @@
 """Pure calculations for the pre-market options monitor."""
 import math
 from copy import deepcopy
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ GAMMA_SIGN_MODEL = "OI_CALL_PLUS_PUT_MINUS_PROXY"
 GAMMA_CURVE_VERSION = "gamma_curve_v2"
 GAMMA_BUCKETS = ("0DTE", "1-7D", "8-30D", "31-60D", "ALL")
 DISTANCE_SIGN_VERSION = "LEVEL_MINUS_SPOT_V2"
+MONTHLY_WALL_METHOD = "MAX_OI_BY_RIGHT_STANDARD_MONTHLY_V1"
 
 
 def finite_number(value, positive=False):
@@ -40,6 +41,106 @@ def distance_pct(level, spot):
     if level is None or spot is None:
         return None
     return (level - spot) / spot * 100.0
+
+
+def _third_friday(year, month):
+    first = date(year, month, 1)
+    return first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+
+
+def _month_offset(value, offset):
+    month_index = value.year * 12 + value.month - 1 + offset
+    return month_index // 12, month_index % 12 + 1
+
+
+def standard_monthly_oi_walls(frame, as_of_date, spot):
+    """Return max-OI put/call walls for the next standard monthly expiry.
+
+    The listed third Friday is preferred. If it is absent (for example Good
+    Friday), the nearest listed expiry in the preceding three calendar days is
+    treated as that month's standard settlement. OI is aggregated by strike
+    within the single selected expiry; ties prefer the strike nearest spot.
+    """
+    result = {
+        "expiry": None,
+        "call_wall": None,
+        "put_wall": None,
+        "call_oi": None,
+        "put_oi": None,
+        "quality": "MISSING_CHAIN",
+        "method": MONTHLY_WALL_METHOD,
+    }
+    if frame is None or frame.empty:
+        return result
+    try:
+        as_of = pd.Timestamp(as_of_date).date()
+    except (TypeError, ValueError):
+        result["quality"] = "INVALID_AS_OF_DATE"
+        return result
+    spot = finite_number(spot, positive=True)
+    if spot is None:
+        result["quality"] = "INVALID_SPOT"
+        return result
+
+    working = frame.copy()
+    required = {"Exp", "S", "R", "OI"}
+    if not required.issubset(working.columns):
+        result["quality"] = "MISSING_COLUMNS"
+        return result
+    working["_expiry"] = pd.to_datetime(
+        working["Exp"].astype(str), format="%Y%m%d", errors="coerce"
+    ).dt.date
+    working["_strike"] = pd.to_numeric(working["S"], errors="coerce")
+    working["_oi"] = pd.to_numeric(working["OI"], errors="coerce")
+    working["_right"] = working["R"].astype(str).str.upper()
+    working = working.loc[
+        working["_expiry"].notna()
+        & (working["_expiry"] >= as_of)
+        & working["_strike"].gt(0)
+        & working["_oi"].gt(0)
+        & working["_right"].isin(["C", "P"])
+    ].copy()
+    if working.empty:
+        result["quality"] = "NO_VALID_OI"
+        return result
+
+    available = set(working["_expiry"])
+    target_expiry = None
+    for offset in range(4):
+        year, month = _month_offset(as_of, offset)
+        nominal = _third_friday(year, month)
+        candidates = sorted(
+            expiry
+            for expiry in available
+            if nominal - timedelta(days=3) <= expiry <= nominal
+        )
+        if candidates:
+            target_expiry = candidates[-1]
+            break
+    if target_expiry is None:
+        result["quality"] = "NO_STANDARD_MONTHLY_EXPIRY"
+        return result
+
+    monthly = working.loc[working["_expiry"] == target_expiry].copy()
+    result["expiry"] = target_expiry.isoformat()
+    missing = []
+    for right, prefix in (("C", "call"), ("P", "put")):
+        side = monthly.loc[monthly["_right"] == right]
+        if side.empty:
+            missing.append(prefix)
+            continue
+        strikes = side.groupby("_strike", as_index=False)["_oi"].sum()
+        strikes["_distance"] = (strikes["_strike"] - spot).abs()
+        best = strikes.sort_values(
+            ["_oi", "_distance", "_strike"],
+            ascending=[False, True, True],
+        ).iloc[0]
+        result[f"{prefix}_wall"] = float(best["_strike"])
+        result[f"{prefix}_oi"] = int(best["_oi"])
+    result["quality"] = "OK" if not missing else "MISSING_" + "_AND_".join(
+        value.upper() for value in missing
+    )
+    return result
 
 
 def _compact_number(value, digits=2, prefix="", signed=False):
@@ -154,6 +255,8 @@ def format_premarket_quality_summary(rows_written, total_symbols, issues):
             label = "预期振幅"
         elif key == "futures_ref":
             label = "期货映射"
+        elif key == "monthly_wall":
+            label = "月度OI墙"
         elif key == "dpsv":
             label = "FINRA"
         elif key in ("expirations", "strikes", "option_qualification", "option_rows"):

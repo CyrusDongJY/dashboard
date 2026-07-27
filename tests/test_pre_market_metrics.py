@@ -15,6 +15,7 @@ from pre_market_metrics import (
     put_call_oi_ratio,
     quote_midpoint,
     select_expirations,
+    standard_monthly_oi_walls,
 )
 
 
@@ -156,6 +157,44 @@ class StructureTests(unittest.TestCase):
         self.assertEqual(result["right"], "P")
         self.assertAlmostEqual(result["delta"], -0.61)
         self.assertIsNotNone(result["gamma_dollar_m"])
+
+
+class StandardMonthlyWallTests(unittest.TestCase):
+    def test_selects_one_monthly_expiry_and_max_oi_by_right(self):
+        frame = pd.DataFrame([
+            option_row("20260814", 100, "C", 900),
+            option_row("20260821", 100, "C", 1200),
+            option_row("20260821", 105, "C", 2000),
+            option_row("20260821", 95, "P", 2400),
+            option_row("20260821", 90, "P", 1000),
+            option_row("20260828", 100, "P", 5000),
+        ])
+        result = standard_monthly_oi_walls(frame, date(2026, 8, 3), 101)
+        self.assertEqual(result["quality"], "OK")
+        self.assertEqual(result["expiry"], "2026-08-21")
+        self.assertEqual(result["call_wall"], 105)
+        self.assertEqual(result["put_wall"], 95)
+        self.assertEqual(result["call_oi"], 2000)
+        self.assertEqual(result["put_oi"], 2400)
+
+    def test_good_friday_uses_preceding_listed_expiry(self):
+        frame = pd.DataFrame([
+            option_row("20250416", 100, "C", 500),
+            option_row("20250417", 105, "C", 1500),
+            option_row("20250417", 95, "P", 1700),
+            option_row("20250421", 100, "P", 9000),
+        ])
+        result = standard_monthly_oi_walls(frame, date(2025, 4, 1), 100)
+        self.assertEqual(result["quality"], "OK")
+        self.assertEqual(result["expiry"], "2025-04-17")
+
+    def test_missing_one_side_is_explicit(self):
+        frame = pd.DataFrame([
+            option_row("20260821", 105, "C", 1500),
+        ])
+        result = standard_monthly_oi_walls(frame, date(2026, 8, 3), 100)
+        self.assertEqual(result["quality"], "MISSING_PUT")
+        self.assertIsNone(result["put_wall"])
 
 
 class EmailSummaryTests(unittest.TestCase):

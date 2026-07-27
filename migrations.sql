@@ -104,6 +104,14 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_requested_co
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_qualified_contract_count int;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_oi_valid_contract_count int;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_valid_contract_count int;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_expiry date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_call_wall numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_put_wall numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_call_wall_oi bigint;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_put_wall_oi bigint;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_oi_source_date date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_method text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_quality text;
 
 CREATE TABLE IF NOT EXISTS option_gamma_buckets (
     date                date        NOT NULL,
@@ -254,7 +262,15 @@ SELECT
     pre.gamma_valid_contract_count,
     post.poc_method,
     post.poc_window,
-    post.poc_source_date
+    post.poc_source_date,
+    pre.monthly_wall_expiry,
+    pre.monthly_call_wall,
+    pre.monthly_put_wall,
+    pre.monthly_call_wall_oi,
+    pre.monthly_put_wall_oi,
+    pre.monthly_wall_oi_source_date,
+    pre.monthly_wall_method,
+    pre.monthly_wall_quality
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
