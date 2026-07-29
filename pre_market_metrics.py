@@ -153,7 +153,8 @@ def _compact_number(value, digits=2, prefix="", signed=False):
 
 def format_premarket_symbol_summary(
         symbol, reference_price, price_source, market_label, previous_close,
-        expected_move, oi_pcr, iv_skew, gamma, gamma_flip_quality):
+        expected_move, oi_pcr, iv_skew, gamma, gamma_flip_quality,
+        iv_skew_quality=None):
     """Render a concise email view without reducing persisted diagnostics."""
     source_labels = {
         "PREMARKET_MID": "盘前中间价",
@@ -217,6 +218,19 @@ def format_premarket_symbol_summary(
             bad_gamma.append(f"{label}:{quality}")
         gamma_parts.append(f"{label} {value}")
     gamma_line = "  Gamma " + " | ".join(gamma_parts)
+    all_gamma = gamma.get("ALL", {})
+    coverage_line = None
+    if all_gamma.get("net_gamma_m") is not None:
+        coverage_line = (
+            "  覆盖 "
+            f"有效{all_gamma.get('contract_count', 0)}/"
+            f"请求{all_gamma.get('requested_contract_count', 0)} | "
+            f"合约{_compact_number(all_gamma.get('coverage_pct'), digits=1)}% | "
+            f"OI{_compact_number(all_gamma.get('oi_coverage_pct'), digits=1)}% | "
+            f"C/P OI {_compact_number(all_gamma.get('call_oi_coverage_pct'), digits=1)}%/"
+            f"{_compact_number(all_gamma.get('put_oi_coverage_pct'), digits=1)}% | "
+            f"IV最旧{_compact_number(all_gamma.get('iv_quote_max_age_seconds'), digits=0)}秒"
+        )
 
     notices = []
     if price_source == "PREVIOUS_CLOSE_FALLBACK":
@@ -225,12 +239,16 @@ def format_premarket_symbol_summary(
         notices.append(f"行情={market_label}")
     if em_quality != "OK":
         notices.append(f"预期振幅={em_quality}")
+    if iv_skew_quality not in (None, "OK"):
+        notices.append(f"Skew={iv_skew_quality}")
     if bad_gamma:
         notices.append("Gamma=" + ",".join(bad_gamma))
     if gamma_flip_quality not in (None, "OK", "BASELINE_RESET", "NO_CROSSING"):
         notices.append(f"Flip={gamma_flip_quality}")
 
     lines = [headline, structure_line, gamma_line]
+    if coverage_line:
+        lines.append(coverage_line)
     if notices:
         lines.append("  注意 " + "；".join(notices))
     return "\n".join(lines)
@@ -414,7 +432,9 @@ def select_expirations(expirations, as_of_date, horizon_days=60):
     return sorted(set(selected)), selected_by_bucket
 
 
-def expected_move_metrics(frame, spot, short_expiration):
+def expected_move_metrics(frame, spot, short_expiration, previous_iv=None,
+                          previous_iv_date=None,
+                          previous_iv_source="PREVIOUS_DAY_IV"):
     result = {
         "value": None,
         "pct": None,
@@ -422,6 +442,8 @@ def expected_move_metrics(frame, spot, short_expiration):
         "dte": None,
         "quality": "MISSING",
         "atm_strike": None,
+        "iv": None,
+        "source_date": None,
     }
     spot = finite_number(spot, positive=True)
     if spot is None or frame.empty:
@@ -437,6 +459,10 @@ def expected_move_metrics(frame, spot, short_expiration):
     years = pd.to_numeric(atm.get("T"), errors="coerce").dropna()
     if not years.empty:
         result["dte"] = float(years.median() * 365.0)
+    if "QuoteAsOf" in atm:
+        quote_times = pd.to_datetime(atm["QuoteAsOf"], errors="coerce", utc=True).dropna()
+        if not quote_times.empty:
+            result["source_date"] = quote_times.max().date().isoformat()
 
     call_mid = finite_number(call.iloc[0].get("Mid"), positive=True) if not call.empty else None
     put_mid = finite_number(put.iloc[0].get("Mid"), positive=True) if not put.empty else None
@@ -455,14 +481,75 @@ def expected_move_metrics(frame, spot, short_expiration):
     ).dropna()
     years_value = finite_number(years.median(), positive=True) if not years.empty else None
     if not ivs.empty and years_value is not None:
-        value = spot * float(ivs.median()) * math.sqrt(years_value)
+        iv_value = float(ivs.median())
+        value = spot * iv_value * math.sqrt(years_value)
         result.update({
             "value": value,
             "pct": value / spot * 100.0,
             "source": "ATM_IV_FALLBACK",
             "quality": "FALLBACK",
+            "iv": iv_value,
+        })
+        return result
+
+    expiry["_iv"] = pd.to_numeric(expiry.get("IV"), errors="coerce")
+    neighbors = (
+        expiry.loc[expiry["_iv"].gt(0), ["S", "_iv"]]
+        .groupby("S", as_index=False)["_iv"].median()
+        .sort_values("S")
+    )
+    below = neighbors[neighbors["S"] < strike]
+    above = neighbors[neighbors["S"] > strike]
+    if not below.empty and not above.empty and years_value is not None:
+        lower, upper = below.iloc[-1], above.iloc[0]
+        span = float(upper["S"] - lower["S"])
+        if span > 0:
+            weight = (float(strike) - float(lower["S"])) / span
+            iv_value = float(lower["_iv"] + weight * (upper["_iv"] - lower["_iv"]))
+            value = spot * iv_value * math.sqrt(years_value)
+            result.update({
+                "value": value,
+                "pct": value / spot * 100.0,
+                "source": "ADJACENT_IV_INTERPOLATION",
+                "quality": "FALLBACK",
+                "iv": iv_value,
+                "source_date": result["source_date"],
+            })
+            return result
+
+    prior_iv = finite_number(previous_iv, positive=True)
+    if prior_iv is not None and years_value is not None:
+        value = spot * prior_iv * math.sqrt(years_value)
+        result.update({
+            "value": value,
+            "pct": value / spot * 100.0,
+            "source": previous_iv_source,
+            "quality": "STALE",
+            "iv": prior_iv,
+            "source_date": previous_iv_date,
         })
     return result
+
+
+def validate_iv_skew(iv_skew, call_row=None, put_row=None,
+                     extreme_abs=0.15, max_spread_pct=0.50,
+                     max_quote_age_seconds=300):
+    """Return an explicit quote-sanity state for the 25-delta IV skew."""
+    skew = finite_number(iv_skew)
+    if skew is None:
+        return "MISSING"
+    rows = [row for row in (call_row, put_row) if row is not None]
+    for row in rows:
+        age = finite_number(row.get("QuoteAgeSeconds"))
+        if age is not None and age > max_quote_age_seconds:
+            return "STALE_QUOTE"
+        bid = finite_number(row.get("Bid"), positive=True)
+        ask = finite_number(row.get("Ask"), positive=True)
+        if bid is not None and ask is not None and ask >= bid:
+            midpoint = (bid + ask) / 2.0
+            if midpoint > 0 and (ask - bid) / midpoint > max_spread_pct:
+                return "WIDE_MARKET"
+    return "EXTREME_REVIEW" if abs(skew) >= extreme_abs else "OK"
 
 
 def dollar_gamma_m(row, evaluation_spot):
@@ -600,7 +687,8 @@ def gamma_structure(frame, spot, grid_width=0.20, grid_points=161):
 
 
 def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
-                             oi_valid_counts):
+                             oi_valid_counts, side_counts=None,
+                             iv_quote_ages=None):
     """Suppress precise Gamma outputs when sampled-chain coverage is unusable."""
     result = deepcopy(structure)
     minimum_contracts = {
@@ -614,6 +702,16 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
         oi_valid = int(oi_valid_counts.get(bucket, 0) or 0)
         valid = int(metrics.get("contract_count", 0) or 0)
         coverage = valid / requested if requested > 0 else 0.0
+        details = (side_counts or {}).get(bucket, {})
+        requested_calls = int(details.get("requested_calls", 0) or 0)
+        requested_puts = int(details.get("requested_puts", 0) or 0)
+        oi_calls = int(details.get("oi_calls", metrics.get("call_count", 0)) or 0)
+        oi_puts = int(details.get("oi_puts", metrics.get("put_count", 0)) or 0)
+        oi_coverage = oi_valid / requested if requested > 0 else 0.0
+        call_oi_coverage = oi_calls / requested_calls if requested_calls > 0 else 0.0
+        put_oi_coverage = oi_puts / requested_puts if requested_puts > 0 else 0.0
+        ages = [finite_number(value) for value in (iv_quote_ages or {}).get(bucket, [])]
+        ages = [value for value in ages if value is not None and value >= 0]
 
         if requested == 0:
             quality = "NO_EXPIRY"
@@ -640,6 +738,10 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
             "qualified_contract_count": qualified,
             "oi_valid_contract_count": oi_valid,
             "coverage_pct": coverage * 100.0,
+            "oi_coverage_pct": oi_coverage * 100.0,
+            "call_oi_coverage_pct": call_oi_coverage * 100.0,
+            "put_oi_coverage_pct": put_oi_coverage * 100.0,
+            "iv_quote_max_age_seconds": max(ages) if ages else None,
             "raw_net_gamma_m": metrics.get("net_gamma_m"),
             "raw_primary_flip": metrics.get("primary_flip"),
             "raw_zero_points": metrics.get("zero_points", []),
@@ -648,6 +750,11 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
             metrics["net_gamma_m"] = None
             metrics["primary_flip"] = None
             metrics["zero_points"] = []
+            metrics["flip_quality"] = quality
+        elif metrics.get("primary_flip") is None:
+            metrics["flip_quality"] = "VALID_NO_CROSS"
+        else:
+            metrics["flip_quality"] = "OK"
 
     active_near = [
         bucket for bucket in ("0DTE", "1-7D")

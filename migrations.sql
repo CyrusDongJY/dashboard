@@ -112,6 +112,14 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_put_wall_o
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_oi_source_date date;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_method text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_quality text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_iv numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_source_date date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS iv_skew_quality text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_oi_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_call_oi_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_put_oi_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_iv_quote_max_age_seconds numeric;
 
 CREATE TABLE IF NOT EXISTS option_gamma_buckets (
     date                date        NOT NULL,
@@ -149,6 +157,11 @@ ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS strike_count int;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS quality text;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS raw_net_gamma_m numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS raw_primary_flip numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS oi_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS call_oi_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS put_oi_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS iv_quote_max_age_seconds numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS flip_quality text;
 
 CREATE TABLE IF NOT EXISTS stock_spot_post_close (
     date            date        NOT NULL,
@@ -168,6 +181,14 @@ ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS current_iv numeric;
 ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_method text;
 ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_window text;
 ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_source_date date;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_nodes jsonb;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_top1_top2_gap_pct numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_bin_width numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_window_start date;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_window_end date;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_previous_price numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_change_pct numeric;
+ALTER TABLE stock_spot_post_close ADD COLUMN IF NOT EXISTS poc_quality text;
 
 -- ------------------------------------------------------------
 -- 3. 汇总视图：把盘前盘后按 (date,ticker) 对齐，供报告/回测统一读取
@@ -270,7 +291,23 @@ SELECT
     pre.monthly_put_wall_oi,
     pre.monthly_wall_oi_source_date,
     pre.monthly_wall_method,
-    pre.monthly_wall_quality
+    pre.monthly_wall_quality,
+    pre.expected_move_iv,
+    pre.expected_move_source_date,
+    pre.iv_skew_quality,
+    pre.gamma_coverage_pct,
+    pre.gamma_oi_coverage_pct,
+    pre.gamma_call_oi_coverage_pct,
+    pre.gamma_put_oi_coverage_pct,
+    pre.gamma_iv_quote_max_age_seconds,
+    post.poc_nodes,
+    post.poc_top1_top2_gap_pct,
+    post.poc_bin_width,
+    post.poc_window_start,
+    post.poc_window_end,
+    post.poc_previous_price,
+    post.poc_change_pct,
+    post.poc_quality
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
@@ -281,6 +318,15 @@ ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS trin_scope text;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS trin_source text;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS context_quality text;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS context_metadata jsonb;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS add_raw numeric;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS add_status text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS add_as_of timestamptz;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS add_age_seconds numeric;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS add_repeat_count int;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_pct_adv numeric;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_sample_size int;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_source text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_as_of timestamptz;
 
 -- 2026-07-24: ADV/DECL/UVOL/DVOL were never valid IBKR contracts.  Older
 -- collectors stored their missing zeros as a neutral-looking U/D=1.00.  Null
@@ -355,11 +401,53 @@ ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_quality text;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_time_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_volume_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_sample_count int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_missing_samples int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_duplicate_samples int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_missing_intervals jsonb;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_source text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_first_bar timestamptz;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_last_bar timestamptz;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_independent_source boolean;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_quality text;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_time_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_volume_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_sample_count int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_missing_samples int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_duplicate_samples int;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_missing_intervals jsonb;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_source text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_first_bar timestamptz;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_last_bar timestamptz;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_independent_source boolean;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_quality text;
+
+-- Vol/OI异动必须等待次日OI确认；概率字段只表示启发式证据等级。
+CREATE TABLE IF NOT EXISTS option_volume_anomalies (
+    report_date             date        NOT NULL,
+    symbol                  text        NOT NULL,
+    expiry                  date        NOT NULL,
+    strike                  numeric     NOT NULL,
+    right                   text        NOT NULL CHECK (right IN ('C', 'P')),
+    volume                  bigint,
+    open_interest           bigint,
+    vol_oi_ratio            numeric,
+    bid                     numeric,
+    ask                     numeric,
+    last_price              numeric,
+    trade_side              text,
+    spread_status           text,
+    verification_date       date,
+    next_open_interest      bigint,
+    oi_change               bigint,
+    new_position_probability text,
+    classification_method   text,
+    source_date             date,
+    as_of_time              timestamptz,
+    ingested_at             timestamptz,
+    PRIMARY KEY (report_date, symbol, expiry, strike, right)
+);
+CREATE INDEX IF NOT EXISTS idx_option_volume_anomalies_pending
+    ON option_volume_anomalies (symbol, report_date DESC, verification_date);
 
 -- ------------------------------------------------------------
 -- 4. 数据质量表：每次抓取每张表一条，记录成功/缺失/滞后/行数

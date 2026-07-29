@@ -3,7 +3,8 @@ import os
 import math
 import logging
 import smtplib
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.header import Header
 from contextlib import contextmanager
@@ -34,6 +35,9 @@ except ImportError:
 # ================= 全局常量与环境配置 =================
 NY_TZ = pytz.timezone('America/New_York')
 DB_MAX_RETRIES = 3
+IB_CONNECT_RETRIES = 3
+AD_MAX_QUOTE_AGE_SECONDS = 180
+AD_REPEAT_THRESHOLD = 3
 IB_INFORMATION_CODES = {2104, 2106, 2107, 2108, 2158}
 IBKR_BREADTH_CONTRACTS = {
     'TICK': ('TICK-NYSE', 'NYSE'),
@@ -42,6 +46,34 @@ IBKR_BREADTH_CONTRACTS = {
 }
 UD_UNSUPPORTED_STATUS = 'UNSUPPORTED_BY_IBKR_CONTRACT'
 UD_UNSUPPORTED_SOURCE = 'UNAVAILABLE:IBKR_NO_UVOL_DVOL_INDEX_CONTRACT'
+
+
+def classify_breadth_status(value, prior_values, quote_age_seconds=None):
+    """Fail closed when an AD quote is missing, old, or repeated three times."""
+    try:
+        current = float(value)
+    except (TypeError, ValueError):
+        return 'MISSING_STREAM', 0
+    if not math.isfinite(current):
+        return 'MISSING_STREAM', 0
+    repeat_count = 1
+    for prior in prior_values or []:
+        try:
+            if float(prior) != current:
+                break
+        except (TypeError, ValueError):
+            break
+        repeat_count += 1
+    try:
+        quote_is_old = (
+            quote_age_seconds is not None
+            and float(quote_age_seconds) > AD_MAX_QUOTE_AGE_SECONDS)
+    except (TypeError, ValueError):
+        quote_is_old = False
+    status = (
+        'STALE_VALUE'
+        if repeat_count >= AD_REPEAT_THRESHOLD or quote_is_old else 'OK')
+    return status, repeat_count
 
 # 日志防干扰设置
 logging.getLogger('ib_insync').setLevel(logging.CRITICAL)
@@ -241,6 +273,158 @@ class GlobalSentinel:
         except Exception as e:
             self.log(f"⚠️ 装载全局视野失败: {e}")
 
+    def connect_with_retry(self):
+        """Reconnect the IB session before giving up on a scheduled sample."""
+        for attempt in range(1, IB_CONNECT_RETRIES + 1):
+            try:
+                if self.ib.isConnected():
+                    return True
+                self.ib.connect(
+                    '127.0.0.1', 4001, clientId=888,
+                    readonly=True, timeout=10)
+                self.ib.reqMarketDataType(1)
+                return True
+            except Exception as exc:
+                self.log(
+                    f"⚠️ IB连接失败 {attempt}/{IB_CONNECT_RETRIES}: "
+                    f"{type(exc).__name__}: {exc}")
+                try:
+                    self.ib.disconnect()
+                except Exception:
+                    pass
+                if attempt < IB_CONNECT_RETRIES:
+                    time.sleep(2 ** (attempt - 1))
+        return False
+
+    def recent_add_values(self, today_str, limit=2):
+        try:
+            response = (supabase.table('intraday_logs')
+                        .select('add_raw,add_val,record_time')
+                        .gte('record_time', f'{today_str} 00:00:00')
+                        .lte('record_time', f'{today_str} 23:59:59')
+                        .order('record_time', desc=True).limit(limit).execute())
+            return [
+                row.get('add_raw')
+                if row.get('add_raw') is not None else row.get('add_val')
+                for row in (response.data or [])
+            ]
+        except Exception as exc:
+            self.log(f"⚠️ AD重复值历史读取失败: {type(exc).__name__}: {exc}")
+            return []
+
+    def post_close_breadth_backup(self, today_str):
+        """Use the independently collected close breadth only as a labeled proxy."""
+        try:
+            response = (supabase.table('market_history')
+                        .select('date,pct_adv,breadth_sample_size,trin_as_of')
+                        .eq('date', today_str).order('date', desc=True)
+                        .limit(1).execute())
+            if not response.data:
+                return None
+            row = response.data[0]
+            value = float(row.get('pct_adv'))
+            if not math.isfinite(value):
+                return None
+            return {
+                'pct_adv': value,
+                'sample_size': int(row.get('breadth_sample_size') or 0),
+                'as_of': row.get('trin_as_of'),
+                'source': 'TradingViewScanner:top500_nyse_nasdaq',
+                'quality': 'EOD_PROXY_NOT_NYSE_AD',
+            }
+        except Exception as exc:
+            self.log(f"⚠️ 备用广度读取失败: {type(exc).__name__}: {exc}")
+            return None
+
+    @staticmethod
+    def ticker_timestamp(ticker):
+        quote_time = getattr(ticker, 'time', None)
+        if not isinstance(quote_time, datetime):
+            return None, None
+        if quote_time.tzinfo is None:
+            quote_time = quote_time.replace(tzinfo=timezone.utc)
+        age = max(
+            0.0,
+            (datetime.now(timezone.utc)
+             - quote_time.astimezone(timezone.utc)).total_seconds())
+        return quote_time.isoformat(), age
+
+    def backfill_missing_checkpoints(self, bars, today_str):
+        """Backfill missed 15-minute SPY checkpoints from IBKR 5-minute bars."""
+        if not bars:
+            return 0
+        try:
+            existing = (supabase.table('intraday_logs').select('record_time')
+                        .gte('record_time', f'{today_str} 00:00:00')
+                        .lte('record_time', f'{today_str} 23:59:59')
+                        .execute()).data or []
+            existing_keys = {
+                pd.Timestamp(row['record_time']).strftime('%H:%M')
+                for row in existing if row.get('record_time')
+            }
+            frame = pd.DataFrame([{
+                'date': getattr(bar, 'date', None),
+                'close': getattr(bar, 'close', None),
+                'volume': getattr(bar, 'volume', None),
+            } for bar in bars])
+            frame['date'] = pd.to_datetime(frame['date'], errors='coerce')
+            if frame['date'].dt.tz is None:
+                frame['date'] = frame['date'].dt.tz_localize(NY_TZ)
+            else:
+                frame['date'] = frame['date'].dt.tz_convert(NY_TZ)
+            frame['close'] = pd.to_numeric(frame['close'], errors='coerce')
+            frame['volume'] = pd.to_numeric(frame['volume'], errors='coerce')
+            frame = frame.dropna().sort_values('date')
+            frame = frame[(frame['close'] > 0) & (frame['volume'] > 0)]
+            if frame.empty:
+                return 0
+
+            now = datetime.now(NY_TZ)
+            end = now.replace(
+                minute=(now.minute // 15) * 15, second=0, microsecond=0)
+            checkpoint = NY_TZ.localize(datetime.strptime(
+                f'{today_str} 09:45', '%Y-%m-%d %H:%M'))
+            inserted = 0
+            while checkpoint <= end:
+                key = checkpoint.strftime('%H:%M')
+                if key not in existing_keys:
+                    observed = frame[frame['date'] <= checkpoint]
+                    if not observed.empty:
+                        vwap = float(
+                            (observed['close'] * observed['volume']).sum()
+                            / observed['volume'].sum())
+                        lagged = observed[observed['date'] <= checkpoint - timedelta(minutes=30)]
+                        lagged_vwap = (
+                            float((lagged['close'] * lagged['volume']).sum()
+                                  / lagged['volume'].sum())
+                            if not lagged.empty else vwap)
+                        payload = {
+                            'record_time': checkpoint.strftime('%Y-%m-%d %H:%M:%S'),
+                            'spy_px': float(observed.iloc[-1]['close']),
+                            'vwap_now': vwap,
+                            'vwap_30m': lagged_vwap,
+                            'add_val': None,
+                            'add_raw': None,
+                            'add_status': 'MISSING_HISTORICAL_BREADTH',
+                            'vol_ratio': None,
+                            'vol_ratio_status': UD_UNSUPPORTED_STATUS,
+                            'context_quality': 'HISTORICAL_BACKFILL',
+                            'context_metadata': {
+                                'backfill_source': 'IBKR:SPY:5min:TRADES',
+                                'backfill_quality': 'HISTORICAL_BACKFILL',
+                                'breadth_source': None,
+                            },
+                        }
+                        if safe_db_insert('intraday_logs', payload):
+                            inserted += 1
+                checkpoint += timedelta(minutes=15)
+            if inserted:
+                self.log(f"✅ 已用IBKR 5分钟历史数据回补 {inserted} 个盘中检查点。")
+            return inserted
+        except Exception as exc:
+            self.log(f"⚠️ 盘中历史回补失败: {type(exc).__name__}: {exc}")
+            return 0
+
     def get_robust_index_val(self, contract, ticker, *, allow_zero=False,
                              positive_only=False, allow_bid_ask=False,
                              allow_history=True):
@@ -333,7 +517,9 @@ class GlobalSentinel:
             self.opt_ctx.get('gamma_flip_all', self.opt_ctx.get('zgl_price')))
         gamma_flip_alert_enabled = bool(
             getattr(cfg, 'ENABLE_GAMMA_FLIP_ALERT', False)
-            and self.context_quality == "OK" and zgl is not None)
+            and self.context_quality == "OK"
+            and self.opt_ctx.get('gamma_flip_quality') == 'OK'
+            and zgl is not None)
         poc = optional_float(self.spot_ctx.get('poc_price'))
         pcr = optional_float(self.opt_ctx.get('oi_pcr'))
         exp_move_pct = optional_float(self.opt_ctx.get('expected_move_pct'))
@@ -375,8 +561,9 @@ class GlobalSentinel:
         }
 
         try:
-            self.ib.connect('127.0.0.1', 4001, clientId=888, readonly=True)
-            self.ib.reqMarketDataType(1)
+            if not self.connect_with_retry():
+                self.log("❌ IB连续重连失败，本次扫描停止且不写入伪造数据。")
+                return
 
             contracts = {
                 'SPY': Stock('SPY', 'SMART', 'USD'),
@@ -428,12 +615,14 @@ class GlobalSentinel:
                     return
 
                 ad_contract = qualified_contracts.get('AD')
+                ad_ticker = ticker_for('AD')
                 add_val = (
                     self.get_robust_index_val(
-                        ad_contract, ticker_for('AD'), allow_zero=True,
+                        ad_contract, ad_ticker, allow_zero=True,
                         allow_history=False)
                     if ad_contract is not None else None
                 )
+                add_as_of, add_age_seconds = self.ticker_timestamp(ad_ticker)
                 trin_contract = qualified_contracts.get('TRIN')
                 trin_raw = (
                     self.get_robust_index_val(
@@ -453,11 +642,25 @@ class GlobalSentinel:
             dvol_val = None
             vol_ratio = None
             vol_ratio_status = UD_UNSUPPORTED_STATUS
-            add_status = 'OK' if add_val is not None else 'MISSING_STREAM'
+            add_raw = add_val
+            prior_add_values = self.recent_add_values(
+                datetime.now(NY_TZ).strftime('%Y-%m-%d'))
+            add_status, repeat_count = classify_breadth_status(
+                add_raw, prior_add_values, add_age_seconds)
+            if add_status != 'OK':
+                add_val = None
+            today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+            breadth_backup = (
+                self.post_close_breadth_backup(today_str)
+                if add_status != 'OK' else None)
             context_metadata.update({
-                "add_raw": add_val,
+                "add_raw": add_raw,
                 "add_status": add_status,
                 "add_source": "IBKR:AD-NYSE",
+                "add_as_of": add_as_of,
+                "add_age_seconds": add_age_seconds,
+                "add_repeat_count": repeat_count,
+                "breadth_backup": breadth_backup,
                 "uvol_raw": None,
                 "dvol_raw": None,
                 "vol_ratio_status": vol_ratio_status,
@@ -484,7 +687,8 @@ class GlobalSentinel:
                         f"{type(exc).__name__}: {exc}")
 
             # 计算 VWAP
-            vwap_now, vwap_30m = spy_px, spy_px 
+            vwap_now, vwap_30m = spy_px, spy_px
+            intra_bars = []
             try:
                 intra_bars = self.ib.reqHistoricalData(contracts['SPY'], endDateTime='', durationStr='1 D', barSizeSetting='5 mins', whatToShow='TRADES', useRTH=True)
                 if intra_bars:
@@ -540,7 +744,8 @@ class GlobalSentinel:
             zgl_mode = "已校准硬触发" if gamma_flip_alert_enabled else "仅观察"
             r += (
                 f"SPY ≤{gamma_max_dte}日采样主Gamma Flip: {display_number(zgl, prefix='$')} "
-                f"({zgl_mode}, 质量={self.context_quality})\n"
+                f"({zgl_mode}, Flip状态={context_metadata['gamma_flip_quality'] or 'MISSING'}, "
+                f"上下文={self.context_quality})\n"
             )
             r += (
                 f"Gamma血缘: 截面={context_metadata['pre_market_date'] or 'NA'} "
@@ -562,8 +767,15 @@ class GlobalSentinel:
             r += f"SPY 现价: ${spy_px:.2f} (VWAP: ${vwap_now:.2f})\n"
             r += (
                 f"NYSE净上涨−下跌家数 (AD-NYSE): "
-                f"{display_signed(add_val)} ({add_status})\n"
+                f"{display_signed(add_val)} ({add_status}; 原始={display_signed(add_raw)}; "
+                f"更新时间={add_as_of or 'NA'}; 连续相同={repeat_count})\n"
             )
+            if breadth_backup:
+                r += (
+                    f"备用收盘广度: 上涨家数 {breadth_backup['pct_adv']:.1f}% "
+                    f"({breadth_backup['quality']}, 样本={breadth_backup['sample_size']}, "
+                    f"源={breadth_backup['source']})\n"
+                )
             r += (
                 f"NYSE上涨/下跌成交量比 (U/D): NA "
                 f"({vol_ratio_status}; IBKR无UVOL/DVOL指数合约)\n"
@@ -585,6 +797,19 @@ class GlobalSentinel:
                 "record_time": ny_timestamp_str,
                 "spy_px": spy_px, "sma20": sma20, "vwap_now": vwap_now, "vwap_30m": vwap_30m,
                 "add_val": add_val, "uvol": uvol_val, "dvol": dvol_val, "vol_ratio": vol_ratio,
+                "add_raw": add_raw,
+                "add_status": add_status,
+                "add_as_of": add_as_of,
+                "add_age_seconds": add_age_seconds,
+                "add_repeat_count": repeat_count,
+                "breadth_pct_adv": (
+                    breadth_backup.get('pct_adv') if breadth_backup else None),
+                "breadth_sample_size": (
+                    breadth_backup.get('sample_size') if breadth_backup else None),
+                "breadth_source": (
+                    breadth_backup.get('source') if breadth_backup else None),
+                "breadth_as_of": (
+                    breadth_backup.get('as_of') if breadth_backup else None),
                 "trin": trin_val, "tick_now": tick_now, "ctick_15m": ctick_15m_avg,
                 "alert_triggered": title if fire else None,
                 "vol_ratio_status": vol_ratio_status,
@@ -596,6 +821,8 @@ class GlobalSentinel:
             
             if safe_db_insert('intraday_logs', db_payload):
                 self.log("✅ 盘中数据切片已成功推入 Supabase。")
+                self.backfill_missing_checkpoints(
+                    intra_bars, datetime.now(NY_TZ).strftime('%Y-%m-%d'))
             else:
                 self.log("⚠️ 数据入库最终失败。")
 

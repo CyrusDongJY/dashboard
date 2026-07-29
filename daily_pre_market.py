@@ -41,6 +41,7 @@ from pre_market_metrics import (
     select_expirations,
     standard_monthly_oi_walls,
     time_to_expiry_years,
+    validate_iv_skew,
 )
 
 # ================= 🔐 安全挂载全局金库 =================
@@ -615,10 +616,24 @@ def get_report():
                         if r == 'P':
                             vanna = -vanna if vanna is not None else None
                             charm = -charm if charm is not None else None
+                        quote_time = getattr(t, "time", None)
+                        quote_age_seconds = None
+                        quote_as_of = None
+                        if isinstance(quote_time, datetime):
+                            if quote_time.tzinfo is None:
+                                quote_time = quote_time.replace(tzinfo=timezone.utc)
+                            quote_as_of = quote_time.isoformat()
+                            quote_age_seconds = max(
+                                0.0,
+                                (datetime.now(timezone.utc)
+                                 - quote_time.astimezone(timezone.utc)).total_seconds(),
+                            )
                         rows.append({
                             'Exp': exp_date_str, 'S': s, 'R': r, 'OI': oi,
                             'Bid': bid, 'Ask': ask, 'Mid': mid, 'Last': last,
                             'IV': iv, 'Delta': delta, 'T': years, 'DTE': dte_days,
+                            'QuoteAsOf': quote_as_of,
+                            'QuoteAgeSeconds': quote_age_seconds,
                             'Vanna_W': (
                                 oi * vanna * 0.01 * 100 if vanna is not None else None),
                             'Charm_W': (
@@ -629,7 +644,29 @@ def get_report():
             
             if rows:
                 df = pd.DataFrame(rows)
-                expected_move = expected_move_metrics(df, curr_price, short_exp)
+                previous_context = get_previous_premarket_record(sym, today_str)
+                previous_iv = finite_number(
+                    previous_context.get("expected_move_iv"), positive=True
+                ) if previous_context else None
+                previous_iv_source = "PREVIOUS_DAY_IV"
+                if previous_iv is None and previous_context:
+                    previous_move_pct = finite_number(
+                        previous_context.get("expected_move_pct"), positive=True)
+                    previous_dte = finite_number(
+                        previous_context.get("expected_move_dte"), positive=True)
+                    if previous_move_pct is not None and previous_dte is not None:
+                        previous_iv = (
+                            previous_move_pct / 100.0
+                            / math.sqrt(previous_dte / 365.0))
+                        previous_iv_source = (
+                            "PREVIOUS_DAY_EXPECTED_MOVE_IV_PROXY")
+                expected_move = expected_move_metrics(
+                    df, curr_price, short_exp,
+                    previous_iv=previous_iv,
+                    previous_iv_date=(
+                        previous_context.get("date") if previous_context else None),
+                    previous_iv_source=previous_iv_source,
+                )
                 if expected_move["quality"] == "MISSING":
                     quality_issues.append(f"expected_move:{sym}")
                 oi_pcr = put_call_oi_ratio(df)
@@ -642,21 +679,35 @@ def get_report():
                     quality_issues.append(
                         f"monthly_wall:{sym}:{monthly_walls['quality']}")
                 oi_valid_counts = {bucket: 0 for bucket in GAMMA_BUCKETS}
+                side_counts = {}
+                iv_quote_ages = {}
                 for bucket in GAMMA_BUCKETS:
-                    if bucket == "ALL":
-                        oi_valid_counts[bucket] = int(len(df))
-                    else:
-                        oi_valid_counts[bucket] = int(
-                            df["DTE"].apply(expiration_bucket).eq(bucket).sum())
+                    subset = (
+                        df if bucket == "ALL" else
+                        df[df["DTE"].apply(expiration_bucket).eq(bucket)]
+                    )
+                    oi_valid_counts[bucket] = int(len(subset))
+                    requested_side = int(requested_counts.get(bucket, 0) / 2)
+                    side_counts[bucket] = {
+                        "requested_calls": requested_side,
+                        "requested_puts": requested_side,
+                        "oi_calls": int((subset["R"] == "C").sum()),
+                        "oi_puts": int((subset["R"] == "P").sum()),
+                    }
+                    iv_quote_ages[bucket] = pd.to_numeric(
+                        subset.get("QuoteAgeSeconds"), errors="coerce"
+                    ).dropna().tolist()
                 gamma = apply_gamma_quality_gate(
                     gamma_structure(df, curr_price),
-                    requested_counts, qualified_counts, oi_valid_counts)
+                    requested_counts, qualified_counts, oi_valid_counts,
+                    side_counts=side_counts, iv_quote_ages=iv_quote_ages)
                 for bucket in GAMMA_BUCKETS:
                     if gamma[bucket]["quality"] not in ("OK", "NO_EXPIRY"):
                         quality_issues.append(
                             f"gamma_{bucket.lower()}:{sym}:{gamma[bucket]['quality']}")
                 
                 iv_skew = None
+                iv_skew_quality = "MISSING"
                 calls = df[(df['R']=='C') & (df['Delta'] > 0)].dropna(subset=['IV', 'Delta'])
                 puts = df[(df['R']=='P') & (df['Delta'] < 0)].dropna(subset=['IV', 'Delta'])
                 if not calls.empty and not puts.empty:
@@ -666,6 +717,14 @@ def get_report():
                         put_iv, call_iv = put_25['IV'].values[0], call_25['IV'].values[0]
                         if put_iv > 0 and call_iv > 0:
                             iv_skew = put_iv - call_iv
+                            iv_skew_quality = validate_iv_skew(
+                                iv_skew,
+                                call_25.iloc[0].to_dict(),
+                                put_25.iloc[0].to_dict(),
+                            )
+                            if iv_skew_quality != "OK":
+                                quality_issues.append(
+                                    f"iv_skew:{sym}:{iv_skew_quality}")
 
                 near = df[df["DTE"] <= 7]
                 vanna_m = pd.to_numeric(
@@ -692,16 +751,16 @@ def get_report():
                 gamma_expirations = {
                     bucket: gamma[bucket]["expirations"] for bucket in GAMMA_BUCKETS
                 }
-                previous_context = get_previous_premarket_record(sym, today_str)
                 previous_flip = None
                 gamma_flip_change_pct = None
                 gamma_roll_changed = None
                 gamma_flip_quality = (
-                    gamma["ALL"]["quality"]
-                    if gamma["ALL"]["quality"] != "OK"
-                    else ("NO_CROSSING" if zgl_strike is None else "BASELINE_RESET")
+                    gamma["ALL"]["flip_quality"]
+                    if gamma["ALL"]["flip_quality"] != "OK"
+                    else "BASELINE_RESET"
                 )
-                if previous_context and gamma["ALL"]["quality"] == "OK":
+                if (previous_context and gamma["ALL"]["quality"] == "OK"
+                        and zgl_strike is not None):
                     previous_flip = finite_number(
                         previous_context.get(
                             "gamma_flip_all", previous_context.get("zgl_price")),
@@ -739,6 +798,7 @@ def get_report():
                     iv_skew=iv_skew,
                     gamma=gamma,
                     gamma_flip_quality=gamma_flip_quality,
+                    iv_skew_quality=iv_skew_quality,
                 ) + "\n"
 
                 try:
@@ -779,6 +839,8 @@ def get_report():
                         "expected_move_source": expected_move["source"],
                         "expected_move_dte": _round_or_none(expected_move["dte"], 6),
                         "expected_move_quality": expected_move["quality"],
+                        "expected_move_iv": _round_or_none(expected_move["iv"], 8),
+                        "expected_move_source_date": expected_move["source_date"],
                         "max_oi_strike": _round_or_none(max_oi["strike"], 4),
                         "max_oi_type": max_oi["right"],
                         "max_oi_expiry": (
@@ -800,6 +862,7 @@ def get_report():
                         "monthly_wall_method": monthly_walls["method"],
                         "monthly_wall_quality": monthly_walls["quality"],
                         "iv_skew": _round_or_none(iv_skew, 6),
+                        "iv_skew_quality": iv_skew_quality,
                         "short_gamma_m": _round_or_none(short_gamma_total, 6),
                         "long_gamma_m": _round_or_none(long_gamma_total, 6),
                         "gamma_0dte_m": _round_or_none(gamma["0DTE"]["net_gamma_m"], 6),
@@ -821,6 +884,16 @@ def get_report():
                         "gamma_qualified_contract_count": qualified_counts["ALL"],
                         "gamma_oi_valid_contract_count": oi_valid_counts["ALL"],
                         "gamma_valid_contract_count": gamma["ALL"]["contract_count"],
+                        "gamma_coverage_pct": _round_or_none(
+                            gamma["ALL"]["coverage_pct"], 4),
+                        "gamma_oi_coverage_pct": _round_or_none(
+                            gamma["ALL"]["oi_coverage_pct"], 4),
+                        "gamma_call_oi_coverage_pct": _round_or_none(
+                            gamma["ALL"]["call_oi_coverage_pct"], 4),
+                        "gamma_put_oi_coverage_pct": _round_or_none(
+                            gamma["ALL"]["put_oi_coverage_pct"], 4),
+                        "gamma_iv_quote_max_age_seconds": _round_or_none(
+                            gamma["ALL"]["iv_quote_max_age_seconds"], 2),
                         "gamma_zeroes": gamma_zeroes,
                         "gamma_expirations": gamma_expirations,
                         "gamma_curve_version": gamma["curve_version"],
@@ -863,10 +936,19 @@ def get_report():
                             "qualified_contract_count": metrics["qualified_contract_count"],
                             "oi_valid_contract_count": metrics["oi_valid_contract_count"],
                             "coverage_pct": _round_or_none(metrics["coverage_pct"], 4),
+                            "oi_coverage_pct": _round_or_none(
+                                metrics["oi_coverage_pct"], 4),
+                            "call_oi_coverage_pct": _round_or_none(
+                                metrics["call_oi_coverage_pct"], 4),
+                            "put_oi_coverage_pct": _round_or_none(
+                                metrics["put_oi_coverage_pct"], 4),
+                            "iv_quote_max_age_seconds": _round_or_none(
+                                metrics["iv_quote_max_age_seconds"], 2),
                             "call_count": metrics["call_count"],
                             "put_count": metrics["put_count"],
                             "strike_count": metrics["strike_count"],
                             "quality": metrics["quality"],
+                            "flip_quality": metrics["flip_quality"],
                             "raw_net_gamma_m": _round_or_none(metrics["raw_net_gamma_m"], 6),
                             "raw_primary_flip": _round_or_none(metrics["raw_primary_flip"], 4),
                             "curve_version": gamma["curve_version"],

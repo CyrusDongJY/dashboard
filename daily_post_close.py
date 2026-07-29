@@ -23,6 +23,9 @@ from market_utils import (
 from data_contracts import (
     calculate_iv_rank_percentile,
     gap_acceptance,
+    opening_probability,
+    option_trade_side,
+    volume_profile_nodes,
     vwap_acceptance,
 )
 
@@ -263,7 +266,7 @@ def get_cash_acceptance_ib(ib, symbol):
             barSizeSetting='5 mins', whatToShow='TRADES', useRTH=True)
         vwap = vwap_acceptance([{
             'high': bar.high, 'low': bar.low, 'close': bar.close,
-            'volume': bar.volume,
+            'volume': bar.volume, 'date': bar.date,
         } for bar in (intraday or [])])
 
         prefix = symbol.lower()
@@ -280,6 +283,13 @@ def get_cash_acceptance_ib(ib, symbol):
                 vwap['volume_acceptance_pct'], 2)
             if vwap['volume_acceptance_pct'] is not None else None,
             f'{prefix}_vwap_sample_count': vwap['sample_count'],
+            f'{prefix}_vwap_missing_samples': vwap['missing_samples'],
+            f'{prefix}_vwap_duplicate_samples': vwap['duplicate_samples'],
+            f'{prefix}_vwap_missing_intervals': vwap['missing_intervals'],
+            f'{prefix}_vwap_source': 'IBKR:TRADES:5min:RTH',
+            f'{prefix}_vwap_first_bar': vwap['first_bar'],
+            f'{prefix}_vwap_last_bar': vwap['last_bar'],
+            f'{prefix}_vwap_independent_source': True,
             f'{prefix}_vwap_quality': vwap['quality'],
         })
         gap_ratio = (f"{gap['acceptance_ratio'] * 100:.1f}%"
@@ -292,7 +302,11 @@ def get_cash_acceptance_ib(ib, symbol):
             f"缺口接受率: {gap_ratio} | 状态={gap['state']} | "
             f"质量={gap['quality']}\n"
             f"动态VWAP接受: 时间={time_value} / 成交量={volume_value} | "
-            f"样本={vwap['sample_count']}/78 | 质量={vwap['quality']}\n")
+            f"样本={vwap['sample_count']}/78 | 缺失={vwap['missing_samples']} | "
+            f"重复={vwap['duplicate_samples']} | 质量={vwap['quality']}\n"
+            f"缺失分钟={','.join(vwap['missing_intervals']) if vwap['missing_intervals'] else '无'}\n"
+            f"数据源=IBKR独立历史行情(TRADES, 5min, RTH) | "
+            f"起止={vwap['first_bar'] or 'NA'} 至 {vwap['last_bar'] or 'NA'}\n")
     except Exception as exc:
         logger.warning(f"{symbol} 现金市场接受度获取失败: {exc}")
         report += f"计算失败: {exc}\n"
@@ -325,31 +339,43 @@ def get_spot_poc_obv_ib(ib, symbol, duration='6 M'):
             elif obv_5d.iloc[-1] > obv_5d.iloc[0]: obv_status = "价格与量能同步上升"
             else: obv_status = "价格与量能同步下降"
 
-        poc_price = None
+        profile = volume_profile_nodes(pd.DataFrame({
+            'date': df['Date'], 'close': df['Close'], 'volume': df['Volume'],
+        }), bins=50, top_n=3)
+        poc_price = profile['poc_price']
+        prior_poc = None
         try:
-            close_vals = df['Close'].dropna().values
-            vol_vals = df['Volume'].fillna(0).values
-            if len(close_vals) == 0: raise ValueError("无收盘价数据")
-            
-            price_range = close_vals.max() - close_vals.min()
-            if price_range < 1e-6:
-                poc_price = close_vals.mean()
-            else:
-                bins = np.linspace(close_vals.min(), close_vals.max(), 51)
-                inds = np.digitize(close_vals, bins) - 1
-                inds = np.clip(inds, 0, len(bins) - 2) 
-                
-                bin_vol = {}
-                for idx, v in zip(inds, vol_vals):
-                    bin_vol[idx] = bin_vol.get(idx, 0) + v
-                    
-                if not bin_vol: raise ValueError("POC 计算无有效成交量")
-                max_idx = max(bin_vol.items(), key=lambda x: x[1])[0]
-                poc_price = (bins[max_idx] + bins[max_idx + 1]) / 2.0
-        except Exception as e:
-            logger.warning(f"{symbol} POC 计算失败: {e}")
+            prior = (supabase.table('stock_spot_post_close')
+                     .select('date,poc_price').eq('ticker', symbol)
+                     .lt('date', datetime.now(NY_TZ).strftime('%Y-%m-%d'))
+                     .order('date', desc=True).limit(1).execute())
+            if prior.data:
+                prior_poc = float(prior.data[0].get('poc_price'))
+        except Exception as exc:
+            logger.warning(f"{symbol} 上期POC读取失败: {exc}")
+        poc_change_pct = (
+            (poc_price - prior_poc) / prior_poc * 100.0
+            if poc_price is not None and prior_poc not in (None, 0) else None)
+        poc_quality = profile['quality']
+        if poc_change_pct is not None and abs(poc_change_pct) >= 3.0:
+            poc_quality = 'JUMP_REVIEW'
 
         report += f"6M日线收盘价分箱POC代理: {('$' + format(poc_price, '.2f')) if poc_price is not None else '未知'}\n"
+        if profile['nodes']:
+            report += "前三成交量节点: " + " | ".join(
+                f"${node['price']:.2f} ({node['volume_share_pct']:.1f}%)"
+                for node in profile['nodes']) + "\n"
+        report += (
+            f"节点1-2占比差={profile['top1_top2_share_gap_pct']:.1f}% | "
+            if profile['top1_top2_share_gap_pct'] is not None else
+            "节点1-2占比差=NA | ")
+        bin_width_text = (
+            f"${profile['bin_width']:.4f}"
+            if profile['bin_width'] is not None else 'NA')
+        report += (
+            f"分箱宽度={bin_width_text} | "
+            f"窗口={profile['window_start'] or 'NA'}至{profile['window_end'] or 'NA'} | "
+            f"质量={poc_quality}\n")
         if poc_price is not None:
             report += "当前价格位阶: 位于 POC 之上\n" if curr_price >= poc_price else "当前价格位阶: 跌破 POC 水位\n"
         report += f"近5日动能 (OBV): {obv_status}\n"
@@ -358,6 +384,14 @@ def get_spot_poc_obv_ib(ib, symbol, duration='6 M'):
             "poc_price": round(poc_price, 2) if poc_price is not None else None,
             "poc_method": "daily_close_volume_bin_50_v2",
             "poc_window": duration,
+            "poc_nodes": profile['nodes'],
+            "poc_top1_top2_gap_pct": profile['top1_top2_share_gap_pct'],
+            "poc_bin_width": profile['bin_width'],
+            "poc_window_start": profile['window_start'],
+            "poc_window_end": profile['window_end'],
+            "poc_previous_price": prior_poc,
+            "poc_change_pct": poc_change_pct,
+            "poc_quality": poc_quality,
             "poc_source_date": pd.Timestamp(df['Date'].iloc[-1]).date().isoformat(),
             "obv_status": obv_status,
             "close_price": round(curr_price, 2),
@@ -467,6 +501,20 @@ def get_unusual_options_activity(ib, symbol):
         bars = ib.reqHistoricalData(stock, endDateTime='', durationStr='1 D', barSizeSetting='1 day', whatToShow='TRADES', useRTH=True)
         if not bars: return report + "⚠️ 获取现价失败。\n"
         curr_price = bars[-1].close
+        report_date = datetime.now(NY_TZ).strftime('%Y-%m-%d')
+        prior_events = []
+        try:
+            prior_response = (supabase.table('option_volume_anomalies')
+                              .select('*').eq('symbol', symbol)
+                              .lt('report_date', report_date)
+                              .order('report_date', desc=True).limit(50)
+                              .execute())
+            prior_events = [
+                row for row in (prior_response.data or [])
+                if not row.get('verification_date')
+            ]
+        except Exception as exc:
+            logger.warning(f"{symbol} Vol/OI待验证记录读取失败: {exc}")
 
         chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
         if not chains: return report + "⚠️ 未找到期权链信息。\n"
@@ -503,6 +551,7 @@ def get_unusual_options_activity(ib, symbol):
             except: pass
 
         anomalies = []
+        snapshots = {}
         for i in range(0, len(all_opt_contracts), BATCH_SIZE):
             batch = all_opt_contracts[i:i+BATCH_SIZE]
             
@@ -516,16 +565,101 @@ def get_unusual_options_activity(ib, symbol):
                     
                     vol = t.volume
                     if vol is None or (isinstance(vol, float) and math.isnan(vol)): vol = 0
+                    expiry = t.contract.lastTradeDateOrContractMonth[:8]
+                    key = (expiry, float(t.contract.strike), r)
+                    snapshot = {
+                        'oi': int(oi), 'volume': int(vol),
+                        'bid': getattr(t, 'bid', None),
+                        'ask': getattr(t, 'ask', None),
+                        'last': getattr(t, 'last', None),
+                    }
+                    snapshots[key] = snapshot
                     
                     if oi > 100 and vol > 500 and (vol / oi) >= 3.0:
-                        anomalies.append({'Exp': t.contract.lastTradeDateOrContractMonth, 'Strike': t.contract.strike, 'Right': 'Call' if r == 'C' else 'Put', 'Vol': int(vol), 'OI': int(oi), 'Ratio': vol / oi})
+                        anomalies.append({
+                            'Exp': expiry, 'Strike': float(t.contract.strike),
+                            'Right': r, 'Vol': int(vol), 'OI': int(oi),
+                            'Ratio': vol / oi,
+                            'Bid': snapshot['bid'], 'Ask': snapshot['ask'],
+                            'Last': snapshot['last'],
+                            'TradeSide': option_trade_side(
+                                snapshot['last'], snapshot['bid'], snapshot['ask']),
+                        })
             ib.sleep(SLEEP_SHORT)
-            
+
+        verified = 0
+        for prior in prior_events:
+            try:
+                key = (
+                    str(prior.get('expiry')).replace('-', '')[:8],
+                    float(prior.get('strike')),
+                    str(prior.get('right')),
+                )
+                current = snapshots.get(key)
+                if current is None:
+                    continue
+                oi_change = current['oi'] - int(prior.get('open_interest') or 0)
+                update = dict(prior)
+                update.update({
+                    'verification_date': report_date,
+                    'next_open_interest': current['oi'],
+                    'oi_change': oi_change,
+                    'new_position_probability': opening_probability(
+                        prior.get('volume'), oi_change),
+                })
+                if safe_upsert(
+                        supabase, 'option_volume_anomalies', update,
+                        conflict_cols='report_date,symbol,expiry,strike,right') is not None:
+                    verified += 1
+            except Exception as exc:
+                logger.warning(f"{symbol} Vol/OI次日验证失败: {exc}")
+
+        for event in anomalies:
+            same_expiry_right = [
+                item for item in anomalies
+                if item['Exp'] == event['Exp']
+                and item['Right'] == event['Right']
+                and item['Strike'] != event['Strike']
+            ]
+            opposite_same_strike = [
+                item for item in anomalies
+                if item['Exp'] == event['Exp']
+                and item['Right'] != event['Right']
+                and item['Strike'] == event['Strike']
+            ]
+            event['SpreadStatus'] = (
+                'POSSIBLE_STRADDLE_OR_COMBO' if opposite_same_strike
+                else ('POSSIBLE_VERTICAL' if same_expiry_right else 'SINGLE_LEG_ONLY')
+            )
+            payload = {
+                'report_date': report_date,
+                'symbol': symbol,
+                'expiry': datetime.strptime(event['Exp'], '%Y%m%d').date().isoformat(),
+                'strike': event['Strike'], 'right': event['Right'],
+                'volume': event['Vol'], 'open_interest': event['OI'],
+                'vol_oi_ratio': event['Ratio'], 'bid': event['Bid'],
+                'ask': event['Ask'], 'last_price': event['Last'],
+                'trade_side': event['TradeSide'],
+                'spread_status': event['SpreadStatus'],
+                'classification_method': 'QUOTE_AND_NEXT_DAY_OI_HEURISTIC_V1',
+            }
+            attach_metadata(payload, source_date=report_date)
+            safe_upsert(
+                supabase, 'option_volume_anomalies', payload,
+                conflict_cols='report_date,symbol,expiry,strike,right')
+
         if not anomalies: report += "未侦测到成交量显著大于持仓量(Vol/OI > 3)的合约。\n"
         else:
             df = pd.DataFrame(anomalies).sort_values('Ratio', ascending=False).head(5)
             report += "发现成交量异常合约 (Vol/OI > 3倍)：\n"
-            for _, row in df.iterrows(): report += f"   ⚡ [{row['Exp']}] ${row['Strike']} {row['Right']} -> 单日成交 {row['Vol']}手 (历史持仓 {row['OI']}手) | 换手倍数: {row['Ratio']:.1f}x\n"
+            for _, row in df.iterrows():
+                report += (
+                    f"   [{row['Exp']}] ${row['Strike']} {row['Right']} -> "
+                    f"成交 {row['Vol']}手 / OI {row['OI']}手 | "
+                    f"{row['Ratio']:.1f}x | {row['TradeSide']} | "
+                    f"{row['SpreadStatus']}\n")
+        if prior_events:
+            report += f"次日OI验证: {verified}/{len(prior_events)}条已补充（概率为启发式分类）。\n"
         return report
     except Exception as e: return report + f"⚠️ 异动扫描报错: {e}\n"
 
@@ -679,6 +813,14 @@ def get_report():
                 "poc_method": dict_poc.get("poc_method"),
                 "poc_window": dict_poc.get("poc_window"),
                 "poc_source_date": dict_poc.get("poc_source_date"),
+                "poc_nodes": dict_poc.get("poc_nodes"),
+                "poc_top1_top2_gap_pct": dict_poc.get("poc_top1_top2_gap_pct"),
+                "poc_bin_width": dict_poc.get("poc_bin_width"),
+                "poc_window_start": dict_poc.get("poc_window_start"),
+                "poc_window_end": dict_poc.get("poc_window_end"),
+                "poc_previous_price": dict_poc.get("poc_previous_price"),
+                "poc_change_pct": dict_poc.get("poc_change_pct"),
+                "poc_quality": dict_poc.get("poc_quality"),
                 "obv_status": dict_poc.get("obv_status"),
                 "ivr_pct": dict_ivr.get("ivr_pct"),
                 "iv_rank_pct": dict_ivr.get("iv_rank_pct"),

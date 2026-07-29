@@ -27,6 +27,11 @@ def compute_etf_share_metrics(history):
         if rows.empty:
             continue
         current = rows.iloc[-1]
+        recent_shares = rows['Shares'].tail(3)
+        stale_unchanged = (
+            len(recent_shares) >= 3
+            and recent_shares.nunique(dropna=True) == 1
+        )
         changes = {}
         for window in (1, 5, 20):
             baseline_index = len(rows) - 1 - window
@@ -36,7 +41,7 @@ def compute_etf_share_metrics(history):
             baseline = rows.iloc[baseline_index]
             delta_shares = float(current['Shares'] - baseline['Shares'])
             baseline_shares = float(baseline['Shares'])
-            changes[f'{window}d'] = {
+            changes[f'{window}d'] = None if stale_unchanged else {
                 'share_change_m': round(delta_shares / 1e6, 4),
                 'share_change_pct': (
                     round(delta_shares / baseline_shares * 100, 4)
@@ -51,7 +56,9 @@ def compute_etf_share_metrics(history):
             'price': round(float(current['Price']), 4),
             'as_of_date': pd.Timestamp(current['Date']).strftime('%Y-%m-%d'),
             'source': 'yfinance_info_unverified',
-            'quality': 'CONTEXT_ONLY',
+            'quality': (
+                'STALE_UNCHANGED' if stale_unchanged else 'CONTEXT_ONLY'
+            ),
             'changes': changes,
         }
     return result
@@ -153,6 +160,11 @@ def vwap_acceptance(bars, expected_samples=78, minimum_coverage=0.80):
         'last_vwap': None,
         'sample_count': 0,
         'coverage_pct': 0.0,
+        'missing_samples': None,
+        'duplicate_samples': 0,
+        'missing_intervals': [],
+        'first_bar': None,
+        'last_bar': None,
         'quality': 'MISSING_BARS',
     }
     if bars is None:
@@ -169,6 +181,15 @@ def vwap_acceptance(bars, expected_samples=78, minimum_coverage=0.80):
     if frame.empty:
         return result
 
+    duplicate_samples = 0
+    if 'date' in frame.columns:
+        frame['date'] = pd.to_datetime(frame['date'], errors='coerce')
+        frame = frame.dropna(subset=['date']).sort_values('date')
+        duplicate_samples = int(frame.duplicated('date', keep='last').sum())
+        frame = frame.drop_duplicates('date', keep='last')
+        if frame.empty:
+            return result
+
     if {'high', 'low'}.issubset(frame.columns):
         typical = (frame['high'] + frame['low'] + frame['close']) / 3.0
         typical = typical.where(typical.notna(), frame['close'])
@@ -179,7 +200,25 @@ def vwap_acceptance(bars, expected_samples=78, minimum_coverage=0.80):
     above = typical > cumulative_vwap
     samples = int(len(frame))
     coverage = min(1.0, samples / max(int(expected_samples), 1))
-    quality = 'OK' if coverage >= minimum_coverage else 'LOW_COVERAGE'
+    missing_samples = max(int(expected_samples) - samples, 0)
+    missing_intervals = []
+    if 'date' in frame and expected_samples > 0:
+        first = frame['date'].iloc[0]
+        session_start = first.normalize() + pd.Timedelta(hours=9, minutes=30)
+        expected_index = pd.date_range(
+            session_start, periods=int(expected_samples), freq='5min')
+        observed_index = pd.DatetimeIndex(frame['date']).floor('5min')
+        missing_intervals = [
+            value.isoformat() for value in expected_index.difference(observed_index)
+        ]
+    if duplicate_samples:
+        quality = 'DUPLICATE_BARS'
+    elif missing_samples == 0 and not missing_intervals:
+        quality = 'OK'
+    elif coverage >= minimum_coverage:
+        quality = 'PARTIAL_COVERAGE'
+    else:
+        quality = 'LOW_COVERAGE'
     result.update({
         'time_acceptance_pct': float(above.mean() * 100.0),
         'volume_acceptance_pct': float(
@@ -187,9 +226,141 @@ def vwap_acceptance(bars, expected_samples=78, minimum_coverage=0.80):
         'last_vwap': float(cumulative_vwap.iloc[-1]),
         'sample_count': samples,
         'coverage_pct': coverage * 100.0,
+        'missing_samples': missing_samples,
+        'duplicate_samples': duplicate_samples,
+        'missing_intervals': missing_intervals,
+        'first_bar': (
+            frame['date'].iloc[0].isoformat() if 'date' in frame else None
+        ),
+        'last_bar': (
+            frame['date'].iloc[-1].isoformat() if 'date' in frame else None
+        ),
         'quality': quality,
     })
     return result
+
+
+def classify_repeated_value(current, previous_values, repeat_threshold=3):
+    """Classify a feed value as stale after N identical observations."""
+    try:
+        value = float(current)
+    except (TypeError, ValueError):
+        return {'status': 'MISSING_STREAM', 'repeat_count': 0}
+    if not math.isfinite(value):
+        return {'status': 'MISSING_STREAM', 'repeat_count': 0}
+    repeats = 1
+    for prior in previous_values or []:
+        try:
+            prior_value = float(prior)
+        except (TypeError, ValueError):
+            break
+        if not math.isfinite(prior_value) or prior_value != value:
+            break
+        repeats += 1
+    return {
+        'status': 'STALE_VALUE' if repeats >= repeat_threshold else 'OK',
+        'repeat_count': repeats,
+    }
+
+
+def volume_profile_nodes(bars, bins=50, top_n=3):
+    """Return leading close-volume nodes and reproducible profile metadata."""
+    result = {
+        'poc_price': None,
+        'nodes': [],
+        'top1_top2_share_gap_pct': None,
+        'bin_width': None,
+        'window_start': None,
+        'window_end': None,
+        'sample_count': 0,
+        'quality': 'MISSING_BARS',
+    }
+    frame = pd.DataFrame(bars).copy()
+    if frame.empty or not {'close', 'volume'}.issubset(frame.columns):
+        return result
+    frame['close'] = pd.to_numeric(frame['close'], errors='coerce')
+    frame['volume'] = pd.to_numeric(frame['volume'], errors='coerce')
+    if 'date' in frame:
+        frame['date'] = pd.to_datetime(frame['date'], errors='coerce')
+    frame = frame.dropna(subset=['close', 'volume'])
+    frame = frame[(frame['close'] > 0) & (frame['volume'] > 0)]
+    if frame.empty:
+        return result
+    low, high = float(frame['close'].min()), float(frame['close'].max())
+    if high <= low:
+        result.update({
+            'poc_price': low,
+            'nodes': [{'price': low, 'volume_share_pct': 100.0,
+                       'volume': float(frame['volume'].sum())}],
+            'bin_width': 0.0,
+            'sample_count': int(len(frame)),
+            'quality': 'SINGLE_PRICE',
+        })
+        return result
+    bin_count = max(2, min(int(bins), int(len(frame))))
+    width = (high - low) / bin_count
+    index = ((frame['close'] - low) / width).astype(int).clip(0, bin_count - 1)
+    grouped = frame.assign(_bin=index).groupby('_bin')['volume'].sum()
+    total = float(grouped.sum())
+    leaders = grouped.sort_values(ascending=False).head(max(int(top_n), 1))
+    nodes = [{
+        'price': low + (int(bin_index) + 0.5) * width,
+        'volume_share_pct': float(volume / total * 100.0),
+        'volume': float(volume),
+    } for bin_index, volume in leaders.items()]
+    gap = (
+        nodes[0]['volume_share_pct'] - nodes[1]['volume_share_pct']
+        if len(nodes) > 1 else None
+    )
+    valid_dates = frame['date'].dropna() if 'date' in frame else pd.Series(dtype='datetime64[ns]')
+    result.update({
+        'poc_price': nodes[0]['price'],
+        'nodes': nodes,
+        'top1_top2_share_gap_pct': gap,
+        'bin_width': width,
+        'window_start': valid_dates.min().date().isoformat() if not valid_dates.empty else None,
+        'window_end': valid_dates.max().date().isoformat() if not valid_dates.empty else None,
+        'sample_count': int(len(frame)),
+        'quality': 'OK',
+    })
+    return result
+
+
+def option_trade_side(last, bid, ask):
+    """Infer aggressor side from a quote snapshot; this is not order provenance."""
+    values = []
+    for value in (last, bid, ask):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = None
+        values.append(number if number is not None and math.isfinite(number) else None)
+    last_value, bid_value, ask_value = values
+    if last_value is None or bid_value is None or ask_value is None or ask_value < bid_value:
+        return 'UNKNOWN'
+    midpoint = (bid_value + ask_value) / 2.0
+    if last_value >= ask_value or last_value > midpoint:
+        return 'ASK_SIDE'
+    if last_value <= bid_value or last_value < midpoint:
+        return 'BID_SIDE'
+    return 'MID'
+
+
+def opening_probability(volume, oi_change):
+    """Classify next-day OI confirmation without presenting it as certainty."""
+    try:
+        volume_value = float(volume)
+        change_value = float(oi_change)
+    except (TypeError, ValueError):
+        return 'UNKNOWN'
+    if volume_value <= 0 or not all(map(math.isfinite, (volume_value, change_value))):
+        return 'UNKNOWN'
+    ratio = change_value / volume_value
+    if ratio >= 0.60:
+        return 'HIGH'
+    if ratio >= 0.25:
+        return 'MEDIUM'
+    return 'LOW'
 
 
 def classify_hyg_tlt(hyg_return_pct, tlt_return_pct, ratio_return_pct):

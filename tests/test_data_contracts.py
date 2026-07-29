@@ -4,11 +4,15 @@ import pandas as pd
 
 from data_contracts import (
     calculate_iv_rank_percentile,
+    classify_repeated_value,
     classify_hyg_tlt,
     concentration_attribution,
     compute_etf_share_metrics,
     gap_acceptance,
+    opening_probability,
+    option_trade_side,
     up_down_volume_ratio,
+    volume_profile_nodes,
     vwap_acceptance,
 )
 from pre_market_metrics import gamma_structure
@@ -24,6 +28,11 @@ class IntradayFailClosedTests(unittest.TestCase):
         value, status = up_down_volume_ratio(200, 100)
         self.assertEqual(value, 2.0)
         self.assertEqual(status, "OK")
+
+    def test_third_identical_observation_is_stale(self):
+        result = classify_repeated_value(1117, [1117, 1117])
+        self.assertEqual(result['status'], 'STALE_VALUE')
+        self.assertEqual(result['repeat_count'], 3)
 
 
 class IVDefinitionTests(unittest.TestCase):
@@ -57,6 +66,37 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result['quality'], 'OK')
         self.assertAlmostEqual(result['time_acceptance_pct'], 2 / 3 * 100)
         self.assertAlmostEqual(result['volume_acceptance_pct'], 2 / 3 * 100)
+
+    def test_vwap_duplicate_bars_cannot_claim_full_quality(self):
+        result = vwap_acceptance([
+            {'date': '2026-07-28 09:30', 'close': 100, 'volume': 100},
+            {'date': '2026-07-28 09:35', 'close': 101, 'volume': 100},
+            {'date': '2026-07-28 09:35', 'close': 102, 'volume': 100},
+        ], expected_samples=2)
+        self.assertEqual(result['quality'], 'DUPLICATE_BARS')
+        self.assertEqual(result['duplicate_samples'], 1)
+
+    def test_missing_reversal_window_is_partial_and_listed(self):
+        bars = [
+            {'date': timestamp, 'close': 100, 'volume': 100}
+            for timestamp in pd.date_range(
+                '2026-07-28 09:30', periods=78, freq='5min')
+            if not (timestamp.hour == 10 and timestamp.minute >= 30)
+            and not (timestamp.hour == 11 and timestamp.minute == 0)
+        ]
+        result = vwap_acceptance(bars, expected_samples=78)
+        self.assertEqual(result['quality'], 'PARTIAL_COVERAGE')
+        self.assertIn('2026-07-28T10:30:00', result['missing_intervals'])
+
+    def test_volume_profile_reports_three_nodes_and_bin_contract(self):
+        result = volume_profile_nodes([
+            {'date': f'2026-07-{20 + index:02d}', 'close': 100 + index,
+             'volume': (index + 1) * 100}
+            for index in range(5)
+        ], bins=5, top_n=3)
+        self.assertEqual(result['quality'], 'OK')
+        self.assertEqual(len(result['nodes']), 3)
+        self.assertGreater(result['bin_width'], 0)
 
     def test_hyg_tlt_label_does_not_call_rate_driven_ratio_full_risk_on(self):
         self.assertEqual(
@@ -94,6 +134,24 @@ class ETFShareHistoryTests(unittest.TestCase):
         self.assertEqual(metrics["changes"]["5d"]["share_change_m"], 5.0)
         self.assertEqual(metrics["changes"]["20d"]["share_change_m"], 20.0)
         self.assertEqual(metrics["changes"]["1d"]["dollar_flow_m"], 700.0)
+
+    def test_three_unchanged_share_observations_are_na_not_zero_flow(self):
+        history = pd.DataFrame({
+            'Date': pd.bdate_range('2026-07-24', periods=3),
+            'Ticker': ['SPY'] * 3,
+            'Shares': [100_000_000] * 3,
+            'Price': [700.0, 701.0, 702.0],
+        })
+        metric = compute_etf_share_metrics(history)['SPY']
+        self.assertEqual(metric['quality'], 'STALE_UNCHANGED')
+        self.assertIsNone(metric['changes']['1d'])
+
+
+class OptionFlowVerificationTests(unittest.TestCase):
+    def test_trade_side_and_next_day_oi_are_labeled_as_heuristics(self):
+        self.assertEqual(option_trade_side(1.19, 1.00, 1.20), 'ASK_SIDE')
+        self.assertEqual(opening_probability(1000, 700), 'HIGH')
+        self.assertEqual(opening_probability(1000, -200), 'LOW')
 
 
 class GammaLineageTests(unittest.TestCase):

@@ -852,7 +852,8 @@ class UltimateDashboard:
                     f"{window} {pct_text} / {flow_text}")
             etf_lines.append(
                 f"[{ticker}份额变化]: " + " | ".join(parts)
-                + f" (source={metric.get('source', 'NA')}, context-only)")
+                + f" (source={metric.get('source', 'NA')}, "
+                f"quality={metric.get('quality', 'MISSING')}, context-only)")
         etf_detail_text = "\n".join(etf_lines) if etf_lines else "[ETF份额变化]: 历史不足"
         def cot_detail(key, output_key):
             meta = self.smf.get('cot_metadata', {}).get(key, {})

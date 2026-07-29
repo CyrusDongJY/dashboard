@@ -16,6 +16,7 @@ from pre_market_metrics import (
     quote_midpoint,
     select_expirations,
     standard_monthly_oi_walls,
+    validate_iv_skew,
 )
 
 
@@ -75,6 +76,41 @@ class ExpectedMoveTests(unittest.TestCase):
         self.assertIsNone(result["value"])
         self.assertIsNone(result["pct"])
 
+    def test_adjacent_strikes_interpolate_iv_before_stale_fallback(self):
+        frame = pd.DataFrame([
+            option_row("20260815", 100, "C", 100, iv=None),
+            option_row("20260815", 100, "P", 100, iv=None),
+            option_row("20260815", 95, "C", 100, iv=0.20),
+            option_row("20260815", 105, "P", 100, iv=0.30),
+        ])
+        result = expected_move_metrics(frame, 100, "20260815", previous_iv=0.40)
+        self.assertEqual(result['source'], 'ADJACENT_IV_INTERPOLATION')
+        self.assertAlmostEqual(result['iv'], 0.25)
+
+    def test_previous_day_iv_is_stale_not_missing_or_zero(self):
+        frame = pd.DataFrame([
+            option_row("20260815", 100, "C", 100, iv=None),
+            option_row("20260815", 100, "P", 100, iv=None),
+        ])
+        result = expected_move_metrics(
+            frame, 100, "20260815", previous_iv=0.28,
+            previous_iv_date='2026-07-27')
+        self.assertEqual(result['source'], 'PREVIOUS_DAY_IV')
+        self.assertEqual(result['quality'], 'STALE')
+        self.assertEqual(result['source_date'], '2026-07-27')
+
+    def test_previous_expected_move_iv_proxy_keeps_explicit_lineage(self):
+        frame = pd.DataFrame([
+            option_row("20260815", 100, "C", 100, iv=None),
+            option_row("20260815", 100, "P", 100, iv=None),
+        ])
+        result = expected_move_metrics(
+            frame, 100, "20260815", previous_iv=0.27,
+            previous_iv_date='2026-07-27',
+            previous_iv_source='PREVIOUS_DAY_EXPECTED_MOVE_IV_PROXY')
+        self.assertEqual(
+            result['source'], 'PREVIOUS_DAY_EXPECTED_MOVE_IV_PROXY')
+
 
 class StructureTests(unittest.TestCase):
     def test_distance_is_positive_when_level_is_above_spot(self):
@@ -98,6 +134,34 @@ class StructureTests(unittest.TestCase):
         self.assertIsNone(gated['ALL']['net_gamma_m'])
         self.assertIsNotNone(gated['ALL']['raw_net_gamma_m'])
         self.assertIsNone(gated['call_wall'])
+
+    def test_valid_curve_without_cross_has_distinct_flip_status(self):
+        rows = []
+        for strike in range(90, 110):
+            rows.extend([
+                option_row("20260815", strike, "C", 1000, dte=30),
+                option_row("20260815", strike, "P", 1000, dte=30),
+            ])
+        raw = gamma_structure(pd.DataFrame(rows), 100)
+        gated = apply_gamma_quality_gate(
+            raw,
+            {'0DTE': 0, '1-7D': 0, '8-30D': 40, '31-60D': 0, 'ALL': 40},
+            {'0DTE': 0, '1-7D': 0, '8-30D': 40, '31-60D': 0, 'ALL': 40},
+            {'0DTE': 0, '1-7D': 0, '8-30D': 40, '31-60D': 0, 'ALL': 40},
+        )
+        self.assertEqual(gated['ALL']['quality'], 'OK')
+        self.assertEqual(gated['ALL']['flip_quality'], 'VALID_NO_CROSS')
+        self.assertIsNone(gated['ALL']['primary_flip'])
+
+    def test_extreme_skew_triggers_quote_review(self):
+        self.assertEqual(validate_iv_skew(0.214), 'EXTREME_REVIEW')
+        self.assertEqual(
+            validate_iv_skew(
+                0.05,
+                {'Bid': 1.0, 'Ask': 2.0, 'QuoteAgeSeconds': 10},
+                {'Bid': 1.0, 'Ask': 1.1, 'QuoteAgeSeconds': 10},
+            ),
+            'WIDE_MARKET')
     def test_put_call_ratio_never_turns_missing_denominator_into_zero(self):
         frame = pd.DataFrame([
             option_row("20260815", 100, "P", 200),
@@ -223,11 +287,12 @@ class EmailSummaryTests(unittest.TestCase):
             {"pct": 1.25, "quality": "OK"},
             0.92, 0.015, self.gamma_fixture(), "OK")
 
-        self.assertEqual(len(text.splitlines()), 3)
+        self.assertEqual(len(text.splitlines()), 4)
         self.assertIn("SPY | 参考 $100.00", text)
         self.assertIn("C $105.00 / P $95.00 / Flip $101.00", text)
         self.assertIn("C/P/Flip距离 +5.00%/-5.00%/+1.00%", text)
         self.assertIn("Gamma 0D +1.20M", text)
+        self.assertIn("覆盖 有效0/请求0", text)
         self.assertNotIn("全部零点", text)
         self.assertNotIn("最大OI", text)
         self.assertNotIn("符号假设", text)

@@ -145,6 +145,20 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
         """)
         self.assertIn("ZERO_SEMANTICS_OK", output)
 
+    def test_repeated_or_old_ad_quote_is_stale(self):
+        output = self._isolated_run("""
+            import runpy
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="stale_breadth_test")
+            classify = module["classify_breadth_status"]
+            assert classify(1117, [1117, 1117], 10) == ("STALE_VALUE", 3)
+            assert classify(1118, [1117, 1117], 181) == ("STALE_VALUE", 1)
+            assert classify(1118, [1117, 1117], 10) == ("OK", 1)
+            print("STALE_BREADTH_OK")
+        """)
+        self.assertIn("STALE_BREADTH_OK", output)
+
     def test_actionable_ib_errors_are_persisted(self):
         output = self._isolated_run("""
             import runpy
