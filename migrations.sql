@@ -427,7 +427,7 @@ CREATE TABLE IF NOT EXISTS option_volume_anomalies (
     symbol                  text        NOT NULL,
     expiry                  date        NOT NULL,
     strike                  numeric     NOT NULL,
-    right                   text        NOT NULL CHECK (right IN ('C', 'P')),
+    "right"                 text        NOT NULL CHECK ("right" IN ('C', 'P')),
     volume                  bigint,
     open_interest           bigint,
     vol_oi_ratio            numeric,
@@ -444,7 +444,7 @@ CREATE TABLE IF NOT EXISTS option_volume_anomalies (
     source_date             date,
     as_of_time              timestamptz,
     ingested_at             timestamptz,
-    PRIMARY KEY (report_date, symbol, expiry, strike, right)
+    PRIMARY KEY (report_date, symbol, expiry, strike, "right")
 );
 CREATE INDEX IF NOT EXISTS idx_option_volume_anomalies_pending
     ON option_volume_anomalies (symbol, report_date DESC, verification_date);
