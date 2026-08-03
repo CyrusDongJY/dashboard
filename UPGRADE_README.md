@@ -91,6 +91,7 @@
    | `liquidity_monitor.py` | 新增（六柱评分与状态机，**必须**放这里） |
    | `liquidity_report.py` | 新增（盘后水位仪PNG，**必须**放这里） |
    | `backfill_history.py` | 新增（一次性历史回补） |
+   | `backfill_option_fragility.py` | 新增（IB/ThetaData期权脆弱度一次性回补） |
    | `requirements-env-dashboard.txt` | 新增（PNG依赖清单） |
    | `market_probes.py` | 覆盖 |
    | `ultimate_dashboard.py` | 覆盖 |
@@ -259,6 +260,10 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
   不会默认显示健康。
 - 五类指数与综合值全部是研究性影子输出：只进入邮件附录、PNG和数据库，明确不接入
   `ALERT_GATE`、不改变 severity、不用于仓位。
+- 环境指数采用风险方向刻度：`0` 表示历史低压，`100` 表示历史高压，数值越高越危险；
+  可选面板缺数时会列出具体指标及有效观测数，不再只显示笼统的“数据不足”。
+- `calc_version=env_v2.2` 后，风险压强只使用显式的 `vix_ratio_contango_pct`
+  （`1 - VIX/VIX3M`），不再把它与VX期货M2/M1升贴水拼入同一历史序列。
 - `backfill_history.py` 对低频FRED序列使用原生观测计算统计量，再映射到NYSE交易日；
   填充日保留真实 `source_date` 且不增加 `effective_obs_count`。
 - 回补前必须先执行最新版 `migrations.sql`。正式执行前建议先运行：
@@ -289,10 +294,16 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 - 执行新版 migrations.sql 创建 liquidity_daily 后，再部署三个新增模块和
   auto_analyst.py。第一版保持 shadow_mode=true，不接入 ALERT_GATE 或仓位。
 
-### V2口径与可靠性修正
+### V2.1口径与可靠性修正
 
-- `calc_version=liquidity_v2`。VIX期货M2/M1升贴水与现货VIX/VIX3M比率分列保存、
+- `calc_version=liquidity_v2.1`。VIX期货M2/M1升贴水与现货VIX/VIX3M比率分列保存、
   分别计算分位，禁止在同一历史序列中混用。数据库中的V1记录保留，可按版本追溯。
+- 水位仪采用支持方向刻度：`0` 表示流动性支持最弱，`100` 表示支持最强，数值越高
+  越充足。综合分只对达到门槛的柱加权，因此必须与有效覆盖率一起解读。
+- 原始业务表仍为第一优先级；表内缺日时，水位仪用 `metric_daily` 的EOD宏观历史
+  补齐广度、VVIX、SKEW及VIX曲线。旧字段 `vix_contango_pct` 只有来源明确为
+  `macro_spot_daily` 或 `yfinance` 才分别映射为期货曲线或VIX/VIX3M曲线，未知来源
+  保持缺失。
 - 净流动性20日变化改用美元金额变化，不再对可能接近零的净值计算百分比。
 - “融资管道承压”和“信用收缩”头条状态必须同时满足历史分位异常和绝对压力护栏；
   只有相对异常时降级为结构提示，避免平静样本内的正常波动触发强状态。
@@ -304,6 +315,52 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 - V2仍为研究性影子输出。部署后至少观察3至5个完整交易日，重点检查官方源覆盖率、
   融资/信用护栏触发率、缺日合并和PNG附件，再决定是否调整绝对阈值；不得直接接入
   告警或仓位决策。
+
+### 一次性补齐市场分配、尾部韧性和期权脆弱度
+
+先重新运行通用回补。新版会增加 `^SKEW`，并让水位仪复用已经存在的广度、VVIX和
+VIX/VIX3M历史：
+
+```bash
+cd /home/winters_dong426/market_dashboard
+/usr/bin/python3 backfill_history.py 2y dry
+/usr/bin/python3 backfill_history.py 2y
+```
+
+期权脚本默认 dry-run，只有显式 `--write` 才会写入。IBKR阶段回建滚动IV Rank；应在
+TWS/IB Gateway已连接且有相应行情权限的环境运行：
+
+```bash
+/usr/bin/python3 backfill_option_fragility.py \
+  --source ib --period 2y --audit-csv /tmp/option_fragility_ib.csv
+/usr/bin/python3 backfill_option_fragility.py --source ib --period 2y --write
+```
+
+ThetaData阶段按交易日读取EOD Greeks与当日上午可知的上一收盘OI，回建ATM预期波幅和
+0-7D净Gamma。新版 `thetadata` Python库要求Python 3.12+；用已安装该库且配置了
+`THETADATA_API_KEY`的解释器执行：
+
+```bash
+<python3.12> backfill_option_fragility.py \
+  --source theta --period 6mo --audit-csv /tmp/option_fragility_theta.csv
+<python3.12> backfill_option_fragility.py --source theta --period 6mo --write
+```
+
+两个阶段都不会覆盖 `is_final=true` 的EOD生产快照，也不新增cron。回补后检查独立
+来源日期是否达到60个，再等待下一次 `auto_analyst.py` 正常盘后运行：
+
+```sql
+SELECT metric, scope, COUNT(DISTINCT source_date) AS native_obs,
+       MIN(report_date) AS earliest_date, MAX(report_date) AS latest_date
+FROM public.metric_daily
+WHERE session = 'EOD'
+  AND metric IN ('pct_20ma','pct_50ma','pct_200ma','pct_adv',
+                 'breadth_diff_pct','vvix','skew','vix_ratio_contango_pct',
+                 'vix_contango_pct',
+                 'ivr_pct','expected_move_pct','short_gamma_m')
+GROUP BY metric, scope
+ORDER BY metric, scope;
+```
 
 ### 云端验证
 

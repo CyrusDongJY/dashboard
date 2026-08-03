@@ -37,11 +37,14 @@ METRIC_REGISTRY = {
     # 波动率结构
     "vix_contango_pct": {"cn": "VIX期限结构", "bad_dir": -1, "scope": "MACRO",
                           "abs": [("<", 0, 3), ("<", 3, 1)], "z": (2.0, 3.0)},
+    "vix_ratio_contango_pct": {"cn": "VIX/VIX3M升贴水", "bad_dir": -1,
+                          "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
     "move":            {"cn": "MOVE债市波动", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 120, 2), (">", 100, 1)], "z": (2.0, 3.0)},
     "vix":             {"cn": "VIX", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 30, 2), (">", 22, 1)], "z": (2.0, 3.0)},
     "vvix":            {"cn": "VVIX", "bad_dir": +1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "skew":            {"cn": "Cboe SKEW", "bad_dir": +1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
     "vrp_num":         {"cn": "VRP风险溢价", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 10, 1)], "z": (2.0, 3.0)},
     "vix_term_ratio":  {"cn": "VIX/VIX3M", "bad_dir": +1, "scope": "MACRO",
@@ -461,6 +464,18 @@ def _metric_source_date(df, metric, date_col, preferred_source_cols=()):
     return str(value) if value is not None and not pd.isna(value) else None
 
 
+def _expand_market_history_metrics(frame):
+    """Expose JSON-only market metrics with explicit, stable calculations."""
+    if frame.empty or 'full_metrics' not in frame.columns:
+        return frame
+    expanded = frame.copy()
+    vix_ratio = pd.to_numeric(expanded['full_metrics'].map(
+        lambda value: value.get('vix_term_ratio')
+        if isinstance(value, dict) else None), errors='coerce')
+    expanded['vix_ratio_contango_pct'] = (1.0 - vix_ratio) * 100.0
+    return expanded
+
+
 def _event_identity(row):
     return tuple(str(row.get(key) or "") for key in
                  ("metric", "scope", "window_scope", "layer", "resonance_key"))
@@ -506,15 +521,20 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
     # ---- 宏观：market_history ----
     mh = _fetch_history(supabase, 'market_history', 'record_date', end_date=report_date)
     if not mh.empty:
+        mh = _expand_market_history_metrics(mh)
         macro_metrics = [
             'vix', 'move', 'vvix', 'credit_spread', 'credit_z', 'nfci',
             'hyg_tlt_ratio', 'net_liq', 'pct_200ma', 'pct_50ma', 'pct_20ma',
-            'pct_adv', 'trin', 'dxy', 'cg_z',
+            'pct_adv', 'trin', 'dxy', 'cg_z', 'vix_ratio_contango_pct',
         ]
         for m in macro_metrics:
             if m in mh.columns:
                 src = _metric_source_date(mh, m, 'record_date', ('source_date',))
-                events += scan_metric(m, mh[m], report_date, scope="MACRO", source_date=src)
+                # The ratio curve feeds the shadow environment model only. Keep
+                # the existing futures-curve alert contract as the formal signal.
+                if m != 'vix_ratio_contango_pct':
+                    events += scan_metric(
+                        m, mh[m], report_date, scope="MACRO", source_date=src)
                 row = metric_snapshot(
                     m, mh[m], report_date, scope="MACRO", source_date=src,
                     session=session, is_final=is_final, source_name="market_history")

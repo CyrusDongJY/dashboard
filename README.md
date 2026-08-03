@@ -57,6 +57,7 @@ Tag 只标识不可移动的代码恢复点，不表示云端已经部署。根�
 | 异常判定 | `anomaly_engine.py`, `market_sentinel.py` | 单指标、多窗口和跨资产共振 |
 | 环境观察 | `environment_indices.py`, `environment_report.py` | 长周期环境指数和 PNG |
 | 流动性观察 | `liquidity_sources.py`, `liquidity_monitor.py`, `liquidity_report.py` | 六柱流动性水位和 PNG |
+| 历史回补 | `backfill_history.py`, `backfill_option_fragility.py` | 宏观、尾部与期权脆弱度的无前视回补 |
 | 盘后归因 | `auto_analyst.py`, `market_probes.py` | 邮件汇总和 AI 叙述 |
 | 运维与审计 | `market_utils.py`, `migrations.sql`, `tests/` | 幂等写入、质量日志、迁移和测试 |
 

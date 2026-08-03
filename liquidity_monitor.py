@@ -20,10 +20,16 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-CALC_VERSION = "liquidity_v2"
+CALC_VERSION = "liquidity_v2.1"
 SHADOW_MODE = True
 MIN_PILLAR_COVERAGE = 0.35
 MIN_COMPOSITE_COVERAGE = 0.50
+
+METRIC_DAILY_FALLBACK_METRICS = (
+    "pct_20ma", "pct_50ma", "pct_200ma", "pct_adv",
+    "breadth_diff_pct", "vvix", "skew", "vix_contango_pct",
+    "vix_ratio_contango_pct",
+)
 
 # A relative tail alone cannot promote an observation to a headline stress
 # state. At least one economically meaningful absolute guard must also fire.
@@ -236,6 +242,121 @@ def _fetch_rows(supabase, table: str, date_col: str, start_date: str,
     return pd.DataFrame(rows)
 
 
+def _fetch_metric_daily_rows(supabase, start_date: str, end_date: str,
+                             page_size: int = 1000) -> pd.DataFrame:
+    """Fetch only the persisted macro history that can repair sparse raw tables."""
+    rows, offset = [], 0
+    while True:
+        result = (supabase.table("metric_daily")
+                  .select("report_date,metric,scope,value,source_date,source_name")
+                  .eq("session", "EOD")
+                  .eq("scope", "MACRO")
+                  .in_("metric", list(METRIC_DAILY_FALLBACK_METRICS))
+                  .gte("report_date", start_date)
+                  .lte("report_date", end_date)
+                  .order("report_date").order("metric")
+                  .range(offset, offset + page_size - 1).execute())
+        batch = result.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return pd.DataFrame(rows)
+
+
+def _metric_daily_fallback_frame(rows: pd.DataFrame) -> pd.DataFrame:
+    """Convert long metric history to waterline columns without mixing VIX curves."""
+    if rows.empty:
+        return pd.DataFrame()
+    direct = {
+        "pct_20ma": "pct_20ma",
+        "pct_50ma": "pct_50ma",
+        "pct_200ma": "pct_200ma",
+        "pct_adv": "pct_adv",
+        "breadth_diff_pct": "breadth_diff_pct",
+        "vvix": "vvix",
+        "skew": "skew",
+        "vix_ratio_contango_pct": "vix_ratio_contango_pct",
+    }
+    records = []
+    for row in rows.to_dict("records"):
+        metric = row.get("metric")
+        target = direct.get(metric)
+        legacy_ratio_basis = False
+        if metric == "vix_contango_pct":
+            source = str(row.get("source_name") or "").strip().lower()
+            if source == "macro_spot_daily":
+                target = "vix_futures_contango_pct"
+            elif source.startswith("yfinance"):
+                target = "vix_ratio_contango_pct"
+                legacy_ratio_basis = True
+            else:
+                # The legacy name has represented two incompatible contracts.
+                # Unknown provenance must remain missing rather than be guessed.
+                continue
+        value = pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0]
+        report_date = pd.to_datetime(row.get("report_date"), errors="coerce")
+        if not target or pd.isna(value) or pd.isna(report_date):
+            continue
+        if legacy_ratio_basis:
+            # Legacy yfinance rows used (VIX3M / VIX - 1). Convert them to the
+            # canonical (1 - VIX / VIX3M) basis before joining the new series.
+            denominator = 100.0 + float(value)
+            if denominator <= 0:
+                continue
+            value = 100.0 * float(value) / denominator
+        source_date = pd.to_datetime(row.get("source_date"), errors="coerce")
+        records.append({
+            "report_date": report_date,
+            "column": target,
+            "value": float(value),
+            "source_date": source_date if pd.notna(source_date) else report_date,
+        })
+    if not records:
+        return pd.DataFrame()
+    tidy = (pd.DataFrame(records)
+            .sort_values(["report_date", "column"])
+            .drop_duplicates(["report_date", "column"], keep="last"))
+    values = tidy.pivot(index="report_date", columns="column", values="value")
+    sources = tidy.pivot(
+        index="report_date", columns="column", values="source_date")
+    for column in list(sources.columns):
+        values[f"{column}_source_date"] = pd.to_datetime(
+            sources[column], errors="coerce")
+    values.index = pd.to_datetime(values.index).tz_localize(None)
+    values.index.name = "report_date"
+    return values.sort_index()
+
+
+def _merge_metric_fallback(primary: pd.DataFrame,
+                           fallback: pd.DataFrame) -> pd.DataFrame:
+    """Fill holes only; production raw tables retain priority over replay rows."""
+    if fallback.empty:
+        return primary.copy()
+    index = primary.index.union(fallback.index).sort_values()
+    result = primary.reindex(index)
+    value_columns = [
+        column for column in fallback.columns
+        if not column.endswith("_source_date")
+    ]
+    for column in value_columns:
+        fallback_values = fallback[column].reindex(index)
+        if column not in result:
+            result[column] = fallback_values
+            result[f"{column}_source_date"] = fallback[
+                f"{column}_source_date"].reindex(index)
+            continue
+        use_fallback = result[column].isna() & fallback_values.notna()
+        result.loc[use_fallback, column] = fallback_values.loc[use_fallback]
+        source_column = f"{column}_source_date"
+        if source_column not in result:
+            result[source_column] = pd.NaT
+        fallback_sources = fallback[source_column].reindex(index)
+        result.loc[use_fallback, source_column] = fallback_sources.loc[use_fallback]
+    result.index.name = "report_date"
+    return result
+
+
 def _shares_to_millions(value):
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return np.nan
@@ -376,6 +497,13 @@ def build_database_frame(supabase, start_date: str,
                 frame[source_col] = extra_source.combine_first(frame[source_col])
             else:
                 frame[source_col] = extra_source
+
+    try:
+        metric_fallback = _metric_daily_fallback_frame(
+            _fetch_metric_daily_rows(supabase, start_date, end_date))
+        frame = _merge_metric_fallback(frame, metric_fallback)
+    except Exception as exc:
+        logger.warning("metric_daily liquidity fallback unavailable: %s", exc)
 
     frame.index.name = "report_date"
     return frame.sort_index()
@@ -740,7 +868,9 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
         "=== 市场流动性水位仪（影子观察，不触发预警） ===",
         f"状态：{result.state}",
         f"说明：{result.state_detail}",
-        f"综合水位：{result.composite if result.composite is not None else '数据不足'}",
+        "刻度：0=流动性支持最弱，100=流动性支持最强；数值越高越充足",
+        "综合流动性水位："
+        f"{result.composite if result.composite is not None else '数据不足'}",
         f"有效覆盖：{result.coverage:.0%}",
         f"落库状态：{result.persistence_status}",
     ]

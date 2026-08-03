@@ -27,7 +27,10 @@ from market_utils import safe_upsert  # noqa: E402
 logger = logging.getLogger("backfill")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
-YF_TICKERS = ["^VIX", "^MOVE", "^VVIX", "^VIX3M", "DX-Y.NYB", "HYG", "TLT"]
+YF_TICKERS = [
+    "^VIX", "^MOVE", "^VVIX", "^SKEW", "^VIX3M",
+    "DX-Y.NYB", "HYG", "TLT",
+]
 FRED_MAP = {
     "BAMLH0A0HYM2": "credit_spread",
     "NFCI": "nfci",
@@ -148,12 +151,14 @@ def build_metric_series(yf_df, fred_df, squeeze_df=None):
 
     if not yf_df.empty:
         for ticker, metric in {
-            "^VIX": "vix", "^MOVE": "move", "^VVIX": "vvix", "DX-Y.NYB": "dxy"
+            "^VIX": "vix", "^MOVE": "move", "^VVIX": "vvix",
+            "^SKEW": "skew", "DX-Y.NYB": "dxy",
         }.items():
             if ticker in yf_df:
                 add(metric, yf_df[ticker], "yfinance")
         if {"^VIX", "^VIX3M"}.issubset(yf_df.columns):
-            add("vix_contango_pct", (yf_df["^VIX3M"] / yf_df["^VIX"] - 1) * 100,
+            add("vix_ratio_contango_pct",
+                (1.0 - yf_df["^VIX"] / yf_df["^VIX3M"]) * 100,
                 "yfinance")
         if {"HYG", "TLT"}.issubset(yf_df.columns):
             add("hyg_tlt_ratio", yf_df["HYG"] / yf_df["TLT"], "yfinance")

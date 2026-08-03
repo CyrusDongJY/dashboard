@@ -19,6 +19,8 @@ from liquidity_monitor import (
     PillarScore,
     _business_day_change,
     _classify,
+    _merge_metric_fallback,
+    _metric_daily_fallback_frame,
     _score_component,
     _shares_to_millions,
     build_database_frame,
@@ -127,8 +129,8 @@ class LiquidityScoreTests(unittest.TestCase):
             tightening.pillars["flow_pulse"].score,
         )
 
-    def test_calc_version_is_v2(self):
-        self.assertEqual(CALC_VERSION, "liquidity_v2")
+    def test_calc_version_is_v2_1(self):
+        self.assertEqual(CALC_VERSION, "liquidity_v2.1")
 
     def test_missing_data_never_defaults_to_healthy(self):
         index = pd.bdate_range("2026-01-02", periods=5)
@@ -152,6 +154,7 @@ class LiquidityScoreTests(unittest.TestCase):
         summary = format_liquidity_summary(result)
         self.assertIn("有效观测", summary)
         self.assertIn("5/60", summary)
+        self.assertIn("数值越高越充足", summary)
 
     def test_vix_curve_contract_keeps_two_distinct_columns(self):
         columns = {spec.column for spec in COMPONENTS}
@@ -254,7 +257,9 @@ class LiquiditySourceTests(unittest.TestCase):
         def fake_rows(_supabase, table, _date_col, _start, _end):
             return pd.DataFrame(market_rows if table == "market_history" else [])
 
-        with patch("liquidity_monitor._fetch_rows", side_effect=fake_rows):
+        with patch("liquidity_monitor._fetch_rows", side_effect=fake_rows), patch(
+                "liquidity_monitor._fetch_metric_daily_rows",
+                return_value=pd.DataFrame()):
             frame = build_database_frame(None, "2026-01-01", "2026-01-09")
         row = frame.iloc[-1]
         self.assertEqual(row["rrp_b"], 100.0)
@@ -284,7 +289,9 @@ class LiquiditySourceTests(unittest.TestCase):
                 return pd.DataFrame(macro_rows)
             return pd.DataFrame()
 
-        with patch("liquidity_monitor._fetch_rows", side_effect=fake_rows):
+        with patch("liquidity_monitor._fetch_rows", side_effect=fake_rows), patch(
+                "liquidity_monitor._fetch_metric_daily_rows",
+                return_value=pd.DataFrame()):
             frame = build_database_frame(None, "2026-01-01", "2026-01-09")
         first, second = pd.Timestamp("2026-01-08"), pd.Timestamp("2026-01-09")
         self.assertEqual(list(frame.index), [first, second])
@@ -293,6 +300,64 @@ class LiquiditySourceTests(unittest.TestCase):
         self.assertAlmostEqual(frame.loc[second, "vix_futures_contango_pct"], 4.85)
         self.assertTrue(pd.isna(frame.loc[second, "vix_ratio_contango_pct"]))
         self.assertEqual(frame.loc[second, "pct_20ma"], 61.0)
+
+    def test_metric_daily_repairs_sparse_breadth_and_keeps_vix_lineage(self):
+        rows = pd.DataFrame([
+            {
+                "report_date": "2026-01-06", "metric": "vix_ratio_contango_pct",
+                "value": 10.0, "source_date": "2026-01-06",
+                "source_name": "yfinance",
+            },
+            {
+                "report_date": "2026-01-07", "metric": "pct_200ma",
+                "value": 58.0, "source_date": "2026-01-07",
+                "source_name": "market_history",
+            },
+            {
+                "report_date": "2026-01-07", "metric": "vix_contango_pct",
+                "value": 11.0, "source_date": "2026-01-07",
+                "source_name": "yfinance",
+            },
+            {
+                "report_date": "2026-01-08", "metric": "vix_contango_pct",
+                "value": 4.5, "source_date": "2026-01-08",
+                "source_name": "macro_spot_daily",
+            },
+            {
+                "report_date": "2026-01-09", "metric": "vix_contango_pct",
+                "value": 99.0, "source_date": "2026-01-09",
+                "source_name": "unknown_legacy_source",
+            },
+        ])
+        fallback = _metric_daily_fallback_frame(rows)
+        self.assertEqual(
+            fallback.loc[pd.Timestamp("2026-01-06"), "vix_ratio_contango_pct"],
+            10.0,
+        )
+        self.assertEqual(fallback.loc[pd.Timestamp("2026-01-07"), "pct_200ma"], 58.0)
+        self.assertAlmostEqual(
+            fallback.loc[pd.Timestamp("2026-01-07"), "vix_ratio_contango_pct"],
+            100.0 * 11.0 / 111.0,
+        )
+        self.assertEqual(
+            fallback.loc[pd.Timestamp("2026-01-08"), "vix_futures_contango_pct"],
+            4.5,
+        )
+        self.assertNotIn(pd.Timestamp("2026-01-09"), fallback.index)
+
+    def test_raw_table_values_win_over_metric_daily_fallback(self):
+        index = pd.to_datetime(["2026-01-08", "2026-01-09"])
+        primary = pd.DataFrame({
+            "pct_20ma": [61.0, np.nan],
+            "pct_20ma_source_date": index,
+        }, index=index)
+        fallback = pd.DataFrame({
+            "pct_20ma": [45.0, 55.0],
+            "pct_20ma_source_date": index,
+        }, index=index)
+        merged = _merge_metric_fallback(primary, fallback)
+        self.assertEqual(merged.loc[index[0], "pct_20ma"], 61.0)
+        self.assertEqual(merged.loc[index[1], "pct_20ma"], 55.0)
 
     def test_official_frame_has_priority_over_database(self):
         index = pd.to_datetime(["2026-01-09"])

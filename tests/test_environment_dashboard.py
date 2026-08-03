@@ -23,8 +23,13 @@ yfinance_module = types.ModuleType("yfinance")
 yfinance_module.download = lambda *args, **kwargs: pd.DataFrame()
 sys.modules.setdefault("yfinance", yfinance_module)
 
-from anomaly_engine import AnomalyEvent, metric_snapshot, scan_metric  # noqa: E402
-from backfill_history import parse_period_days, replay  # noqa: E402
+from anomaly_engine import (  # noqa: E402
+    AnomalyEvent,
+    _expand_market_history_metrics,
+    metric_snapshot,
+    scan_metric,
+)
+from backfill_history import build_metric_series, parse_period_days, replay  # noqa: E402
 from environment_indices import (  # noqa: E402
     INDEX_DEFS,
     classify_state,
@@ -94,7 +99,7 @@ class EnvironmentIndexTests(unittest.TestCase):
             metric_row("vix", 95, sample=60),
             metric_row("vvix", 90, sample=60),
             metric_row("move", 92, sample=60),
-            metric_row("vix_contango_pct", 5, sample=60),
+            metric_row("vix_ratio_contango_pct", 5, sample=60),
         ])
         scores, coverage, maturity, _ = score_frame_details(frame)
         self.assertIsNotNone(scores["idx_risk_pressure"])
@@ -156,7 +161,7 @@ class EnvironmentIndexTests(unittest.TestCase):
     def test_history_builder_scores_each_day(self):
         rows = [
             metric_row("vix", 95), metric_row("vvix", 90),
-            metric_row("move", 92), metric_row("vix_contango_pct", 5),
+            metric_row("move", 92), metric_row("vix_ratio_contango_pct", 5),
         ]
         history = build_history(pd.DataFrame(rows))
         self.assertEqual(len(history), 1)
@@ -178,17 +183,35 @@ class EnvironmentIndexTests(unittest.TestCase):
                     "metric": "nfci", "status": "INSUFFICIENT_SAMPLE",
                     "effective_obs_count": 40, "required_obs_count": 60,
                 }],
+                "idx_options_fragility": [{
+                    "metric": "expected_move_pct",
+                    "status": "INSUFFICIENT_SAMPLE",
+                    "effective_obs_count": 19,
+                    "required_obs_count": 60,
+                }],
             },
             "composite": 82.0,
             "resonance_count": 0,
             "resonance_themes": [],
         })
-        self.assertIn("可用面板参考值：82.0/100（不代表整体环境）", text)
+        self.assertIn(
+            "可用面板风险压力参考值：82.0/100（越高越危险；不代表整体环境）",
+            text,
+        )
+        self.assertIn("数值越高表示风险压力越大", text)
         self.assertIn("有效样本不足 40/60", text)
+        self.assertIn("预期波幅 19/60", text)
         self.assertIn("不代表环境健康", text)
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_market_history_vix_ratio_uses_canonical_contango_basis(self):
+        expanded = _expand_market_history_metrics(pd.DataFrame([{
+            "record_date": "2026-07-14",
+            "full_metrics": {"vix_term_ratio": 0.9},
+        }]))
+        self.assertAlmostEqual(expanded.iloc[0]["vix_ratio_contango_pct"], 10.0)
+
     def test_snapshot_preserves_session_and_quality_contract(self):
         values = pd.Series(np.linspace(10, 20, 80))
         row = metric_snapshot(
@@ -231,6 +254,23 @@ class BackfillTests(unittest.TestCase):
             self.assertEqual(row["sample_len"], expected)
         self.assertTrue(any(row["is_filled"] for row in rows))
 
+    def test_yfinance_backfill_includes_skew(self):
+        index = pd.bdate_range("2026-01-02", periods=3)
+        yf_frame = pd.DataFrame({
+            "^SKEW": [140.0, 141.0, 139.0],
+            "^VIX": [20.0, 21.0, 22.0],
+            "^VIX3M": [22.0, 23.1, 24.2],
+        }, index=index)
+        metrics = build_metric_series(yf_frame, pd.DataFrame())
+        self.assertIn("skew", metrics)
+        self.assertIn("vix_ratio_contango_pct", metrics)
+        self.assertNotIn("vix_contango_pct", metrics)
+        self.assertEqual(metrics["skew"]["source_name"], "yfinance")
+        self.assertAlmostEqual(
+            metrics["vix_ratio_contango_pct"]["series"].iloc[0],
+            (1.0 - 20.0 / 22.0) * 100,
+        )
+
 
 class _Query:
     def __init__(self, rows):
@@ -256,7 +296,7 @@ class ChartTests(unittest.TestCase):
     def test_png_report_is_nonempty(self):
         rows = [
             metric_row("vix", 95), metric_row("vvix", 90),
-            metric_row("move", 92), metric_row("vix_contango_pct", 5),
+            metric_row("move", 92), metric_row("vix_ratio_contango_pct", 5),
         ]
         path = os.path.join(
             tempfile.gettempdir(), "environment_chart_test", "nested",

@@ -12,7 +12,7 @@ import pandas as pd
 from anomaly_engine import BASELINE, METRIC_REGISTRY, RESONANCE_THEMES
 
 SHADOW_MODE = True
-ENV_CALC_VERSION = "env_v2.1"
+ENV_CALC_VERSION = "env_v2.2"
 MIN_EFFECTIVE_OBS = 60
 MIN_INDEX_COVERAGE = 0.50
 MIN_STATE_COVERAGE = 0.65
@@ -29,7 +29,7 @@ INDEX_DEFS = {
             ("vix", None, 1.0),
             ("vvix", None, 0.6),
             ("move", None, 0.8),
-            ("vix_contango_pct", None, 1.0),
+            ("vix_ratio_contango_pct", None, 1.0),
         ],
     },
     "idx_liquidity_stress": {
@@ -451,7 +451,8 @@ def format_env_summary(idx):
         state_text = state
     lines = ["=== 环境指数（影子观察，不触发预警） ===",
              f"正式状态：{state_text}",
-             f"说明：{idx.get('state_desc', '')}"]
+             f"说明：{idx.get('state_desc', '')}",
+             "刻度：0=历史低压，100=历史高压；数值越高表示风险压力越大"]
     labels = {
         "idx_risk_pressure": "风险压强",
         "idx_liquidity_stress": "信用条件",
@@ -514,13 +515,37 @@ def format_env_summary(idx):
     if blockers:
         lines.append("分类阻塞项：" + "；".join(blockers))
 
+    optional_notes = []
+    for key in ("idx_options_fragility", "idx_flow_behavior"):
+        if idx.get(key) is not None:
+            continue
+        missing = []
+        for item in diagnostics.get(key, []):
+            if item.get("status") == "OK":
+                continue
+            metric = item.get("metric", "unknown")
+            metric_label = METRIC_REGISTRY.get(metric, {}).get("cn", metric)
+            status = item.get("status")
+            if status == "INSUFFICIENT_SAMPLE":
+                missing.append(
+                    f"{metric_label} {item.get('effective_obs_count', 0)}/"
+                    f"{item.get('required_obs_count', MIN_EFFECTIVE_OBS)}")
+            else:
+                missing.append(
+                    f"{metric_label}：{diagnostic_labels.get(status, status or '不可用')}")
+        detail = "、".join(missing[:4]) if missing else "尚无可评分分量"
+        optional_notes.append(f"{labels[key]}（{detail}）")
+    if optional_notes:
+        lines.append("观察面板缺数：" + "；".join(optional_notes))
+
     comp = idx.get("composite")
     if comp is None:
-        lines.append("综合观察值：暂不发布（暂无达到门槛的成熟子指数）")
+        lines.append("综合风险压力值：暂不发布（暂无达到门槛的成熟子指数）")
     elif state == "数据不足":
-        lines.append(f"可用面板参考值：{comp:.1f}/100（不代表整体环境）")
+        lines.append(
+            f"可用面板风险压力参考值：{comp:.1f}/100（越高越危险；不代表整体环境）")
     else:
-        lines.append(f"综合观察值：{comp:.1f}/100")
+        lines.append(f"综合风险压力值：{comp:.1f}/100（越高越危险）")
 
     theme_keys = idx.get("resonance_themes") or []
     theme_names = [RESONANCE_THEMES.get(key, {}).get("cn", key)
