@@ -1,4 +1,5 @@
 from datetime import date
+import logging
 import unittest
 
 import numpy as np
@@ -8,6 +9,10 @@ from backfill_option_fragility import aggregate_theta_day, rolling_iv_metrics
 
 
 class OptionFragilityBackfillTests(unittest.TestCase):
+    def test_ib_client_logging_does_not_emit_account_details_at_info(self):
+        self.assertGreaterEqual(
+            logging.getLogger("ib_insync").level, logging.WARNING)
+
     def test_rolling_iv_metrics_has_no_future_leakage(self):
         index = pd.bdate_range("2025-01-02", periods=100)
         values = pd.Series(np.linspace(0.15, 0.35, len(index)), index=index)

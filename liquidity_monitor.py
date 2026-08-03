@@ -20,7 +20,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-CALC_VERSION = "liquidity_v2.1"
+CALC_VERSION = "liquidity_v2.2"
 SHADOW_MODE = True
 MIN_PILLAR_COVERAGE = 0.35
 MIN_COMPOSITE_COVERAGE = 0.50
@@ -174,6 +174,7 @@ class PillarScore:
     chart_label: str
     score: Optional[float]
     coverage: float
+    maturity: float = 0.0
 
 
 @dataclass
@@ -425,9 +426,11 @@ def build_database_frame(supabase, start_date: str,
         if old in frame:
             frame[new] = frame[old].map(_shares_to_millions)
 
+    index_source = pd.Series(frame.index, index=frame.index)
     fallback_source = (
-        pd.to_datetime(frame["source_date"], errors="coerce")
-        if "source_date" in frame else pd.Series(frame.index, index=frame.index)
+        pd.to_datetime(frame["source_date"], errors="coerce").combine_first(
+            index_source)
+        if "source_date" in frame else index_source
     )
     for column in list(frame.columns):
         if column.endswith("_source_date") or column == "source_date":
@@ -738,21 +741,25 @@ def score_liquidity_frame(frame: pd.DataFrame,
         by_key = {component.key: component for component in components}
         total_weight = sum(spec.weight for spec in specs)
         available = 0.0
+        nominal_available = 0.0
         weighted = 0.0
         for spec in specs:
             component = by_key[spec.key]
             if component.score is None or component.quality <= 0:
                 continue
+            nominal_available += spec.weight
             effective = spec.weight * component.quality
             available += effective
             weighted += component.score * effective
-        coverage = available / total_weight if total_weight else 0.0
+        coverage = nominal_available / total_weight if total_weight else 0.0
+        maturity = available / nominal_available if nominal_available else 0.0
         score = weighted / available if (
             available and coverage >= MIN_PILLAR_COVERAGE) else None
         pillars[key] = PillarScore(
             key, label, chart_label,
             round(score, 1) if score is not None else None,
             round(coverage, 3),
+            round(maturity, 3),
         )
 
     total_pillar_weight = sum(value[2] for value in PILLARS.values())
@@ -762,7 +769,7 @@ def score_liquidity_frame(frame: pd.DataFrame,
         pillar = pillars[key]
         if pillar.score is None:
             continue
-        effective = weight * pillar.coverage
+        effective = weight * pillar.coverage * pillar.maturity
         available_pillar_weight += effective
         composite_sum += pillar.score * effective
     coverage = available_pillar_weight / total_pillar_weight
@@ -886,7 +893,9 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
                 for item in blockers[:4]
             )
             coverage = pillar.coverage if pillar else 0.0
-            suffix = f"（可评分覆盖 {coverage:.0%}"
+            suffix = f"（分量覆盖 {coverage:.0%}"
+            if pillar:
+                suffix += f"；样本成熟度 {pillar.maturity:.0%}"
             if diagnostic:
                 suffix += f"；有效观测 {diagnostic}"
             suffix += "）"
@@ -894,7 +903,8 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
         else:
             lines.append(
                 f"{pillar.label}：{pillar.score:.1f}/100 "
-                f"（覆盖 {pillar.coverage:.0%}）")
+                f"（分量覆盖 {pillar.coverage:.0%}；"
+                f"样本成熟度 {pillar.maturity:.0%}）")
     if result.supports:
         lines.append("主要支撑：" + "；".join(result.supports))
     if result.drags:

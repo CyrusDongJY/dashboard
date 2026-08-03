@@ -29,7 +29,12 @@ from anomaly_engine import (  # noqa: E402
     metric_snapshot,
     scan_metric,
 )
-from backfill_history import build_metric_series, parse_period_days, replay  # noqa: E402
+from backfill_history import (  # noqa: E402
+    build_metric_series,
+    latest_completed_nyse_day,
+    parse_period_days,
+    replay,
+)
 from environment_indices import (  # noqa: E402
     INDEX_DEFS,
     classify_state,
@@ -239,6 +244,14 @@ class BackfillTests(unittest.TestCase):
     def test_period_parser(self):
         self.assertEqual(parse_period_days("2y"), 730)
         self.assertEqual(parse_period_days("18mo"), 540)
+
+    def test_backfill_end_date_waits_for_eod_files(self):
+        midday = pd.Timestamp("2026-08-03 11:30", tz="America/New_York")
+        evening = pd.Timestamp("2026-08-03 18:05", tz="America/New_York")
+        self.assertEqual(
+            latest_completed_nyse_day(midday), pd.Timestamp("2026-07-31"))
+        self.assertEqual(
+            latest_completed_nyse_day(evening), pd.Timestamp("2026-08-03"))
 
     def test_low_frequency_fill_does_not_inflate_effective_observations(self):
         index = pd.date_range("2024-01-05", periods=80, freq="W-FRI")

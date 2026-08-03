@@ -29,6 +29,7 @@ if CONFIG_DIR not in sys.path:
 logger = logging.getLogger("option_fragility_backfill")
 logging.basicConfig(
     level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+logging.getLogger("ib_insync").setLevel(logging.WARNING)
 
 DEFAULT_SYMBOLS = [
     "SPY", "QQQ", "AAPL", "MSFT", "GOOGL",
@@ -180,9 +181,14 @@ def fetch_ib_iv_history(symbols: Iterable[str], start_date: pd.Timestamp,
         raise RuntimeError("IB回填需要 ib_insync") from exc
 
     ib = IB()
+    ib.RequestTimeout = 30
     history: Dict[str, pd.Series] = {}
     try:
-        ib.connect(host, port, clientId=client_id, timeout=20)
+        # IB.connect() also synchronizes positions, account updates and
+        # executions. A read-only Gateway can leave those requests pending even
+        # though historical market data is usable, so this collector opens only
+        # the underlying API socket.
+        ib.client.connect(host, port, clientId=client_id, timeout=20)
         duration_years = max(1, math.ceil((end_date - start_date).days / 365))
         end_text = (end_date + pd.Timedelta(days=1)).strftime(
             "%Y%m%d 23:59:59 US/Eastern")
@@ -212,7 +218,9 @@ def fetch_ib_iv_history(symbols: Iterable[str], start_date: pd.Timestamp,
                 history[symbol] = series.loc[start_date:end_date]
                 logger.info("IB %s IV history: %d rows", symbol, len(history[symbol]))
             except Exception as exc:
-                logger.warning("IB %s IV回填失败: %s", symbol, exc)
+                logger.warning(
+                    "IB %s IV回填失败: %s: %s",
+                    symbol, type(exc).__name__, exc)
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -313,10 +321,12 @@ def _parse_args(argv=None):
 
 def main(argv=None):
     args = _parse_args(argv)
-    from backfill_history import finalized_keys, nyse_days, parse_period_days
+    from backfill_history import (
+        finalized_keys, latest_completed_nyse_day, nyse_days, parse_period_days,
+    )
 
     symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
-    output_end = pd.Timestamp.now(tz="America/New_York").tz_localize(None).normalize()
+    output_end = latest_completed_nyse_day()
     output_start = output_end - pd.Timedelta(days=parse_period_days(args.period))
     days = nyse_days(output_start, output_end)
     rows: List[dict] = []

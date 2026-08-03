@@ -129,8 +129,8 @@ class LiquidityScoreTests(unittest.TestCase):
             tightening.pillars["flow_pulse"].score,
         )
 
-    def test_calc_version_is_v2_1(self):
-        self.assertEqual(CALC_VERSION, "liquidity_v2.1")
+    def test_calc_version_is_v2_2(self):
+        self.assertEqual(CALC_VERSION, "liquidity_v2.2")
 
     def test_missing_data_never_defaults_to_healthy(self):
         index = pd.bdate_range("2026-01-02", periods=5)
@@ -155,6 +155,21 @@ class LiquidityScoreTests(unittest.TestCase):
         self.assertIn("有效观测", summary)
         self.assertIn("5/60", summary)
         self.assertIn("数值越高越充足", summary)
+
+    def test_pillar_coverage_is_separate_from_sample_maturity(self):
+        index = pd.bdate_range("2025-01-02", periods=80)
+        frame = pd.DataFrame(index=index)
+        frame["pct_20ma"] = np.linspace(35.0, 65.0, len(index))
+        frame["pct_50ma"] = np.linspace(40.0, 70.0, len(index))
+        frame["pct_200ma"] = np.linspace(45.0, 75.0, len(index))
+        for column in list(frame.columns):
+            frame[f"{column}_source_date"] = index
+        result = score_liquidity_frame(frame)
+        pillar = result.pillars["market_distribution"]
+        self.assertIsNotNone(pillar.score)
+        self.assertGreater(pillar.coverage, 0.60)
+        self.assertLess(pillar.maturity, 0.40)
+        self.assertIn("样本成熟度", format_liquidity_summary(result))
 
     def test_vix_curve_contract_keeps_two_distinct_columns(self):
         columns = {spec.column for spec in COMPONENTS}
@@ -230,6 +245,27 @@ class LiquidityScoreTests(unittest.TestCase):
 
 
 class LiquiditySourceTests(unittest.TestCase):
+    def test_daily_market_metrics_fall_back_to_record_date_only(self):
+        market_rows = [{
+            "record_date": "2026-01-08",
+            "source_date": None,
+            "pct_20ma": 58.0,
+            "fed_assets": 6500.0,
+            "full_metrics": {},
+        }]
+
+        def fake_rows(_supabase, table, _date_col, _start, _end):
+            return pd.DataFrame(market_rows if table == "market_history" else [])
+
+        with patch("liquidity_monitor._fetch_rows", side_effect=fake_rows), patch(
+                "liquidity_monitor._fetch_metric_daily_rows",
+                return_value=pd.DataFrame()):
+            frame = build_database_frame(None, "2026-01-01", "2026-01-09")
+        row = frame.iloc[-1]
+        self.assertEqual(
+            row["pct_20ma_source_date"], pd.Timestamp("2026-01-08"))
+        self.assertTrue(pd.isna(row["fed_assets_b_source_date"]))
+
     def test_database_fallback_uses_native_fred_dates(self):
         market_rows = [{
             "record_date": "2026-01-09",

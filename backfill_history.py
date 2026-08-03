@@ -55,6 +55,25 @@ def nyse_days(start, end):
     return pd.DatetimeIndex(schedule.index).tz_localize(None).normalize()
 
 
+def latest_completed_nyse_day(now=None):
+    """Return the latest session whose EOD vendor files should be complete."""
+    current = pd.Timestamp(now) if now is not None else pd.Timestamp.now(
+        tz="America/New_York")
+    if current.tzinfo is None:
+        current = current.tz_localize("America/New_York")
+    else:
+        current = current.tz_convert("America/New_York")
+    # Theta EOD is generated after 17:15 ET; 18:00 leaves a conservative buffer
+    # for all backfill sources and prevents intraday partial rows.
+    candidate = current.normalize()
+    if current.hour < 18:
+        candidate -= pd.Timedelta(days=1)
+    sessions = nyse_days(candidate - pd.Timedelta(days=14), candidate)
+    if sessions.empty:
+        raise RuntimeError("未找到已完成的NYSE交易日")
+    return sessions[-1]
+
+
 def fetch_yf(fetch_start):
     logger.info("拉取 yfinance 日频历史，起点 %s", fetch_start.date())
     df = yf.download(
@@ -240,7 +259,7 @@ def main():
     include_finra = "finra" in args
     period = next((arg for arg in args if arg.endswith("y") or arg.endswith("mo")), "2y")
     period_days = parse_period_days(period)
-    output_end = pd.Timestamp.now(tz="America/New_York").tz_localize(None).normalize()
+    output_end = latest_completed_nyse_day()
     output_start = output_end - pd.Timedelta(days=period_days)
     # NFCI 为周频；多取约六年用于形成最多252个原生观测的基准。
     fetch_start = output_start - pd.Timedelta(days=6 * 365)

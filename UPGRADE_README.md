@@ -294,12 +294,14 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 - 执行新版 migrations.sql 创建 liquidity_daily 后，再部署三个新增模块和
   auto_analyst.py。第一版保持 shadow_mode=true，不接入 ALERT_GATE 或仓位。
 
-### V2.1口径与可靠性修正
+### V2.2口径与可靠性修正
 
-- `calc_version=liquidity_v2.1`。VIX期货M2/M1升贴水与现货VIX/VIX3M比率分列保存、
+- `calc_version=liquidity_v2.2`。VIX期货M2/M1升贴水与现货VIX/VIX3M比率分列保存、
   分别计算分位，禁止在同一历史序列中混用。数据库中的V1记录保留，可按版本追溯。
 - 水位仪采用支持方向刻度：`0` 表示流动性支持最弱，`100` 表示支持最强，数值越高
   越充足。综合分只对达到门槛的柱加权，因此必须与有效覆盖率一起解读。
+- 柱内“分量覆盖”和“样本成熟度”分开显示：是否发布柱分数由覆盖决定，成熟度继续
+  参与柱内权重及综合有效覆盖，避免已有三个成熟广度分量却因二次折扣显示数据不足。
 - 原始业务表仍为第一优先级；表内缺日时，水位仪用 `metric_daily` 的EOD宏观历史
   补齐广度、VVIX、SKEW及VIX曲线。旧字段 `vix_contango_pct` 只有来源明确为
   `macro_spot_daily` 或 `yfinance` 才分别映射为期货曲线或VIX/VIX3M曲线，未知来源
@@ -312,14 +314,15 @@ severity/confidence/lag_days/layer/...），可直接回测调参。
 - 官方HTTP源增加指数退避重试，财政部DTS接口支持分页；数据库写入失败会出现在
   邮件摘要和数据质量日志中。图表缺少核心数据时明确显示“数据不足”，不再把点画在
   中性位置。
-- V2仍为研究性影子输出。部署后至少观察3至5个完整交易日，重点检查官方源覆盖率、
+- V2.2仍为研究性影子输出。部署后至少观察3至5个完整交易日，重点检查官方源覆盖率、
   融资/信用护栏触发率、缺日合并和PNG附件，再决定是否调整绝对阈值；不得直接接入
   告警或仓位决策。
 
 ### 一次性补齐市场分配、尾部韧性和期权脆弱度
 
 先重新运行通用回补。新版会增加 `^SKEW`，并让水位仪复用已经存在的广度、VVIX和
-VIX/VIX3M历史：
+VIX/VIX3M历史。脚本自动把结束日限制为18:00 ET后数据源已完成的最近NYSE交易日，
+盘中执行也不会写入当天未完成行情：
 
 ```bash
 cd /home/winters_dong426/market_dashboard
@@ -336,15 +339,24 @@ TWS/IB Gateway已连接且有相应行情权限的环境运行：
 /usr/bin/python3 backfill_option_fragility.py --source ib --period 2y --write
 ```
 
+IB连接只打开历史行情socket，不同步账户或订单；单个请求30秒超时。若日志显示HMDS
+农场断线，脚本会保留IVR为缺失并退出，待Gateway恢复后重跑，不用降低面板门槛。
+
 ThetaData阶段按交易日读取EOD Greeks与当日上午可知的上一收盘OI，回建ATM预期波幅和
 0-7D净Gamma。新版 `thetadata` Python库要求Python 3.12+；用已安装该库且配置了
-`THETADATA_API_KEY`的解释器执行：
+`THETADATA_API_KEY`的解释器执行。当前云端使用隔离环境
+`~/market_dashboard/.venv_option_backfill`，不修改Miniconda base：
 
 ```bash
-<python3.12> backfill_option_fragility.py \
-  --source theta --period 6mo --audit-csv /tmp/option_fragility_theta.csv
-<python3.12> backfill_option_fragility.py --source theta --period 6mo --write
+.venv_option_backfill/bin/python backfill_option_fragility.py \
+  --source theta --period 6mo --symbols SPY,QQQ \
+  --audit-csv option_fragility_theta_spy_qqq_6mo.csv
+.venv_option_backfill/bin/python backfill_option_fragility.py \
+  --source theta --period 6mo --symbols SPY,QQQ --write
 ```
+
+SPY与QQQ足以让预期波幅和短Gamma两个分量越过50%发布门槛；其余标的继续通过日常
+采集积累，避免一次性回填产生数千个不必要的供应商请求。
 
 两个阶段都不会覆盖 `is_final=true` 的EOD生产快照，也不新增cron。回补后检查独立
 来源日期是否达到60个，再等待下一次 `auto_analyst.py` 正常盘后运行：
