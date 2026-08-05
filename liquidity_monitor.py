@@ -20,7 +20,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-CALC_VERSION = "liquidity_v2.2"
+CALC_VERSION = "liquidity_v2.3"
 SHADOW_MODE = True
 MIN_PILLAR_COVERAGE = 0.35
 MIN_COMPOSITE_COVERAGE = 0.50
@@ -190,6 +190,7 @@ class LiquidityResult:
     drags: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     context: Dict[str, Optional[float]] = field(default_factory=dict)
+    change_attribution: Dict[str, object] = field(default_factory=dict)
     shadow_mode: bool = SHADOW_MODE
     calc_version: str = CALC_VERSION
     persistence_status: str = "not_attempted"
@@ -204,6 +205,7 @@ class LiquidityResult:
             "drags": self.drags,
             "warnings": self.warnings,
             "context": self.context,
+            "change_attribution": self.change_attribution,
         }
         return {
             "report_date": self.report_date,
@@ -722,6 +724,41 @@ def _business_day_change(frame: pd.DataFrame, column: str,
     return float(values.iloc[-1] - baseline.iloc[-1])
 
 
+def _net_liquidity_attribution(frame: pd.DataFrame, report_date: pd.Timestamp,
+                               business_days: int) -> Dict[str, object]:
+    contributions = {
+        "fed_assets_contribution_b": _business_day_change(
+            frame, "fed_assets_b", report_date, business_days),
+        "tga_contribution_b": None,
+        "rrp_contribution_b": None,
+    }
+    tga_change = _business_day_change(
+        frame, "tga_b", report_date, business_days)
+    rrp_change = _business_day_change(
+        frame, "rrp_b", report_date, business_days)
+    if tga_change is not None:
+        contributions["tga_contribution_b"] = -tga_change
+    if rrp_change is not None:
+        contributions["rrp_contribution_b"] = -rrp_change
+    net_change = _business_day_change(
+        frame, "net_liq_b", report_date, business_days)
+    values = list(contributions.values())
+    attributed = sum(values) if all(value is not None for value in values) else None
+    residual = (
+        net_change - attributed
+        if net_change is not None and attributed is not None else None)
+    return {
+        "window_business_days": business_days,
+        "net_liquidity_change_b": net_change,
+        **contributions,
+        "attributed_change_b": attributed,
+        "residual_b": residual,
+        "quality": (
+            "OK" if residual is not None and abs(residual) <= 0.05
+            else "INCOMPLETE_OR_MISMATCH"),
+    }
+
+
 def score_liquidity_frame(frame: pd.DataFrame,
                           report_date: Optional[str] = None) -> LiquidityResult:
     if frame.empty:
@@ -786,6 +823,10 @@ def score_liquidity_frame(frame: pd.DataFrame,
     context = {
         key: _latest_value(frame, key, as_of) for key in context_columns
     }
+    change_attribution = {
+        "latest": _net_liquidity_attribution(frame, as_of, 1),
+        "20d": _net_liquidity_attribution(frame, as_of, 20),
+    }
     state, detail = _classify(pillars, coverage, context)
     eligible = [
         component for component in components
@@ -838,6 +879,7 @@ def score_liquidity_frame(frame: pd.DataFrame,
         drags=drags,
         warnings=warnings,
         context=context,
+        change_attribution=change_attribution,
     )
 
 
@@ -909,6 +951,17 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
         lines.append("主要支撑：" + "；".join(result.supports))
     if result.drags:
         lines.append("主要拖累：" + "；".join(result.drags))
+    for key, label in (("latest", "最近1日"), ("20d", "20日")):
+        attribution = (result.change_attribution or {}).get(key, {})
+        if attribution.get("quality") == "OK":
+            lines.append(
+                f"{label}净流动性变化归因："
+                f"总变化 {attribution['net_liquidity_change_b']:+.2f}B | "
+                f"TGA {attribution['tga_contribution_b']:+.2f}B | "
+                f"RRP {attribution['rrp_contribution_b']:+.2f}B | "
+                f"Fed Assets {attribution['fed_assets_contribution_b']:+.2f}B")
+        else:
+            lines.append(f"{label}净流动性变化归因：数据不足或分项与总量不一致")
     if result.warnings:
         lines.append("结构提示：" + "；".join(result.warnings))
     lines.append("注：DIX/FINRA/GEX仅展示上下文，方向未经验证，不直接计分。")

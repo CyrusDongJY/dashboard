@@ -22,7 +22,9 @@ from market_utils import (
 )
 from data_contracts import (
     calculate_iv_rank_percentile,
+    classify_vix_curve,
     gap_acceptance,
+    oi_verification_quality,
     opening_probability,
     option_trade_side,
     volume_profile_nodes,
@@ -443,9 +445,12 @@ def get_vix_term_structure(ib):
         if m1_px is None or m2_px is None or m1_px <= 0 or m2_px <= 0:
             return "⚠️ VIX 延迟快照价格异常或不可用。\n", {}
 
-        diff = m2_px - m1_px
-        contango_pct = (diff / m1_px) * 100 if m1_px != 0 else 0
-        structure_type = "Contango (升水)" if diff > 0 else "Backwardation (贴水倒挂)"
+        curve_state, contango_pct = classify_vix_curve(m1_px, m2_px)
+        structure_type = {
+            "CONTANGO": "Contango (升水)",
+            "BACKWARDATION": "Backwardation (贴水倒挂)",
+            "FLAT": "Flat (平坦)",
+        }[curve_state]
 
         report += f"近月 (M1 - {m1_fut.lastTradeDateOrContractMonth}): {m1_px:.2f}\n"
         report += f"次月 (M2 - {m2_fut.lastTradeDateOrContractMonth}): {m2_px:.2f}\n"
@@ -453,7 +458,11 @@ def get_vix_term_structure(ib):
         report += f"价差比例: {contango_pct:+.2f}%\n"
 
         return report, {
-            "vix_m1": round(m1_px, 2), "vix_m2": round(m2_px, 2), "vix_contango_pct": round(contango_pct, 2)
+            "vix_m1": round(m1_px, 2), "vix_m2": round(m2_px, 2),
+            "vix_contango_pct": round(contango_pct, 2),
+            "vix_curve_state": curve_state,
+            "vix_curve_flat_abs_threshold": 0.10,
+            "vix_curve_flat_pct_threshold": 0.50,
         }
     except Exception as e: 
         return f"⚠️ VIX 异常报错: {e}\n", {}
@@ -550,6 +559,47 @@ def get_unusual_options_activity(ib, symbol):
                 if qualified: all_opt_contracts.extend(qualified)
             except: pass
 
+        # Pending events may sit outside today's first two expiries or +/-12%
+        # scan universe. Qualify their exact contracts so verification coverage
+        # is not capped by the discovery sampler.
+        pending_opts = []
+        active_prior_events = []
+        for prior in prior_events:
+            try:
+                expiry = str(prior.get('expiry')).replace('-', '')[:8]
+                if datetime.strptime(expiry, '%Y%m%d').date() < now:
+                    terminal = dict(prior)
+                    terminal.update({
+                        'verification_date': report_date,
+                        'verification_attempt_date': report_date,
+                        'verification_status': 'EXPIRED_UNVERIFIED',
+                        'new_position_probability': 'UNKNOWN',
+                    })
+                    safe_upsert(
+                        supabase, 'option_volume_anomalies', terminal,
+                        conflict_cols='report_date,symbol,expiry,strike,right')
+                    continue
+                active_prior_events.append(prior)
+                pending_opts.append(Option(
+                    symbol, expiry, float(prior.get('strike')),
+                    str(prior.get('right')), 'SMART',
+                    tradingClass=getattr(chain, 'tradingClass', None)))
+            except (TypeError, ValueError):
+                continue
+        prior_events = active_prior_events
+        if pending_opts:
+            try:
+                all_opt_contracts.extend(ib.qualifyContracts(*pending_opts) or [])
+            except Exception as exc:
+                logger.warning(f"{symbol} 待验证OI合约资格确认失败: {exc}")
+        deduplicated = {}
+        for contract in all_opt_contracts:
+            key = (
+                str(contract.lastTradeDateOrContractMonth)[:8],
+                float(contract.strike), str(contract.right))
+            deduplicated[key] = contract
+        all_opt_contracts = list(deduplicated.values())
+
         anomalies = []
         snapshots = {}
         for i in range(0, len(all_opt_contracts), BATCH_SIZE):
@@ -561,21 +611,27 @@ def get_unusual_options_activity(ib, symbol):
                     if t is None or getattr(t, 'contract', None) is None: continue
                     r = getattr(t.contract, 'right', None)
                     oi = getattr(t, 'callOpenInterest' if r == 'C' else 'putOpenInterest', getattr(t, 'openInterest', 0))
-                    if oi is None or (isinstance(oi, float) and math.isnan(oi)): oi = 0
+                    try:
+                        oi = float(oi)
+                        if not math.isfinite(oi) or oi < 0:
+                            oi = None
+                    except (TypeError, ValueError):
+                        oi = None
                     
                     vol = t.volume
                     if vol is None or (isinstance(vol, float) and math.isnan(vol)): vol = 0
                     expiry = t.contract.lastTradeDateOrContractMonth[:8]
                     key = (expiry, float(t.contract.strike), r)
                     snapshot = {
-                        'oi': int(oi), 'volume': int(vol),
+                        'oi': int(oi) if oi is not None else None,
+                        'volume': int(vol),
                         'bid': getattr(t, 'bid', None),
                         'ask': getattr(t, 'ask', None),
                         'last': getattr(t, 'last', None),
                     }
                     snapshots[key] = snapshot
                     
-                    if oi > 100 and vol > 500 and (vol / oi) >= 3.0:
+                    if oi is not None and oi > 100 and vol > 500 and (vol / oi) >= 3.0:
                         anomalies.append({
                             'Exp': expiry, 'Strike': float(t.contract.strike),
                             'Right': r, 'Vol': int(vol), 'OI': int(oi),
@@ -597,6 +653,24 @@ def get_unusual_options_activity(ib, symbol):
                 )
                 current = snapshots.get(key)
                 if current is None:
+                    update = dict(prior)
+                    update.update({
+                        'verification_attempt_date': report_date,
+                        'verification_status': 'CONTRACT_NOT_SAMPLED',
+                    })
+                    safe_upsert(
+                        supabase, 'option_volume_anomalies', update,
+                        conflict_cols='report_date,symbol,expiry,strike,right')
+                    continue
+                if current.get('oi') is None:
+                    update = dict(prior)
+                    update.update({
+                        'verification_attempt_date': report_date,
+                        'verification_status': 'OI_UNAVAILABLE',
+                    })
+                    safe_upsert(
+                        supabase, 'option_volume_anomalies', update,
+                        conflict_cols='report_date,symbol,expiry,strike,right')
                     continue
                 oi_change = current['oi'] - int(prior.get('open_interest') or 0)
                 update = dict(prior)
@@ -606,6 +680,9 @@ def get_unusual_options_activity(ib, symbol):
                     'oi_change': oi_change,
                     'new_position_probability': opening_probability(
                         prior.get('volume'), oi_change),
+                    'verification_attempt_date': report_date,
+                    'verification_status': 'VERIFIED',
+                    'classification_method': 'NEXT_DAY_OI_VERIFIED_HEURISTIC_V2',
                 })
                 if safe_upsert(
                         supabase, 'option_volume_anomalies', update,
@@ -627,10 +704,11 @@ def get_unusual_options_activity(ib, symbol):
                 and item['Right'] != event['Right']
                 and item['Strike'] == event['Strike']
             ]
-            event['SpreadStatus'] = (
+            event['SameSnapshotPattern'] = (
                 'POSSIBLE_STRADDLE_OR_COMBO' if opposite_same_strike
                 else ('POSSIBLE_VERTICAL' if same_expiry_right else 'SINGLE_LEG_ONLY')
             )
+            event['SpreadStatus'] = 'UNVERIFIED_NO_TRADE_LINKAGE'
             payload = {
                 'report_date': report_date,
                 'symbol': symbol,
@@ -641,7 +719,8 @@ def get_unusual_options_activity(ib, symbol):
                 'ask': event['Ask'], 'last_price': event['Last'],
                 'trade_side': event['TradeSide'],
                 'spread_status': event['SpreadStatus'],
-                'classification_method': 'QUOTE_AND_NEXT_DAY_OI_HEURISTIC_V1',
+                'same_snapshot_pattern': event['SameSnapshotPattern'],
+                'classification_method': 'QUOTE_CLUSTER_PENDING_NEXT_DAY_OI_V2',
             }
             attach_metadata(payload, source_date=report_date)
             safe_upsert(
@@ -657,9 +736,26 @@ def get_unusual_options_activity(ib, symbol):
                     f"   [{row['Exp']}] ${row['Strike']} {row['Right']} -> "
                     f"成交 {row['Vol']}手 / OI {row['OI']}手 | "
                     f"{row['Ratio']:.1f}x | {row['TradeSide']} | "
-                    f"{row['SpreadStatus']}\n")
+                    f"候选聚类={row['SameSnapshotPattern']} | 结构未验证\n")
         if prior_events:
-            report += f"次日OI验证: {verified}/{len(prior_events)}条已补充（概率为启发式分类）。\n"
+            verification = oi_verification_quality(verified, len(prior_events))
+            report += (
+                f"次日OI验证: {verified}/{len(prior_events)}条 | "
+                f"覆盖 {verification['coverage_pct']:.1f}% | "
+                f"质量 {verification['quality']}。\n")
+            if not verification['structure_inference_eligible']:
+                report += (
+                    "结构归因：禁用（覆盖不足；不得据此判断新开/平仓、"
+                    "垂直价差、跨式或单腿方向）。\n")
+            log_data_quality(
+                supabase, job_name='daily_post_close_oi_verification',
+                table_name='option_volume_anomalies',
+                status=('ok' if verification['quality'] == 'OK' else 'partial'),
+                rows_written=verified,
+                notes=(f"symbol={symbol}; verified={verified}; "
+                       f"pending={len(prior_events)}; "
+                       f"quality={verification['quality']}"),
+            )
         return report
     except Exception as e: return report + f"⚠️ 异动扫描报错: {e}\n"
 

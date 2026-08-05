@@ -600,11 +600,27 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
                     if m not in g.columns:
                         continue
                     metric_series = g[m]
+                    if (m == 'expected_move_pct'
+                            and 'expected_move_decision_eligible' in g.columns):
+                        metric_series = g.loc[
+                            g['expected_move_decision_eligible'] == True, m]  # noqa: E712
+                    if (m.startswith('gamma_') or m in (
+                            'short_gamma_m', 'long_gamma_m', 'zgl_price')):
+                        if 'gamma_quality' in g.columns:
+                            quality_ok = g['gamma_quality'].apply(
+                                lambda value: isinstance(value, dict)
+                                and value.get('ALL') == 'OK')
+                            metric_series = g.loc[quality_ok, m]
                     if (m.startswith('distance_to_')
                             and 'distance_sign_version' in g.columns):
                         metric_series = g.loc[
                             g['distance_sign_version'] == 'LEVEL_MINUS_SPOT_V2', m]
-                    source_cols = ('dpsv_source_date', 'source_date') if m == 'dpsv_pct' else ('source_date',)
+                    if m == 'dpsv_pct':
+                        source_cols = ('dpsv_source_date', 'source_date')
+                    elif m == 'expected_move_pct':
+                        source_cols = ('expected_move_source_date', 'source_date')
+                    else:
+                        source_cols = ('source_date',)
                     src = _metric_source_date(g, m, 'date', source_cols)
                     events += scan_metric(
                         m, metric_series, report_date, scope=tkr, source_date=src)

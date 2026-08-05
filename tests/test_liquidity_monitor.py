@@ -129,8 +129,8 @@ class LiquidityScoreTests(unittest.TestCase):
             tightening.pillars["flow_pulse"].score,
         )
 
-    def test_calc_version_is_v2_2(self):
-        self.assertEqual(CALC_VERSION, "liquidity_v2.2")
+    def test_calc_version_is_v2_3(self):
+        self.assertEqual(CALC_VERSION, "liquidity_v2.3")
 
     def test_missing_data_never_defaults_to_healthy(self):
         index = pd.bdate_range("2026-01-02", periods=5)
@@ -183,6 +183,24 @@ class LiquidityScoreTests(unittest.TestCase):
         component = _score_component(frame, spec, frame.index[-1])
         expected = frame["net_liq_b"].diff(20).iloc[-1]
         self.assertAlmostEqual(component.signal_value, expected, places=4)
+
+    def test_net_liquidity_change_attribution_reconciles(self):
+        frame = synthetic_frame(True)
+        frame["net_liq_b"] = (
+            frame["fed_assets_b"] - frame["tga_b"] - frame["rrp_b"])
+        result = score_liquidity_frame(frame)
+        attribution = result.change_attribution['20d']
+        self.assertEqual(attribution['quality'], 'OK')
+        total = (
+            attribution['fed_assets_contribution_b']
+            + attribution['tga_contribution_b']
+            + attribution['rrp_contribution_b'])
+        self.assertAlmostEqual(
+            total, attribution['net_liquidity_change_b'], places=6)
+        summary = format_liquidity_summary(result)
+        self.assertIn('20日净流动性变化归因', summary)
+        self.assertIn('最近1日净流动性变化归因', summary)
+        self.assertIn('TGA', summary)
 
     def test_relative_funding_tail_needs_absolute_guard(self):
         state, _ = _classify(

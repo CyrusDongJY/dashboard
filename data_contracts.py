@@ -363,6 +363,31 @@ def opening_probability(volume, oi_change):
     return 'LOW'
 
 
+def oi_verification_quality(verified_count, pending_count):
+    """Return a fail-closed global quality label for next-day OI verification."""
+    try:
+        verified = max(0, int(verified_count))
+        pending = max(0, int(pending_count))
+    except (TypeError, ValueError):
+        return {'coverage_pct': None, 'quality': 'INVALID_COUNTS',
+                'structure_inference_eligible': False}
+    if pending == 0:
+        return {'coverage_pct': None, 'quality': 'NO_PENDING_EVENTS',
+                'structure_inference_eligible': False}
+    coverage = verified / pending * 100.0
+    if coverage >= 80:
+        quality = 'OK'
+    elif coverage >= 50:
+        quality = 'PARTIAL'
+    else:
+        quality = 'LOW_COVERAGE'
+    return {
+        'coverage_pct': coverage,
+        'quality': quality,
+        'structure_inference_eligible': quality == 'OK',
+    }
+
+
 def classify_hyg_tlt(hyg_return_pct, tlt_return_pct, ratio_return_pct):
     """Return a graded, attribution-aware credit-vs-duration label."""
     try:
@@ -417,3 +442,23 @@ def concentration_attribution(returns_pct, cap_weights, equal_weights,
         'group_contributions_pct': contributions,
     })
     return result
+
+
+VIX_FLAT_ABS_POINTS = 0.10
+VIX_FLAT_PCT = 0.50
+
+
+def classify_vix_curve(m1_price, m2_price):
+    """Classify the M1/M2 curve with an explicit near-zero dead band."""
+    try:
+        m1 = float(m1_price)
+        m2 = float(m2_price)
+    except (TypeError, ValueError):
+        return "UNAVAILABLE", None
+    if not all(math.isfinite(value) and value > 0 for value in (m1, m2)):
+        return "UNAVAILABLE", None
+    spread = m2 - m1
+    spread_pct = spread / m1 * 100.0
+    if abs(spread) < VIX_FLAT_ABS_POINTS or abs(spread_pct) < VIX_FLAT_PCT:
+        return "FLAT", spread_pct
+    return ("CONTANGO" if spread > 0 else "BACKWARDATION"), spread_pct

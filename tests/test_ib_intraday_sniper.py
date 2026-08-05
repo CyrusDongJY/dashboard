@@ -155,9 +155,22 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
             assert classify(1117, [1117, 1117], 10) == ("STALE_VALUE", 3)
             assert classify(1118, [1117, 1117], 181) == ("STALE_VALUE", 1)
             assert classify(1118, [1117, 1117], 10) == ("OK", 1)
+            assert classify(
+                1117, [1117], 10, prior_statuses=["STALE_VALUE"]
+            ) == ("STALE_VALUE", 2)
+            assert classify(
+                1117, [], 10, history_available=False
+            ) == ("HISTORY_UNAVAILABLE", 0)
+            assert classify(1117, [], None) == ("MISSING_TIMESTAMP", 1)
             print("STALE_BREADTH_OK")
         """)
         self.assertIn("STALE_BREADTH_OK", output)
+
+    def test_post_close_breadth_uses_record_date_schema(self):
+        source = Path("ib_intraday_sniper.py").read_text(encoding="utf-8")
+        self.assertIn(".select('record_date,pct_adv", source)
+        self.assertIn(".eq('record_date', today_str)", source)
+        self.assertNotIn(".select('date,pct_adv", source)
 
     def test_actionable_ib_errors_are_persisted(self):
         output = self._isolated_run("""

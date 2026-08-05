@@ -13,6 +13,9 @@ GAMMA_CURVE_VERSION = "gamma_curve_v2"
 GAMMA_BUCKETS = ("0DTE", "1-7D", "8-30D", "31-60D", "ALL")
 DISTANCE_SIGN_VERSION = "LEVEL_MINUS_SPOT_V2"
 MONTHLY_WALL_METHOD = "MAX_OI_BY_RIGHT_STANDARD_MONTHLY_V1"
+EXPECTED_MOVE_MAX_QUOTE_AGE_SECONDS = 300
+EXPECTED_MOVE_GAP_CONSUMED_THRESHOLD_PCT = 50.0
+GAMMA_MAX_IV_QUOTE_AGE_SECONDS = 300
 
 
 def finite_number(value, positive=False):
@@ -165,6 +168,19 @@ def format_premarket_symbol_summary(
     source_text = source_labels.get(price_source, price_source or "未知")
     em_pct = expected_move.get("pct") if expected_move else None
     em_quality = expected_move.get("quality") if expected_move else "MISSING"
+    em_eligible = (
+        expected_move.get("decision_eligible")
+        if expected_move and "decision_eligible" in expected_move
+        else em_quality == "OK")
+    em_decision_quality = (
+        expected_move.get("decision_quality", em_quality)
+        if expected_move else "MISSING")
+    em_decision_status = (
+        expected_move.get("decision_status", em_decision_quality)
+        if expected_move else "MISSING")
+    em_text = (
+        f"±{_compact_number(em_pct)}%"
+        if em_eligible else f"NA[{em_decision_status}]")
 
     skew = finite_number(iv_skew)
     skew_text = _compact_number(
@@ -173,7 +189,7 @@ def format_premarket_symbol_summary(
         f"{symbol} | 参考 {_compact_number(reference_price, prefix='$')} "
         f"({source_text}/{market_label}) | "
         f"昨收 {_compact_number(previous_close, prefix='$')} | "
-        f"预期 ±{_compact_number(em_pct)}% | "
+        f"预期 {em_text} | "
         f"PCR {_compact_number(oi_pcr)} | "
         f"Skew {skew_text}%"
     )
@@ -220,15 +236,19 @@ def format_premarket_symbol_summary(
     gamma_line = "  Gamma " + " | ".join(gamma_parts)
     all_gamma = gamma.get("ALL", {})
     coverage_line = None
-    if all_gamma.get("net_gamma_m") is not None:
+    if all_gamma:
         coverage_line = (
             "  覆盖 "
             f"有效{all_gamma.get('contract_count', 0)}/"
             f"请求{all_gamma.get('requested_contract_count', 0)} | "
             f"合约{_compact_number(all_gamma.get('coverage_pct'), digits=1)}% | "
+            f"资格{_compact_number(all_gamma.get('qualification_coverage_pct'), digits=1)}% | "
             f"OI{_compact_number(all_gamma.get('oi_coverage_pct'), digits=1)}% | "
+            f"ATM{_compact_number(all_gamma.get('atm_coverage_pct'), digits=1)}% | "
             f"C/P OI {_compact_number(all_gamma.get('call_oi_coverage_pct'), digits=1)}%/"
             f"{_compact_number(all_gamma.get('put_oi_coverage_pct'), digits=1)}% | "
+            f"平衡{_compact_number(all_gamma.get('call_put_balance_pct'), digits=1)}% | "
+            "Gamma$全链覆盖 NA[无全链分母] | "
             f"IV最旧{_compact_number(all_gamma.get('iv_quote_max_age_seconds'), digits=0)}秒"
         )
 
@@ -237,8 +257,8 @@ def format_premarket_symbol_summary(
         notices.append("未取得盘前价")
     elif market_label != "实时":
         notices.append(f"行情={market_label}")
-    if em_quality != "OK":
-        notices.append(f"预期振幅={em_quality}")
+    if not em_eligible:
+        notices.append(f"预期振幅={em_decision_status}")
     if iv_skew_quality not in (None, "OK"):
         notices.append(f"Skew={iv_skew_quality}")
     if bad_gamma:
@@ -247,6 +267,19 @@ def format_premarket_symbol_summary(
         notices.append(f"Flip={gamma_flip_quality}")
 
     lines = [headline, structure_line, gamma_line]
+    if not em_eligible and finite_number(em_pct, positive=True) is not None:
+        scores = expected_move.get("quality_scores") or {}
+        score_text = "/".join(
+            "NA" if scores.get(key) is None else f"{scores[key]:.0f}"
+            for key in ("source", "freshness", "atm_quote_coverage",
+                        "event", "premarket_gap"))
+        lines.append(
+            "  预期振幅原始值 "
+            f"±{_compact_number(em_pct)}% | 可靠性"
+            f"{_compact_number(expected_move.get('reliability_score'), digits=0)}/100 | "
+            f"分项源/时效/ATM/事件/缺口 {score_text} | "
+            f"盘前缺口消耗{_compact_number(expected_move.get('gap_consumed_pct'), digits=0)}% | "
+            f"事件={expected_move.get('event_status', 'UNKNOWN')}")
     if coverage_line:
         lines.append(coverage_line)
     if notices:
@@ -444,6 +477,9 @@ def expected_move_metrics(frame, spot, short_expiration, previous_iv=None,
         "atm_strike": None,
         "iv": None,
         "source_date": None,
+        "quote_coverage_pct": 0.0,
+        "quote_max_age_seconds": None,
+        "market_data_types": [],
     }
     spot = finite_number(spot, positive=True)
     if spot is None or frame.empty:
@@ -462,10 +498,21 @@ def expected_move_metrics(frame, spot, short_expiration, previous_iv=None,
     if "QuoteAsOf" in atm:
         quote_times = pd.to_datetime(atm["QuoteAsOf"], errors="coerce", utc=True).dropna()
         if not quote_times.empty:
-            result["source_date"] = quote_times.max().date().isoformat()
+            result["source_date"] = quote_times.min().date().isoformat()
 
     call_mid = finite_number(call.iloc[0].get("Mid"), positive=True) if not call.empty else None
     put_mid = finite_number(put.iloc[0].get("Mid"), positive=True) if not put.empty else None
+    result["quote_coverage_pct"] = (
+        sum(value is not None for value in (call_mid, put_mid)) / 2.0 * 100.0)
+    quote_ages = (pd.to_numeric(
+        atm["QuoteAgeSeconds"], errors="coerce").dropna()
+        if "QuoteAgeSeconds" in atm else pd.Series(dtype=float))
+    if not quote_ages.empty:
+        result["quote_max_age_seconds"] = float(quote_ages.max())
+    market_types = (pd.to_numeric(
+        atm["MarketDataType"], errors="coerce").dropna()
+        if "MarketDataType" in atm else pd.Series(dtype=float))
+    result["market_data_types"] = sorted(set(int(value) for value in market_types))
     if call_mid is not None and put_mid is not None:
         value = call_mid + put_mid
         result.update({
@@ -528,6 +575,121 @@ def expected_move_metrics(frame, spot, short_expiration, previous_iv=None,
             "iv": prior_iv,
             "source_date": previous_iv_date,
         })
+    return result
+
+
+def assess_expected_move_context(expected_move, previous_close, premarket_price,
+                                 report_date=None, event_status="UNKNOWN"):
+    """Separate a raw expected-move estimate from decision eligibility."""
+    result = deepcopy(expected_move or {})
+    raw_quality = result.get("quality", "MISSING")
+    score = {"OK": 100.0, "FALLBACK": 55.0, "STALE": 0.0}.get(
+        raw_quality, 0.0)
+    quality_scores = {
+        "source": score,
+        "freshness": 100.0,
+        "atm_quote_coverage": 100.0,
+        "event": None,
+        "premarket_gap": 100.0,
+    }
+    flags = []
+
+    if raw_quality != "OK":
+        flags.append(raw_quality)
+
+    source_date = result.get("source_date")
+    if report_date and source_date and str(source_date) != str(report_date):
+        flags.append("STALE_SOURCE_DATE")
+        quality_scores["freshness"] = 0.0
+        score = 0.0
+
+    ages = finite_number(result.get("quote_max_age_seconds"))
+    market_types = set(result.get("market_data_types") or [])
+    if raw_quality == "OK":
+        if result.get("quote_coverage_pct", 0) < 100:
+            flags.append("ATM_QUOTE_COVERAGE_INSUFFICIENT")
+            quality_scores["atm_quote_coverage"] = 40.0
+            score = min(score, 40.0)
+        if ages is None:
+            flags.append("QUOTE_AGE_UNKNOWN")
+            quality_scores["freshness"] = 40.0
+            score = min(score, 40.0)
+        elif ages > EXPECTED_MOVE_MAX_QUOTE_AGE_SECONDS:
+            flags.append("STALE_QUOTE")
+            quality_scores["freshness"] = 0.0
+            score = 0.0
+        if market_types.intersection({2, 4}):
+            flags.append("FROZEN_MARKET_DATA")
+            quality_scores["freshness"] = 0.0
+            score = 0.0
+        elif 3 in market_types:
+            flags.append("DELAYED_MARKET_DATA")
+            quality_scores["freshness"] = min(
+                quality_scores["freshness"], 60.0)
+            score = min(score, 60.0)
+        elif not market_types:
+            flags.append("MARKET_DATA_TYPE_UNKNOWN")
+            quality_scores["freshness"] = min(
+                quality_scores["freshness"], 60.0)
+            score = min(score, 60.0)
+
+    previous = finite_number(previous_close, positive=True)
+    current = finite_number(premarket_price, positive=True)
+    move_pct = finite_number(result.get("pct"), positive=True)
+    gap_pct = None
+    consumed_pct = None
+    if previous is not None and current is not None:
+        gap_pct = abs(current / previous - 1.0) * 100.0
+    if gap_pct is not None and move_pct is not None and move_pct > 0:
+        consumed_pct = gap_pct / move_pct * 100.0
+        if consumed_pct >= EXPECTED_MOVE_GAP_CONSUMED_THRESHOLD_PCT:
+            flags.append("PREMARKET_GAP_CONSUMED")
+            gap_score = 30.0 if consumed_pct >= 100 else 60.0
+            quality_scores["premarket_gap"] = gap_score
+            score = min(score, gap_score)
+
+    normalized_event = str(event_status or "UNKNOWN").upper()
+    if normalized_event == "EVENT_DAY":
+        flags.append("EVENT_DAY_REVIEW")
+        quality_scores["event"] = 50.0
+        score = min(score, 50.0)
+    elif normalized_event == "NORMAL":
+        quality_scores["event"] = 100.0
+    elif normalized_event not in ("NORMAL", "UNKNOWN"):
+        normalized_event = "UNKNOWN"
+
+    unique_flags = list(dict.fromkeys(flags))
+    if raw_quality == "MISSING":
+        decision_status = "MISSING"
+    elif raw_quality == "STALE" or any(
+            value in unique_flags for value in (
+                "STALE_SOURCE_DATE", "STALE_QUOTE", "FROZEN_MARKET_DATA")):
+        decision_status = "STALE"
+    elif raw_quality == "FALLBACK":
+        decision_status = "FALLBACK"
+    elif "EVENT_DAY_REVIEW" in unique_flags:
+        decision_status = "EVENT_DAY_REVIEW"
+    elif "PREMARKET_GAP_CONSUMED" in unique_flags:
+        decision_status = "PREMARKET_GAP_CONSUMED"
+    elif "ATM_QUOTE_COVERAGE_INSUFFICIENT" in unique_flags:
+        decision_status = "ATM_QUOTE_COVERAGE_INSUFFICIENT"
+    elif unique_flags:
+        decision_status = "REVIEW"
+    else:
+        decision_status = "OK"
+    decision_eligible = raw_quality == "OK" and score >= 70.0
+    result.update({
+        "raw_quality": raw_quality,
+        "decision_status": decision_status,
+        "decision_quality": "OK" if decision_eligible else "|".join(
+            unique_flags) or "MISSING",
+        "decision_eligible": decision_eligible,
+        "reliability_score": round(score, 1),
+        "quality_scores": quality_scores,
+        "premarket_gap_pct": gap_pct,
+        "gap_consumed_pct": consumed_pct,
+        "event_status": normalized_event,
+    })
     return result
 
 
@@ -688,7 +850,8 @@ def gamma_structure(frame, spot, grid_width=0.20, grid_points=161):
 
 def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
                              oi_valid_counts, side_counts=None,
-                             iv_quote_ages=None):
+                             iv_quote_ages=None, atm_counts=None,
+                             oi_weight_totals=None):
     """Suppress precise Gamma outputs when sampled-chain coverage is unusable."""
     result = deepcopy(structure)
     minimum_contracts = {
@@ -702,14 +865,33 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
         oi_valid = int(oi_valid_counts.get(bucket, 0) or 0)
         valid = int(metrics.get("contract_count", 0) or 0)
         coverage = valid / requested if requested > 0 else 0.0
+        qualification_coverage = qualified / requested if requested > 0 else 0.0
         details = (side_counts or {}).get(bucket, {})
         requested_calls = int(details.get("requested_calls", 0) or 0)
         requested_puts = int(details.get("requested_puts", 0) or 0)
         oi_calls = int(details.get("oi_calls", metrics.get("call_count", 0)) or 0)
         oi_puts = int(details.get("oi_puts", metrics.get("put_count", 0)) or 0)
-        oi_coverage = oi_valid / requested if requested > 0 else 0.0
-        call_oi_coverage = oi_calls / requested_calls if requested_calls > 0 else 0.0
-        put_oi_coverage = oi_puts / requested_puts if requested_puts > 0 else 0.0
+        qualified_calls = int(details.get("qualified_calls", requested_calls) or 0)
+        qualified_puts = int(details.get("qualified_puts", requested_puts) or 0)
+        oi_coverage = oi_valid / qualified if qualified > 0 else 0.0
+        call_oi_coverage = oi_calls / qualified_calls if qualified_calls > 0 else 0.0
+        put_oi_coverage = oi_puts / qualified_puts if qualified_puts > 0 else 0.0
+        side_max = max(call_oi_coverage, put_oi_coverage)
+        side_balance = (
+            min(call_oi_coverage, put_oi_coverage) / side_max
+            if side_max > 0 else 0.0)
+        atm = (atm_counts or {}).get(bucket, {})
+        atm_requested = int(atm.get("requested", 0) or 0)
+        atm_valid = int(atm.get("gamma_valid", 0) or 0)
+        atm_coverage = (
+            atm_valid / atm_requested if atm_requested > 0 else None)
+        weights = (oi_weight_totals or {}).get(bucket, {})
+        oi_weight_total = finite_number(weights.get("oi_total"))
+        gamma_input_oi = finite_number(weights.get("gamma_input_oi"))
+        gamma_input_oi_coverage = (
+            gamma_input_oi / oi_weight_total
+            if oi_weight_total is not None and oi_weight_total > 0
+            and gamma_input_oi is not None else None)
         ages = [finite_number(value) for value in (iv_quote_ages or {}).get(bucket, [])]
         ages = [value for value in ages if value is not None and value >= 0]
 
@@ -721,6 +903,21 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
             quality = "OI_MISSING"
         elif valid == 0:
             quality = "IV_MISSING"
+        elif qualification_coverage < 0.50:
+            quality = "LOW_QUALIFICATION_COVERAGE"
+        elif oi_coverage < 0.70:
+            quality = "LOW_OI_COVERAGE"
+        elif atm_coverage is not None and atm_coverage < 0.60:
+            quality = "LOW_ATM_COVERAGE"
+        elif (gamma_input_oi_coverage is not None
+              and gamma_input_oi_coverage < 0.80):
+            quality = "LOW_GAMMA_INPUT_COVERAGE"
+        elif side_counts is not None and side_balance < 0.50:
+            quality = "CALL_PUT_IMBALANCE"
+        elif iv_quote_ages is not None and not ages:
+            quality = "IV_TIMESTAMP_MISSING"
+        elif ages and max(ages) > GAMMA_MAX_IV_QUOTE_AGE_SECONDS:
+            quality = "STALE_IV_QUOTES"
         elif (
             valid < minimum_contracts[bucket]
             or coverage < 0.20
@@ -738,9 +935,19 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
             "qualified_contract_count": qualified,
             "oi_valid_contract_count": oi_valid,
             "coverage_pct": coverage * 100.0,
+            "qualification_coverage_pct": qualification_coverage * 100.0,
             "oi_coverage_pct": oi_coverage * 100.0,
             "call_oi_coverage_pct": call_oi_coverage * 100.0,
             "put_oi_coverage_pct": put_oi_coverage * 100.0,
+            "call_put_balance_pct": side_balance * 100.0,
+            "atm_coverage_pct": (
+                atm_coverage * 100.0 if atm_coverage is not None else None),
+            "gamma_input_oi_weight_coverage_pct": (
+                gamma_input_oi_coverage * 100.0
+                if gamma_input_oi_coverage is not None else None),
+            "gamma_dollar_coverage_pct": None,
+            "gamma_dollar_coverage_status": (
+                "UNAVAILABLE_NO_FULL_CHAIN_DENOMINATOR"),
             "iv_quote_max_age_seconds": max(ages) if ages else None,
             "raw_net_gamma_m": metrics.get("net_gamma_m"),
             "raw_primary_flip": metrics.get("primary_flip"),

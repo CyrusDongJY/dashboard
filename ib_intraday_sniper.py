@@ -48,14 +48,22 @@ UD_UNSUPPORTED_STATUS = 'UNSUPPORTED_BY_IBKR_CONTRACT'
 UD_UNSUPPORTED_SOURCE = 'UNAVAILABLE:IBKR_NO_UVOL_DVOL_INDEX_CONTRACT'
 
 
-def classify_breadth_status(value, prior_values, quote_age_seconds=None):
-    """Fail closed when an AD quote is missing, old, or repeated three times."""
+def classify_breadth_status(value, prior_values, quote_age_seconds=None,
+                            prior_statuses=None, history_available=True):
+    """Fail closed when an AD quote cannot be proven live.
+
+    A stale value is sticky for the same numeric print. Reconnecting to IBKR
+    must not turn a frozen AD value back into OK merely because the socket or
+    ticker timestamp refreshed.
+    """
     try:
         current = float(value)
     except (TypeError, ValueError):
         return 'MISSING_STREAM', 0
     if not math.isfinite(current):
         return 'MISSING_STREAM', 0
+    if not history_available:
+        return 'HISTORY_UNAVAILABLE', 0
     repeat_count = 1
     for prior in prior_values or []:
         try:
@@ -65,14 +73,18 @@ def classify_breadth_status(value, prior_values, quote_age_seconds=None):
             break
         repeat_count += 1
     try:
-        quote_is_old = (
-            quote_age_seconds is not None
-            and float(quote_age_seconds) > AD_MAX_QUOTE_AGE_SECONDS)
+        quote_age = float(quote_age_seconds)
+        quote_is_old = quote_age > AD_MAX_QUOTE_AGE_SECONDS
     except (TypeError, ValueError):
-        quote_is_old = False
+        return 'MISSING_TIMESTAMP', repeat_count
+    sticky_stale = any(
+        status in ('STALE_VALUE', 'MISSING_TIMESTAMP')
+        for status in (prior_statuses or [])[:repeat_count - 1]
+    )
     status = (
         'STALE_VALUE'
-        if repeat_count >= AD_REPEAT_THRESHOLD or quote_is_old else 'OK')
+        if (repeat_count >= AD_REPEAT_THRESHOLD or quote_is_old or sticky_stale)
+        else 'OK')
     return status, repeat_count
 
 # 日志防干扰设置
@@ -296,28 +308,25 @@ class GlobalSentinel:
                     time.sleep(2 ** (attempt - 1))
         return False
 
-    def recent_add_values(self, today_str, limit=2):
+    def recent_add_observations(self, today_str, limit=3):
         try:
             response = (supabase.table('intraday_logs')
-                        .select('add_raw,add_val,record_time')
+                        .select('add_raw,add_val,add_status,record_time')
                         .gte('record_time', f'{today_str} 00:00:00')
                         .lte('record_time', f'{today_str} 23:59:59')
                         .order('record_time', desc=True).limit(limit).execute())
-            return [
-                row.get('add_raw')
-                if row.get('add_raw') is not None else row.get('add_val')
-                for row in (response.data or [])
-            ]
+            return (response.data or []), True
         except Exception as exc:
             self.log(f"⚠️ AD重复值历史读取失败: {type(exc).__name__}: {exc}")
-            return []
+            return [], False
 
     def post_close_breadth_backup(self, today_str):
         """Use the independently collected close breadth only as a labeled proxy."""
         try:
             response = (supabase.table('market_history')
-                        .select('date,pct_adv,breadth_sample_size,trin_as_of')
-                        .eq('date', today_str).order('date', desc=True)
+                        .select('record_date,pct_adv,breadth_sample_size,trin_as_of')
+                        .eq('record_date', today_str)
+                        .order('record_date', desc=True)
                         .limit(1).execute())
             if not response.data:
                 return None
@@ -523,7 +532,11 @@ class GlobalSentinel:
         poc = optional_float(self.spot_ctx.get('poc_price'))
         pcr = optional_float(self.opt_ctx.get('oi_pcr'))
         exp_move_pct = optional_float(self.opt_ctx.get('expected_move_pct'))
-        exp_move = exp_move_pct / 100.0 if exp_move_pct is not None else None
+        exp_move_eligible = self.opt_ctx.get(
+            'expected_move_decision_eligible') is True
+        exp_move = (
+            exp_move_pct / 100.0
+            if exp_move_pct is not None and exp_move_eligible else None)
         prev_close = optional_float(
             self.opt_ctx.get('previous_close', self.opt_ctx.get('current_price')))
 
@@ -541,6 +554,11 @@ class GlobalSentinel:
             "pre_market_date": self.opt_ctx.get('date'),
             "pre_market_as_of": self.opt_ctx.get('quote_as_of') or self.opt_ctx.get('as_of_time'),
             "pre_market_context_quality": self.context_quality,
+            "expected_move_decision_eligible": exp_move_eligible,
+            "expected_move_decision_quality": self.opt_ctx.get(
+                'expected_move_decision_quality'),
+            "expected_move_decision_status": self.opt_ctx.get(
+                'expected_move_decision_status'),
             "spot_reference": self.opt_ctx.get('premarket_reference_price', self.opt_ctx.get('current_price')),
             "spot_reference_source": self.opt_ctx.get('premarket_price_source'),
             "gamma_scope": f"sampled_expirations_le_{gamma_max_dte}d",
@@ -643,10 +661,18 @@ class GlobalSentinel:
             vol_ratio = None
             vol_ratio_status = UD_UNSUPPORTED_STATUS
             add_raw = add_val
-            prior_add_values = self.recent_add_values(
+            prior_add_rows, add_history_available = self.recent_add_observations(
                 datetime.now(NY_TZ).strftime('%Y-%m-%d'))
+            prior_add_values = [
+                row.get('add_raw')
+                if row.get('add_raw') is not None else row.get('add_val')
+                for row in prior_add_rows
+            ]
+            prior_add_statuses = [row.get('add_status') for row in prior_add_rows]
             add_status, repeat_count = classify_breadth_status(
-                add_raw, prior_add_values, add_age_seconds)
+                add_raw, prior_add_values, add_age_seconds,
+                prior_statuses=prior_add_statuses,
+                history_available=add_history_available)
             if add_status != 'OK':
                 add_val = None
             today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
@@ -660,6 +686,7 @@ class GlobalSentinel:
                 "add_as_of": add_as_of,
                 "add_age_seconds": add_age_seconds,
                 "add_repeat_count": repeat_count,
+                "add_history_available": add_history_available,
                 "breadth_backup": breadth_backup,
                 "uvol_raw": None,
                 "dvol_raw": None,

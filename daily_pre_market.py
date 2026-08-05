@@ -24,6 +24,7 @@ from market_utils import (
 from pre_market_metrics import (
     DISTANCE_SIGN_VERSION,
     GAMMA_BUCKETS,
+    assess_expected_move_context,
     apply_gamma_quality_gate,
     calc_delta_gamma,
     calc_vanna_charm,
@@ -72,6 +73,22 @@ SYMBOLS = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA'
 
 supabase: Client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
 ib = IB()
+
+
+def configured_expected_move_event_status(symbol, report_date):
+    """Read an optional reviewed event calendar without inventing event dates."""
+    calendar = getattr(cfg, "EXPECTED_MOVE_EVENT_DATES", None)
+    complete = bool(getattr(cfg, "EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE", False))
+    if not calendar:
+        return "UNKNOWN"
+    if isinstance(calendar, dict):
+        dates = calendar.get(symbol, calendar.get("ALL", []))
+    else:
+        dates = calendar
+    normalized = {str(value)[:10] for value in (dates or [])}
+    if str(report_date)[:10] in normalized:
+        return "EVENT_DAY"
+    return "NORMAL" if complete else "UNKNOWN"
 
 # ================= 日志防干扰设置 =================
 logging.getLogger('ib_insync').setLevel(logging.ERROR)
@@ -552,6 +569,26 @@ def get_report():
                 for bucket in GAMMA_BUCKETS if bucket != "ALL"
             }
             requested_counts["ALL"] = sum(requested_counts.values())
+            atm_target_strikes = [
+                strike for strike in target_strikes
+                if abs(float(strike) / curr_price - 1.0) <= 0.05
+            ]
+            atm_counts = {
+                bucket: {
+                    "requested": len(expiration_coverage.get(bucket, []))
+                    * len(atm_target_strikes) * 2,
+                    "qualified": 0,
+                    "oi_valid": 0,
+                    "gamma_valid": 0,
+                }
+                for bucket in GAMMA_BUCKETS if bucket != "ALL"
+            }
+            atm_counts["ALL"] = {
+                "requested": sum(value["requested"] for value in atm_counts.values()),
+                "qualified": 0,
+                "oi_valid": 0,
+                "gamma_valid": 0,
+            }
             try: contracts = ib.qualifyContracts(*opts)
             except Exception: contracts = []
             
@@ -561,6 +598,8 @@ def get_report():
                 continue
 
             qualified_counts = {bucket: 0 for bucket in GAMMA_BUCKETS}
+            qualified_side_counts = {
+                bucket: {"C": 0, "P": 0} for bucket in GAMMA_BUCKETS}
             for contract in contracts:
                 try:
                     expiry = datetime.strptime(
@@ -569,6 +608,13 @@ def get_report():
                     if bucket:
                         qualified_counts[bucket] += 1
                         qualified_counts["ALL"] += 1
+                        right = str(getattr(contract, "right", "")).upper()
+                        if right in ("C", "P"):
+                            qualified_side_counts[bucket][right] += 1
+                            qualified_side_counts["ALL"][right] += 1
+                        if abs(float(contract.strike) / curr_price - 1.0) <= 0.05:
+                            atm_counts[bucket]["qualified"] += 1
+                            atm_counts["ALL"]["qualified"] += 1
                 except (TypeError, ValueError):
                     continue
             
@@ -634,6 +680,7 @@ def get_report():
                             'IV': iv, 'Delta': delta, 'T': years, 'DTE': dte_days,
                             'QuoteAsOf': quote_as_of,
                             'QuoteAgeSeconds': quote_age_seconds,
+                            'MarketDataType': getattr(t, "marketDataType", None),
                             'Vanna_W': (
                                 oi * vanna * 0.01 * 100 if vanna is not None else None),
                             'Charm_W': (
@@ -667,8 +714,17 @@ def get_report():
                         previous_context.get("date") if previous_context else None),
                     previous_iv_source=previous_iv_source,
                 )
-                if expected_move["quality"] == "MISSING":
-                    quality_issues.append(f"expected_move:{sym}")
+                expected_move = assess_expected_move_context(
+                    expected_move,
+                    price_snapshot.get("previous_close"),
+                    curr_price,
+                    report_date=today_str,
+                    event_status=configured_expected_move_event_status(
+                        sym, today_str),
+                )
+                if not expected_move["decision_eligible"]:
+                    quality_issues.append(
+                        f"expected_move:{sym}:{expected_move['decision_quality']}")
                 oi_pcr = put_call_oi_ratio(df)
                 if oi_pcr is None:
                     quality_issues.append(f"oi_pcr:{sym}")
@@ -681,6 +737,7 @@ def get_report():
                 oi_valid_counts = {bucket: 0 for bucket in GAMMA_BUCKETS}
                 side_counts = {}
                 iv_quote_ages = {}
+                oi_weight_totals = {}
                 for bucket in GAMMA_BUCKETS:
                     subset = (
                         df if bucket == "ALL" else
@@ -691,8 +748,28 @@ def get_report():
                     side_counts[bucket] = {
                         "requested_calls": requested_side,
                         "requested_puts": requested_side,
+                        "qualified_calls": qualified_side_counts[bucket]["C"],
+                        "qualified_puts": qualified_side_counts[bucket]["P"],
                         "oi_calls": int((subset["R"] == "C").sum()),
                         "oi_puts": int((subset["R"] == "P").sum()),
+                    }
+                    atm_subset = subset.loc[
+                        (pd.to_numeric(subset["S"], errors="coerce")
+                         / curr_price - 1.0).abs() <= 0.05]
+                    gamma_valid_subset = atm_subset.loc[
+                        pd.to_numeric(atm_subset["IV"], errors="coerce").gt(0)
+                        & pd.to_numeric(atm_subset["T"], errors="coerce").gt(0)]
+                    atm_counts[bucket]["oi_valid"] = int(len(atm_subset))
+                    atm_counts[bucket]["gamma_valid"] = int(
+                        len(gamma_valid_subset))
+                    all_gamma_valid = subset.loc[
+                        pd.to_numeric(subset["IV"], errors="coerce").gt(0)
+                        & pd.to_numeric(subset["T"], errors="coerce").gt(0)]
+                    oi_weight_totals[bucket] = {
+                        "oi_total": float(pd.to_numeric(
+                            subset["OI"], errors="coerce").fillna(0).sum()),
+                        "gamma_input_oi": float(pd.to_numeric(
+                            all_gamma_valid["OI"], errors="coerce").fillna(0).sum()),
                     }
                     iv_quote_ages[bucket] = pd.to_numeric(
                         subset.get("QuoteAgeSeconds"), errors="coerce"
@@ -700,7 +777,9 @@ def get_report():
                 gamma = apply_gamma_quality_gate(
                     gamma_structure(df, curr_price),
                     requested_counts, qualified_counts, oi_valid_counts,
-                    side_counts=side_counts, iv_quote_ages=iv_quote_ages)
+                    side_counts=side_counts, iv_quote_ages=iv_quote_ages,
+                    atm_counts=atm_counts,
+                    oi_weight_totals=oi_weight_totals)
                 for bucket in GAMMA_BUCKETS:
                     if gamma[bucket]["quality"] not in ("OK", "NO_EXPIRY"):
                         quality_issues.append(
@@ -841,6 +920,26 @@ def get_report():
                         "expected_move_quality": expected_move["quality"],
                         "expected_move_iv": _round_or_none(expected_move["iv"], 8),
                         "expected_move_source_date": expected_move["source_date"],
+                        "expected_move_decision_quality": expected_move[
+                            "decision_quality"],
+                        "expected_move_decision_status": expected_move[
+                            "decision_status"],
+                        "expected_move_decision_eligible": expected_move[
+                            "decision_eligible"],
+                        "expected_move_reliability_score": _round_or_none(
+                            expected_move["reliability_score"], 2),
+                        "expected_move_quality_scores": expected_move[
+                            "quality_scores"],
+                        "expected_move_quote_coverage_pct": _round_or_none(
+                            expected_move["quote_coverage_pct"], 2),
+                        "expected_move_quote_max_age_seconds": _round_or_none(
+                            expected_move["quote_max_age_seconds"], 2),
+                        "expected_move_premarket_gap_pct": _round_or_none(
+                            expected_move["premarket_gap_pct"], 4),
+                        "expected_move_gap_consumed_pct": _round_or_none(
+                            expected_move["gap_consumed_pct"], 2),
+                        "expected_move_event_status": expected_move[
+                            "event_status"],
                         "max_oi_strike": _round_or_none(max_oi["strike"], 4),
                         "max_oi_type": max_oi["right"],
                         "max_oi_expiry": (
@@ -886,12 +985,24 @@ def get_report():
                         "gamma_valid_contract_count": gamma["ALL"]["contract_count"],
                         "gamma_coverage_pct": _round_or_none(
                             gamma["ALL"]["coverage_pct"], 4),
+                        "gamma_qualification_coverage_pct": _round_or_none(
+                            gamma["ALL"]["qualification_coverage_pct"], 4),
                         "gamma_oi_coverage_pct": _round_or_none(
                             gamma["ALL"]["oi_coverage_pct"], 4),
                         "gamma_call_oi_coverage_pct": _round_or_none(
                             gamma["ALL"]["call_oi_coverage_pct"], 4),
                         "gamma_put_oi_coverage_pct": _round_or_none(
                             gamma["ALL"]["put_oi_coverage_pct"], 4),
+                        "gamma_atm_coverage_pct": _round_or_none(
+                            gamma["ALL"]["atm_coverage_pct"], 4),
+                        "gamma_call_put_balance_pct": _round_or_none(
+                            gamma["ALL"]["call_put_balance_pct"], 4),
+                        "gamma_input_oi_weight_coverage_pct": _round_or_none(
+                            gamma["ALL"][
+                                "gamma_input_oi_weight_coverage_pct"], 4),
+                        "gamma_dollar_coverage_pct": None,
+                        "gamma_dollar_coverage_status": gamma["ALL"][
+                            "gamma_dollar_coverage_status"],
                         "gamma_iv_quote_max_age_seconds": _round_or_none(
                             gamma["ALL"]["iv_quote_max_age_seconds"], 2),
                         "gamma_zeroes": gamma_zeroes,
@@ -936,12 +1047,23 @@ def get_report():
                             "qualified_contract_count": metrics["qualified_contract_count"],
                             "oi_valid_contract_count": metrics["oi_valid_contract_count"],
                             "coverage_pct": _round_or_none(metrics["coverage_pct"], 4),
+                            "qualification_coverage_pct": _round_or_none(
+                                metrics["qualification_coverage_pct"], 4),
                             "oi_coverage_pct": _round_or_none(
                                 metrics["oi_coverage_pct"], 4),
                             "call_oi_coverage_pct": _round_or_none(
                                 metrics["call_oi_coverage_pct"], 4),
                             "put_oi_coverage_pct": _round_or_none(
                                 metrics["put_oi_coverage_pct"], 4),
+                            "atm_coverage_pct": _round_or_none(
+                                metrics["atm_coverage_pct"], 4),
+                            "call_put_balance_pct": _round_or_none(
+                                metrics["call_put_balance_pct"], 4),
+                            "gamma_input_oi_weight_coverage_pct": _round_or_none(
+                                metrics["gamma_input_oi_weight_coverage_pct"], 4),
+                            "gamma_dollar_coverage_pct": None,
+                            "gamma_dollar_coverage_status": metrics[
+                                "gamma_dollar_coverage_status"],
                             "iv_quote_max_age_seconds": _round_or_none(
                                 metrics["iv_quote_max_age_seconds"], 2),
                             "call_count": metrics["call_count"],

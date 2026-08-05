@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 
 from pre_market_metrics import (
+    assess_expected_move_context,
     apply_gamma_quality_gate,
     distance_pct,
     expected_move_metrics,
@@ -22,7 +23,8 @@ from pre_market_metrics import (
 
 def option_row(
         expiration, strike, right, oi, iv=0.25, years=30 / 365,
-        dte=30, mid=None, delta=None):
+        dte=30, mid=None, delta=None, quote_age=None, market_data_type=None,
+        quote_as_of=None):
     return {
         "Exp": expiration,
         "S": float(strike),
@@ -33,6 +35,9 @@ def option_row(
         "DTE": dte,
         "Mid": mid,
         "Delta": delta,
+        "QuoteAgeSeconds": quote_age,
+        "MarketDataType": market_data_type,
+        "QuoteAsOf": quote_as_of,
     }
 
 
@@ -111,6 +116,37 @@ class ExpectedMoveTests(unittest.TestCase):
         self.assertEqual(
             result['source'], 'PREVIOUS_DAY_EXPECTED_MOVE_IV_PROXY')
 
+    def test_frozen_expected_move_is_raw_only_not_decision_eligible(self):
+        frame = pd.DataFrame([
+            option_row("20260815", 100, "C", 100, mid=3.2,
+                       quote_age=600, market_data_type=4,
+                       quote_as_of="2026-08-04T20:00:00Z"),
+            option_row("20260815", 100, "P", 100, mid=2.8,
+                       quote_age=600, market_data_type=4,
+                       quote_as_of="2026-08-04T20:00:00Z"),
+        ])
+        raw = expected_move_metrics(frame, 100, "20260815")
+        result = assess_expected_move_context(
+            raw, 99, 100, report_date="2026-08-05", event_status="UNKNOWN")
+        self.assertFalse(result['decision_eligible'])
+        self.assertEqual(result['reliability_score'], 0.0)
+        self.assertIn('STALE', result['decision_quality'])
+        self.assertIn('FROZEN', result['decision_quality'])
+
+    def test_premarket_gap_consumption_is_scored_separately(self):
+        raw = {
+            'pct': 1.0, 'quality': 'OK', 'source_date': '2026-08-05',
+            'quote_coverage_pct': 100.0, 'quote_max_age_seconds': 30,
+            'market_data_types': [1],
+        }
+        result = assess_expected_move_context(
+            raw, 100, 100.8, report_date="2026-08-05",
+            event_status="EVENT_DAY")
+        self.assertAlmostEqual(result['gap_consumed_pct'], 80.0)
+        self.assertIn('PREMARKET_GAP_CONSUMED', result['decision_quality'])
+        self.assertIn('EVENT_DAY_REVIEW', result['decision_quality'])
+        self.assertFalse(result['decision_eligible'])
+
 
 class StructureTests(unittest.TestCase):
     def test_distance_is_positive_when_level_is_above_spot(self):
@@ -130,10 +166,49 @@ class StructureTests(unittest.TestCase):
             {'0DTE': 0, '1-7D': 62, '8-30D': 0, '31-60D': 0, 'ALL': 62},
             {'0DTE': 0, '1-7D': 8, '8-30D': 0, '31-60D': 0, 'ALL': 8},
         )
-        self.assertEqual(gated['ALL']['quality'], 'LOW_COVERAGE')
+        self.assertEqual(gated['ALL']['quality'], 'LOW_OI_COVERAGE')
         self.assertIsNone(gated['ALL']['net_gamma_m'])
         self.assertIsNotNone(gated['ALL']['raw_net_gamma_m'])
         self.assertIsNone(gated['call_wall'])
+
+    def test_gamma_gate_checks_atm_side_and_input_oi_coverage(self):
+        rows = []
+        for strike in range(90, 110):
+            rows.extend([
+                option_row("20260815", strike, "C", 1000, dte=30),
+                option_row("20260815", strike, "P", 1000, dte=30),
+            ])
+        raw = gamma_structure(pd.DataFrame(rows), 100)
+        counts = {'0DTE': 0, '1-7D': 0, '8-30D': 40,
+                  '31-60D': 0, 'ALL': 40}
+        side_counts = {
+            bucket: {'requested_calls': 0, 'requested_puts': 0,
+                     'qualified_calls': 0, 'qualified_puts': 0,
+                     'oi_calls': 0, 'oi_puts': 0}
+            for bucket in counts
+        }
+        side_counts['8-30D'] = side_counts['ALL'] = {
+            'requested_calls': 20, 'requested_puts': 20,
+            'qualified_calls': 20, 'qualified_puts': 20,
+            'oi_calls': 20, 'oi_puts': 20,
+        }
+        atm = {bucket: {'requested': 0, 'gamma_valid': 0} for bucket in counts}
+        atm['8-30D'] = atm['ALL'] = {'requested': 10, 'gamma_valid': 4}
+        weights = {bucket: {'oi_total': 0, 'gamma_input_oi': 0} for bucket in counts}
+        weights['8-30D'] = weights['ALL'] = {
+            'oi_total': 40_000, 'gamma_input_oi': 40_000}
+        ages = {bucket: [] for bucket in counts}
+        ages['8-30D'] = ages['ALL'] = [30]
+        gated = apply_gamma_quality_gate(
+            raw, counts, counts, counts, side_counts=side_counts,
+            iv_quote_ages=ages, atm_counts=atm,
+            oi_weight_totals=weights)
+        self.assertEqual(gated['ALL']['quality'], 'LOW_ATM_COVERAGE')
+        self.assertEqual(gated['ALL']['atm_coverage_pct'], 40.0)
+        self.assertIsNone(gated['ALL']['gamma_dollar_coverage_pct'])
+        self.assertEqual(
+            gated['ALL']['gamma_dollar_coverage_status'],
+            'UNAVAILABLE_NO_FULL_CHAIN_DENOMINATOR')
 
     def test_valid_curve_without_cross_has_distinct_flip_status(self):
         rows = []

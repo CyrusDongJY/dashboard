@@ -114,11 +114,27 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_metho
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_quality text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_iv numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_source_date date;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_decision_quality text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_decision_status text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_decision_eligible boolean;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_reliability_score numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_quality_scores jsonb;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_quote_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_quote_max_age_seconds numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_premarket_gap_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_gap_consumed_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_status text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS iv_skew_quality text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_qualification_coverage_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_oi_coverage_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_call_oi_coverage_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_put_oi_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_atm_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_call_put_balance_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_input_oi_weight_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_pct numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_status text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_iv_quote_max_age_seconds numeric;
 
 CREATE TABLE IF NOT EXISTS option_gamma_buckets (
@@ -151,6 +167,7 @@ ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS requested_contract_cou
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS qualified_contract_count int;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS oi_valid_contract_count int;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS qualification_coverage_pct numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS call_count int;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS put_count int;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS strike_count int;
@@ -160,6 +177,11 @@ ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS raw_primary_flip numer
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS oi_coverage_pct numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS call_oi_coverage_pct numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS put_oi_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS atm_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS call_put_balance_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS gamma_input_oi_weight_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_pct numeric;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_status text;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS iv_quote_max_age_seconds numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS flip_quality text;
 
@@ -307,7 +329,23 @@ SELECT
     post.poc_window_end,
     post.poc_previous_price,
     post.poc_change_pct,
-    post.poc_quality
+    post.poc_quality,
+    pre.expected_move_decision_quality,
+    pre.expected_move_decision_status,
+    pre.expected_move_decision_eligible,
+    pre.expected_move_reliability_score,
+    pre.expected_move_quality_scores,
+    pre.expected_move_quote_coverage_pct,
+    pre.expected_move_quote_max_age_seconds,
+    pre.expected_move_premarket_gap_pct,
+    pre.expected_move_gap_consumed_pct,
+    pre.expected_move_event_status,
+    pre.gamma_qualification_coverage_pct,
+    pre.gamma_atm_coverage_pct,
+    pre.gamma_call_put_balance_pct,
+    pre.gamma_input_oi_weight_coverage_pct,
+    pre.gamma_dollar_coverage_pct,
+    pre.gamma_dollar_coverage_status
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
@@ -420,6 +458,9 @@ ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_first_bar timesta
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_last_bar timestamptz;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_independent_source boolean;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_state text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_flat_abs_threshold numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_flat_pct_threshold numeric;
 
 -- Vol/OI异动必须等待次日OI确认；概率字段只表示启发式证据等级。
 CREATE TABLE IF NOT EXISTS option_volume_anomalies (
@@ -448,6 +489,9 @@ CREATE TABLE IF NOT EXISTS option_volume_anomalies (
 );
 CREATE INDEX IF NOT EXISTS idx_option_volume_anomalies_pending
     ON option_volume_anomalies (symbol, report_date DESC, verification_date);
+ALTER TABLE option_volume_anomalies ADD COLUMN IF NOT EXISTS same_snapshot_pattern text;
+ALTER TABLE option_volume_anomalies ADD COLUMN IF NOT EXISTS verification_attempt_date date;
+ALTER TABLE option_volume_anomalies ADD COLUMN IF NOT EXISTS verification_status text;
 
 -- ------------------------------------------------------------
 -- 4. 数据质量表：每次抓取每张表一条，记录成功/缺失/滞后/行数

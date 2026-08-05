@@ -3,6 +3,30 @@
 本次升级把系统从"探针文本战报"升级为"客观异常矩阵"：同一指标看 1D/5D/21D/63D
 观察窗口，以 252 个交易日为统计基准，跨指标做共振判定，并按数据新鲜度加权置信度。
 
+## 2026-08-05 质量闸门迁移
+
+部署配套 Python 文件前，先在 Supabase SQL Editor 执行
+`migration_20260805_quality_gates.sql`。迁移仅增加字段，可重复执行。
+
+Expected Move 现在将原始估计与 `expected_move_decision_eligible` 分开。
+冻结、陈旧、回退、事件日复核、盘前缺口大量消耗和 ATM 报价覆盖不足仍会
+保留用于审计，但不会进入盘中阈值和环境指数评分。
+
+事件日不能从价格异动反推。如需启用事件日闸门，应在云端私有
+`market_config.py` 维护经复核的日期：
+
+```python
+EXPECTED_MOVE_EVENT_DATES = {
+    "ALL": ["2026-09-16"],
+    "AAPL": ["2026-10-29"],
+}
+EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE = False
+```
+
+除非该日历对全部标的和日期均完整，否则保持
+`EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE = False`；未配置日期会标为
+`UNKNOWN`，不会被静默视为普通交易日。
+
 盘前期权模块同时升级为明确的数据契约：
 
 - 昨收、盘前成交、Bid/Ask/Mid、期货映射参考价分别存储，禁止混称"当前现价"；

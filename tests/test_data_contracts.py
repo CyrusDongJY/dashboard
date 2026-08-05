@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from data_contracts import (
+    classify_vix_curve,
     calculate_iv_rank_percentile,
     classify_repeated_value,
     classify_hyg_tlt,
@@ -10,6 +11,7 @@ from data_contracts import (
     compute_etf_share_metrics,
     gap_acceptance,
     opening_probability,
+    oi_verification_quality,
     option_trade_side,
     up_down_volume_ratio,
     volume_profile_nodes,
@@ -152,6 +154,18 @@ class OptionFlowVerificationTests(unittest.TestCase):
         self.assertEqual(option_trade_side(1.19, 1.00, 1.20), 'ASK_SIDE')
         self.assertEqual(opening_probability(1000, 700), 'HIGH')
         self.assertEqual(opening_probability(1000, -200), 'LOW')
+
+    def test_low_next_day_oi_coverage_disables_structure_inference(self):
+        result = oi_verification_quality(6, 37)
+        self.assertEqual(result['quality'], 'LOW_COVERAGE')
+        self.assertAlmostEqual(result['coverage_pct'], 6 / 37 * 100)
+        self.assertFalse(result['structure_inference_eligible'])
+
+    def test_vix_curve_has_flat_dead_band(self):
+        self.assertEqual(classify_vix_curve(18.00, 18.00)[0], 'FLAT')
+        self.assertEqual(classify_vix_curve(18.00, 18.08)[0], 'FLAT')
+        self.assertEqual(classify_vix_curve(18.00, 18.20)[0], 'CONTANGO')
+        self.assertEqual(classify_vix_curve(18.20, 18.00)[0], 'BACKWARDATION')
 
 
 class GammaLineageTests(unittest.TestCase):
