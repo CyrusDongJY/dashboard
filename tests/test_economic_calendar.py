@@ -71,8 +71,8 @@ class EconomicCalendarTests(unittest.TestCase):
         for url, kwargs in session.calls:
             if "fomccalendars" in url:
                 continue
-            self.assertEqual(kwargs["params"]["realtime_start"], "2026-08-11")
-            self.assertEqual(kwargs["params"]["realtime_end"], "2026-08-11")
+            self.assertNotIn("realtime_start", kwargs["params"])
+            self.assertNotIn("realtime_end", kwargs["params"])
         summary = format_economic_event_summary(result)
         self.assertIn("下一重大事件：美国CPI", summary)
         self.assertIn("发布时间：2026-08-12 08:30 ET", summary)

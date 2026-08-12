@@ -133,10 +133,6 @@ def _fetch_fred_events(api_key, start_date, end_date, session=None,
                 "release_id": release_id,
                 "api_key": api_key,
                 "file_type": "json",
-                # Query the schedule as known at the report timestamp. These
-                # are vintage controls, not release-date filters.
-                "realtime_start": start_date.isoformat(),
-                "realtime_end": start_date.isoformat(),
                 "include_release_dates_with_no_data": "true",
                 "limit": 1000,
                 "sort_order": "desc",
