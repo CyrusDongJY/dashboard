@@ -16,8 +16,9 @@ NY_TZ = pytz.timezone('America/New_York')
 
 # ================= 🔐 安全挂载 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
-if CONFIG_DIR not in sys.path: 
-    sys.path.append(CONFIG_DIR)
+if CONFIG_DIR in sys.path:
+    sys.path.remove(CONFIG_DIR)
+sys.path.insert(0, CONFIG_DIR)
 
 try:
     import market_config as cfg
@@ -120,6 +121,31 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
         if k not in ['id', 'created_at']: appendix += f"{k}: {v}\n"
 
     appendix += "\n【三、十大核心标的期权与暗池明细全息扫描】\n"
+    event_row = next((
+        stock for stock in micro_raw_list
+        if stock.get('expected_move_event_name')
+        or stock.get('expected_move_event_status')
+    ), None)
+    if event_row:
+        event_name = event_row.get('expected_move_event_name')
+        event_status = event_row.get('expected_move_event_status')
+        if event_name:
+            event_at = event_row.get('expected_move_event_at')
+            try:
+                event_at = datetime.fromisoformat(str(event_at)).astimezone(
+                    NY_TZ).strftime('%Y-%m-%d %H:%M ET')
+            except (TypeError, ValueError):
+                event_at = '时间未记录'
+            event_days = event_row.get('expected_move_event_trading_days')
+            event_risk = event_row.get('expected_move_event_risk') or '未评级'
+            appendix += (
+                f"【已核验重大事件】{event_name} | {event_at} | "
+                f"距离{event_days if event_days is not None else 'NA'}个交易日 | "
+                f"风险{event_risk}\n")
+        elif event_status == 'EVENT_CALENDAR_UNAVAILABLE':
+            appendix += (
+                "【重大事件日历】EVENT_CALENDAR_UNAVAILABLE | "
+                "Expected Move事件分项不可用\n")
     for stock in micro_raw_list:
         sym = stock.get('ticker', 'UNKNOWN')
         appendix += f"[{sym}]: "
@@ -133,10 +159,21 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
         if stock.get('poc_price'): details.append(f"POC ${stock['poc_price']:.2f}")
         if stock.get('dpsv_pct'): details.append(f"FINRA短售量代理 {stock['dpsv_pct']}%")
         if stock.get('ivr_pct'): details.append(f"IVR {stock['ivr_pct']}%")
-        gamma_flip = stock.get('gamma_flip_all', stock.get('zgl_price'))
-        if gamma_flip:
-            details.append(f"主Gamma Flip观察位 ${gamma_flip:.2f}")
-        if stock.get('charm_m'): details.append(f"Charm推力 {stock['charm_m']}M")
+        gamma_quality = stock.get('gamma_quality')
+        gamma_eligible = stock.get('gamma_decision_eligible')
+        if gamma_eligible is None:
+            gamma_eligible = (
+                isinstance(gamma_quality, dict)
+                and gamma_quality.get('ALL') == 'OK')
+        if gamma_eligible:
+            gamma_flip = stock.get('gamma_flip_all', stock.get('zgl_price'))
+            if gamma_flip:
+                details.append(f"主Gamma Flip观察位 ${gamma_flip:.2f}")
+            if stock.get('charm_m'):
+                details.append(f"Charm推力 {stock['charm_m']}M")
+        else:
+            details.append(
+                "Gamma数据不足（战术权重0；期权OI仅作价格活动区）")
         appendix += " | ".join(details) + "\n"
         
     return appendix

@@ -127,7 +127,7 @@ EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE = False
    **📁 `~/quant_bot/`**
    | 文件 | 动作 |
    |---|---|
-   | `auto_analyst.py` | 覆盖 —— 从 `~/market_dashboard` 拉共享模块，**不要**把模块复制到这里 |
+   | `auto_analyst.py` | 覆盖 —— 将 `~/market_dashboard` 放到 `sys.path` 首位并从中加载共享模块，**不要**把模块复制到这里 |
 
    **📁 `~/TradingRadar/`**
    | 文件 | 动作 |
@@ -420,3 +420,36 @@ LIMIT 5;
 邮件应包含环境图和 `liquidity_waterline_YYYY-MM-DD.png` 两个 PNG 附件；日志应出现
 `流动性水位仪生成完成`。没有异常也会生成水位仪，因为它是每日影子报告，不受
 `market_sentinel.py` 的告警门槛控制。
+
+## 九、事件、Gamma与盘中广度质量闸门（2026-08-12）
+
+先在 Supabase SQL Editor 执行：
+
+```sql
+-- 文件：migration_20260812_event_gamma_breadth.sql
+```
+
+再部署 `economic_calendar.py` 与本次修改的生产模块。事件模块使用已配置的
+`FRED_API_KEY` 读取 CPI、PPI、非农、GDP 和 PCE 发布日，并从美联储官方日历读取
+FOMC 决议日。结果默认缓存在 `~/market_dashboard/cache/economic_events.json`。
+如果官方源失败且缓存过期，邮件会显示 `EVENT_CALENDAR_UNAVAILABLE`，
+Expected Move 事件分项归零且禁止决策，不再使用 `UNKNOWN`。
+
+Gamma 仅当 `gamma_quality.ALL=OK` 时保持 `gamma_tactical_weight=1`。低覆盖时权重为0，
+Flip、Gamma Call/Put Wall 与派生距离不参与异常引擎；标准月度OI墙只是价格活动区，
+不作方向信号。AD-NYSE 非 `OK` 时盘中转为 `PRICE_VWAP_TRIN_CTICK`，邮件/控制台
+不再显示可误读的原始AD数值，`add_raw` 仅留作数据库审计。
+
+部署后先做不触发邮件/行情的导入与语法验证：
+
+```bash
+/home/winters_dong426/trading_venv/bin/python3 -m py_compile \
+  /home/winters_dong426/market_dashboard/economic_calendar.py \
+  /home/winters_dong426/market_dashboard/pre_market_metrics.py \
+  /home/winters_dong426/market_dashboard/daily_pre_market.py
+/usr/bin/python3 -m py_compile \
+  /home/winters_dong426/market_dashboard/anomaly_engine.py \
+  /home/winters_dong426/market_dashboard/market_probes.py \
+  /home/winters_dong426/quant_bot/auto_analyst.py \
+  /home/winters_dong426/TradingRadar/ib_intraday_sniper.py
+```

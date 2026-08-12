@@ -166,6 +166,44 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
         """)
         self.assertIn("STALE_BREADTH_OK", output)
 
+    def test_stale_ad_switches_to_price_vwap_framework(self):
+        output = self._isolated_run("""
+            import runpy
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="framework_test")
+            select = module["select_intraday_decision_framework"]
+            assert select("OK") == {
+                "breadth_state": "AVAILABLE",
+                "decision_framework": "NYSE_AD_PRICE_VWAP_TRIN_CTICK",
+            }
+            assert select("STALE_VALUE") == {
+                "breadth_state": "UNAVAILABLE",
+                "decision_framework": "PRICE_VWAP_TRIN_CTICK",
+            }
+            print("FRAMEWORK_SWITCH_OK")
+        """)
+        self.assertIn("FRAMEWORK_SWITCH_OK", output)
+
+    def test_gamma_value_requires_explicit_decision_eligibility(self):
+        output = self._isolated_run("""
+            import runpy
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="gamma_gate_test")
+            gate = module["gamma_decision_value"]
+            assert gate(512.5, True) == 512.5
+            assert gate(512.5, False) is None
+            assert gate(512.5, None) is None
+            print("GAMMA_DISPLAY_GATE_OK")
+        """)
+        self.assertIn("GAMMA_DISPLAY_GATE_OK", output)
+
+    def test_stale_ad_raw_value_is_audit_only_in_report(self):
+        source = Path("ib_intraday_sniper.py").read_text(encoding="utf-8")
+        self.assertIn("原始值仅保留在add_raw审计字段", source)
+        self.assertNotIn("原始={display_signed(add_raw)}", source)
+
     def test_post_close_breadth_uses_record_date_schema(self):
         source = Path("ib_intraday_sniper.py").read_text(encoding="utf-8")
         self.assertIn(".select('record_date,pct_adv", source)

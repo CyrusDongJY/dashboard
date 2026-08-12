@@ -144,7 +144,62 @@ class ExpectedMoveTests(unittest.TestCase):
             event_status="EVENT_DAY")
         self.assertAlmostEqual(result['gap_consumed_pct'], 80.0)
         self.assertIn('PREMARKET_GAP_CONSUMED', result['decision_quality'])
-        self.assertIn('EVENT_DAY_REVIEW', result['decision_quality'])
+        self.assertIn('HIGH_IMPACT_EVENT_WINDOW', result['decision_quality'])
+        self.assertFalse(result['decision_eligible'])
+
+    def test_next_session_high_impact_event_is_persisted_and_scored(self):
+        raw = {
+            'pct': 1.0, 'quality': 'OK', 'source_date': '2026-08-11',
+            'quote_coverage_pct': 100.0, 'quote_max_age_seconds': 30,
+            'market_data_types': [1],
+        }
+        context = {
+            'name': '美国CPI',
+            'event_at': '2026-08-12T08:30:00-04:00',
+            'trading_days': 1,
+            'risk': 'HIGH',
+            'event_status': 'HIGH_IMPACT_NEXT_SESSION',
+            'source': 'FRED_RELEASE_CALENDAR:10',
+            'source_status': 'LIVE',
+        }
+        result = assess_expected_move_context(
+            raw, 100, 100, report_date='2026-08-11',
+            event_context=context)
+        self.assertEqual(result['decision_status'], 'EVENT_RISK_HIGH')
+        self.assertEqual(result['event_name'], '美国CPI')
+        self.assertEqual(result['event_trading_days'], 1)
+        self.assertEqual(result['quality_scores']['event'], 50.0)
+        self.assertFalse(result['decision_eligible'])
+
+    def test_unknown_event_calendar_fails_closed(self):
+        raw = {
+            'pct': 1.0, 'quality': 'OK', 'source_date': '2026-08-11',
+            'quote_coverage_pct': 100.0, 'quote_max_age_seconds': 30,
+            'market_data_types': [1],
+        }
+        result = assess_expected_move_context(
+            raw, 100, 100, report_date='2026-08-11',
+            event_status='UNKNOWN')
+        self.assertEqual(
+            result['decision_status'], 'EVENT_CALENDAR_UNAVAILABLE')
+        self.assertEqual(result['quality_scores']['event'], 0.0)
+        self.assertFalse(result['decision_eligible'])
+
+    def test_incomplete_calendar_cannot_claim_no_major_event(self):
+        raw = {
+            'pct': 1.0, 'quality': 'OK', 'source_date': '2026-08-11',
+            'quote_coverage_pct': 100.0, 'quote_max_age_seconds': 30,
+            'market_data_types': [1],
+        }
+        result = assess_expected_move_context(
+            raw, 100, 100, report_date='2026-08-11',
+            event_context={
+                'event_status': 'NO_MAJOR_EVENT_SCHEDULED',
+                'source_status': 'CONFIG_ONLY',
+                'decision_eligible': False,
+            })
+        self.assertEqual(
+            result['decision_status'], 'EVENT_CALENDAR_UNAVAILABLE')
         self.assertFalse(result['decision_eligible'])
 
 
@@ -170,6 +225,10 @@ class StructureTests(unittest.TestCase):
         self.assertIsNone(gated['ALL']['net_gamma_m'])
         self.assertIsNotNone(gated['ALL']['raw_net_gamma_m'])
         self.assertIsNone(gated['call_wall'])
+        self.assertIsNone(gated['put_wall'])
+        self.assertFalse(gated['decision_eligible'])
+        self.assertEqual(gated['tactical_weight'], 0.0)
+        self.assertEqual(gated['usage'], 'PRICE_ACTIVITY_ZONE_ONLY')
 
     def test_gamma_gate_checks_atm_side_and_input_oi_coverage(self):
         rows = []
@@ -343,6 +402,8 @@ class EmailSummaryTests(unittest.TestCase):
             "call_wall": 105,
             "put_wall": 95,
             "pin_strike": None,
+            "decision_eligible": not low_quality,
+            "tactical_weight": 0.0 if low_quality else 1.0,
         }
         for bucket, value in (
                 ("0DTE", 1.2), ("1-7D", 2.4),
@@ -362,12 +423,13 @@ class EmailSummaryTests(unittest.TestCase):
             {"pct": 1.25, "quality": "OK"},
             0.92, 0.015, self.gamma_fixture(), "OK")
 
-        self.assertEqual(len(text.splitlines()), 4)
+        self.assertEqual(len(text.splitlines()), 5)
         self.assertIn("SPY | 参考 $100.00", text)
         self.assertIn("C $105.00 / P $95.00 / Flip $101.00", text)
         self.assertIn("C/P/Flip距离 +5.00%/-5.00%/+1.00%", text)
         self.assertIn("Gamma 0D +1.20M", text)
         self.assertIn("覆盖 有效0/请求0", text)
+        self.assertIn("战术权重100%", text)
         self.assertNotIn("全部零点", text)
         self.assertNotIn("最大OI", text)
         self.assertNotIn("符号假设", text)
@@ -383,6 +445,10 @@ class EmailSummaryTests(unittest.TestCase):
         self.assertIn("未取得盘前价", text)
         self.assertIn("预期振幅=MISSING", text)
         self.assertIn("Flip=JUMP_REVIEW", text)
+        self.assertIn("战术权重0%", text)
+        self.assertIn("期权OI仅作价格活动区", text)
+        self.assertIn("Gamma墙 NA[低覆盖]", text)
+        self.assertNotIn("C $105.00", text)
 
     def test_quality_footer_groups_internal_issue_keys(self):
         text = format_premarket_quality_summary(

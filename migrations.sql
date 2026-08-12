@@ -124,6 +124,12 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_quot
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_premarket_gap_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_gap_consumed_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_status text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_name text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_at timestamptz;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_trading_days int;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_risk text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_source text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS expected_move_event_source_status text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS iv_skew_quality text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_coverage_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_qualification_coverage_pct numeric;
@@ -136,6 +142,10 @@ ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_input_oi_wei
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_pct numeric;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_status text;
 ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_iv_quote_max_age_seconds numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_decision_eligible boolean;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_tactical_weight numeric;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS gamma_usage text;
+ALTER TABLE stock_options_pre_market ADD COLUMN IF NOT EXISTS monthly_wall_usage text;
 
 CREATE TABLE IF NOT EXISTS option_gamma_buckets (
     date                date        NOT NULL,
@@ -184,6 +194,8 @@ ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS gamma_dollar_coverage_status text;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS iv_quote_max_age_seconds numeric;
 ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS flip_quality text;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS decision_eligible boolean;
+ALTER TABLE option_gamma_buckets ADD COLUMN IF NOT EXISTS tactical_weight numeric;
 
 CREATE TABLE IF NOT EXISTS stock_spot_post_close (
     date            date        NOT NULL,
@@ -345,7 +357,17 @@ SELECT
     pre.gamma_call_put_balance_pct,
     pre.gamma_input_oi_weight_coverage_pct,
     pre.gamma_dollar_coverage_pct,
-    pre.gamma_dollar_coverage_status
+    pre.gamma_dollar_coverage_status,
+    pre.expected_move_event_name,
+    pre.expected_move_event_at,
+    pre.expected_move_event_trading_days,
+    pre.expected_move_event_risk,
+    pre.expected_move_event_source,
+    pre.expected_move_event_source_status,
+    pre.gamma_decision_eligible,
+    pre.gamma_tactical_weight,
+    pre.gamma_usage,
+    pre.monthly_wall_usage
 FROM stock_options_pre_market pre
 FULL OUTER JOIN stock_spot_post_close post
     ON pre.date = post.date AND pre.ticker = post.ticker;
@@ -365,6 +387,8 @@ ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_pct_adv num
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_sample_size int;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_source text;
 ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_as_of timestamptz;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS breadth_state text;
+ALTER TABLE IF EXISTS intraday_logs ADD COLUMN IF NOT EXISTS decision_framework text;
 
 -- 2026-07-24: ADV/DECL/UVOL/DVOL were never valid IBKR contracts.  Older
 -- collectors stored their missing zeros as a neutral-looking U/D=1.00.  Null

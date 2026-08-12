@@ -26,6 +26,7 @@ sys.modules.setdefault("yfinance", yfinance_module)
 from anomaly_engine import (  # noqa: E402
     AnomalyEvent,
     _expand_market_history_metrics,
+    gamma_decision_mask,
     metric_snapshot,
     scan_metric,
 )
@@ -60,6 +61,32 @@ def metric_row(metric, percentile, sample=252, lag=0, scope="MACRO"):
 
 
 class EnvironmentIndexTests(unittest.TestCase):
+    def test_gamma_mask_fails_closed_for_low_coverage_derived_metrics(self):
+        frame = pd.DataFrame({
+            "gamma_quality": [
+                {"ALL": "LOW_COVERAGE"}, {"ALL": "OK"}, {"ALL": "OK"}],
+            "gamma_decision_eligible": [False, False, True],
+            "call_wall": [500, 501, 502],
+        })
+        self.assertEqual(
+            gamma_decision_mask(frame).tolist(), [False, False, True])
+
+    def test_distance_version_filter_cannot_reinclude_ineligible_gamma(self):
+        frame = pd.DataFrame({
+            "gamma_quality": [
+                {"ALL": "LOW_COVERAGE"}, {"ALL": "OK"}],
+            "gamma_decision_eligible": [False, True],
+            "distance_sign_version": [
+                "LEVEL_MINUS_SPOT_V2", "LEVEL_MINUS_SPOT_V2"],
+            "distance_to_call_wall_pct": [9.0, 1.0],
+        })
+        metric = frame.loc[
+            gamma_decision_mask(frame), "distance_to_call_wall_pct"]
+        metric = metric.loc[
+            frame.loc[metric.index, "distance_sign_version"]
+            == "LEVEL_MINUS_SPOT_V2"]
+        self.assertEqual(metric.tolist(), [1.0])
+
     def test_no_data_is_not_healthy(self):
         state, _ = classify_state({}, {}, 0, False)
         self.assertEqual(state, "数据不足")

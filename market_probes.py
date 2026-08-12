@@ -84,6 +84,14 @@ def scan_macro_regime(supabase, cutoff_date):
 # ==========================================
 # 探针二：微观筹码与期权防线探针 (Micro Options Probe)
 # ==========================================
+def _gamma_decision_eligible(row):
+    explicit = row.get('gamma_decision_eligible')
+    if explicit is not None and not pd.isna(explicit):
+        return explicit is True or str(explicit).lower() == 'true'
+    quality = row.get('gamma_quality')
+    return isinstance(quality, dict) and quality.get('ALL') == 'OK'
+
+
 def _fetch_micro_df(supabase, cutoff_date):
     """优先读拆分后的盘前/盘后表并按 (date,ticker) 合并；两表皆空则回退旧表。"""
     def _q(table):
@@ -126,6 +134,7 @@ def scan_micro_options(supabase, cutoff_date):
         last_week = tdf.iloc[-6] if len(tdf) >= 6 else None
         ticker_anomalies = []
         raw_options_list.append(today.to_dict())
+        gamma_eligible = _gamma_decision_eligible(today)
 
         curr_px, poc_px = pd.to_numeric(today.get('current_price', 0), errors='coerce'), pd.to_numeric(today.get('poc_price', 0), errors='coerce')
         if pd.notna(poc_px) and pd.notna(curr_px) and curr_px > 0:
@@ -145,8 +154,9 @@ def scan_micro_options(supabase, cutoff_date):
 
         zgl_today = pd.to_numeric(
             today.get('gamma_flip_all', today.get('zgl_price', np.nan)),
-            errors='coerce')
-        if last_week is not None:
+            errors='coerce') if gamma_eligible else np.nan
+        if (gamma_eligible and last_week is not None
+                and _gamma_decision_eligible(last_week)):
             zgl_lw = pd.to_numeric(
                 last_week.get('gamma_flip_all', last_week.get('zgl_price', np.nan)),
                 errors='coerce')
@@ -157,16 +167,28 @@ def scan_micro_options(supabase, cutoff_date):
                     f"(上周: {zgl_lw} -> 今日: {zgl_today})；"
                     "到期滚动和采样变化可能造成跳变。")
 
-        pin_strike = pd.to_numeric(today.get('pin_strike', np.nan), errors='coerce')
+        pin_strike = pd.to_numeric(
+            today.get('pin_strike', np.nan), errors='coerce'
+        ) if gamma_eligible else np.nan
         pin_state = today.get('pin_state')
         if pd.notna(pin_strike) and pin_state:
             label = "Pin候选位" if pin_state == "PIN_CANDIDATE" else "突破枢轴"
             ticker_anomalies.append(f"[双边Gamma集中] {label} ${pin_strike:.2f}。")
 
-        charm_t0, charm_t1 = pd.to_numeric(today.get('charm_m', np.nan), errors='coerce'), pd.to_numeric(yday.get('charm_m', np.nan), errors='coerce')
+        charm_t0 = pd.to_numeric(
+            today.get('charm_m', np.nan), errors='coerce'
+        ) if gamma_eligible else np.nan
+        charm_t1 = pd.to_numeric(
+            yday.get('charm_m', np.nan), errors='coerce'
+        ) if _gamma_decision_eligible(yday) else np.nan
         if pd.notna(charm_t0) and pd.notna(charm_t1):
             if charm_t0 > 0 > charm_t1: ticker_anomalies.append(f"[Charm翻转] 由负转正 (昨日: {charm_t1:.2f}M -> 今日: {charm_t0:.2f}M)")
             elif charm_t0 < 0 < charm_t1: ticker_anomalies.append(f"[Charm翻转] 由正转负 (昨日: {charm_t1:.2f}M -> 今日: {charm_t0:.2f}M)")
+
+        if not gamma_eligible:
+            ticker_anomalies.append(
+                "[Gamma质量闸门] 覆盖不足，战术权重0；"
+                "Flip/墙/Charm不可用，期权OI仅作价格活动区。")
 
         ivr = pd.to_numeric(today.get('ivr_pct', np.nan), errors='coerce')
         if pd.notna(ivr) and ivr < 10: ticker_anomalies.append(f"[波动率极值] IVR极低({ivr:.1f}%) -> 情绪极度麻木，随时可能爆发Gamma Squeeze。")

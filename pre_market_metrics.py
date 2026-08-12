@@ -194,22 +194,25 @@ def format_premarket_symbol_summary(
         f"Skew {skew_text}%"
     )
 
-    flip = gamma.get("ALL", {}).get("primary_flip")
-    if gamma.get("pin_strike") is not None:
+    gamma_eligible = gamma.get("decision_eligible") is True
+    flip = gamma.get("ALL", {}).get("primary_flip") if gamma_eligible else None
+    if gamma_eligible and gamma.get("pin_strike") is not None:
         structure_parts = [
             "Pin " + _compact_number(gamma.get("pin_strike"), prefix="$"),
         ]
-    else:
+    elif gamma_eligible:
         structure_parts = [
             "C " + _compact_number(gamma.get("call_wall"), prefix="$"),
             "P " + _compact_number(gamma.get("put_wall"), prefix="$"),
         ]
+    else:
+        structure_parts = ["Gamma墙 NA[低覆盖]"]
     structure_parts.append("Flip " + _compact_number(flip, prefix="$"))
-    distance_values = [
-        distance_pct(gamma.get("call_wall"), reference_price),
-        distance_pct(gamma.get("put_wall"), reference_price),
-        distance_pct(flip, reference_price),
-    ]
+    distance_values = (
+        [distance_pct(gamma.get("call_wall"), reference_price),
+         distance_pct(gamma.get("put_wall"), reference_price),
+         distance_pct(flip, reference_price)]
+        if gamma_eligible else [None, None, None])
     distance_text = "/".join(
         _compact_number(value, signed=True) + "%" for value in distance_values)
     structure_line = (
@@ -266,7 +269,12 @@ def format_premarket_symbol_summary(
     if gamma_flip_quality not in (None, "OK", "BASELINE_RESET", "NO_CROSSING"):
         notices.append(f"Flip={gamma_flip_quality}")
 
-    lines = [headline, structure_line, gamma_line]
+    gamma_usage_line = (
+        "  Gamma用途 "
+        f"战术权重{_compact_number(gamma.get('tactical_weight', 0) * 100, digits=0)}% | "
+        + ("方向结构可用" if gamma.get("decision_eligible")
+           else "方向结构禁用；期权OI仅作价格活动区"))
+    lines = [headline, structure_line, gamma_line, gamma_usage_line]
     if not em_eligible and finite_number(em_pct, positive=True) is not None:
         scores = expected_move.get("quality_scores") or {}
         score_text = "/".join(
@@ -279,7 +287,7 @@ def format_premarket_symbol_summary(
             f"{_compact_number(expected_move.get('reliability_score'), digits=0)}/100 | "
             f"分项源/时效/ATM/事件/缺口 {score_text} | "
             f"盘前缺口消耗{_compact_number(expected_move.get('gap_consumed_pct'), digits=0)}% | "
-            f"事件={expected_move.get('event_status', 'UNKNOWN')}")
+            f"事件={expected_move.get('event_status', 'EVENT_CALENDAR_UNAVAILABLE')}")
     if coverage_line:
         lines.append(coverage_line)
     if notices:
@@ -579,7 +587,9 @@ def expected_move_metrics(frame, spot, short_expiration, previous_iv=None,
 
 
 def assess_expected_move_context(expected_move, previous_close, premarket_price,
-                                 report_date=None, event_status="UNKNOWN"):
+                                 report_date=None,
+                                 event_status="EVENT_CALENDAR_UNAVAILABLE",
+                                 event_context=None):
     """Separate a raw expected-move estimate from decision eligibility."""
     result = deepcopy(expected_move or {})
     raw_quality = result.get("quality", "MISSING")
@@ -648,15 +658,29 @@ def assess_expected_move_context(expected_move, previous_close, premarket_price,
             quality_scores["premarket_gap"] = gap_score
             score = min(score, gap_score)
 
-    normalized_event = str(event_status or "UNKNOWN").upper()
-    if normalized_event == "EVENT_DAY":
-        flags.append("EVENT_DAY_REVIEW")
+    event_context = event_context or {}
+    normalized_event = str(
+        event_context.get("event_status", event_status)
+        or "EVENT_CALENDAR_UNAVAILABLE").upper()
+    if event_context and event_context.get("decision_eligible") is False:
+        normalized_event = "EVENT_CALENDAR_UNAVAILABLE"
+        flags.append("EVENT_CALENDAR_UNAVAILABLE")
+        quality_scores["event"] = 0.0
+        score = 0.0
+    elif normalized_event in (
+            "EVENT_DAY", "HIGH_IMPACT_EVENT_DAY",
+            "HIGH_IMPACT_NEXT_SESSION"):
+        flags.append("HIGH_IMPACT_EVENT_WINDOW")
         quality_scores["event"] = 50.0
         score = min(score, 50.0)
-    elif normalized_event == "NORMAL":
+    elif normalized_event in (
+            "NORMAL", "SCHEDULED", "NO_MAJOR_EVENT_SCHEDULED"):
         quality_scores["event"] = 100.0
-    elif normalized_event not in ("NORMAL", "UNKNOWN"):
-        normalized_event = "UNKNOWN"
+    else:
+        normalized_event = "EVENT_CALENDAR_UNAVAILABLE"
+        flags.append("EVENT_CALENDAR_UNAVAILABLE")
+        quality_scores["event"] = 0.0
+        score = 0.0
 
     unique_flags = list(dict.fromkeys(flags))
     if raw_quality == "MISSING":
@@ -667,8 +691,10 @@ def assess_expected_move_context(expected_move, previous_close, premarket_price,
         decision_status = "STALE"
     elif raw_quality == "FALLBACK":
         decision_status = "FALLBACK"
-    elif "EVENT_DAY_REVIEW" in unique_flags:
-        decision_status = "EVENT_DAY_REVIEW"
+    elif "HIGH_IMPACT_EVENT_WINDOW" in unique_flags:
+        decision_status = "EVENT_RISK_HIGH"
+    elif "EVENT_CALENDAR_UNAVAILABLE" in unique_flags:
+        decision_status = "EVENT_CALENDAR_UNAVAILABLE"
     elif "PREMARKET_GAP_CONSUMED" in unique_flags:
         decision_status = "PREMARKET_GAP_CONSUMED"
     elif "ATM_QUOTE_COVERAGE_INSUFFICIENT" in unique_flags:
@@ -689,6 +715,12 @@ def assess_expected_move_context(expected_move, previous_close, premarket_price,
         "premarket_gap_pct": gap_pct,
         "gap_consumed_pct": consumed_pct,
         "event_status": normalized_event,
+        "event_name": event_context.get("name"),
+        "event_at": event_context.get("event_at"),
+        "event_trading_days": event_context.get("trading_days"),
+        "event_risk": event_context.get("risk"),
+        "event_source": event_context.get("source"),
+        "event_source_status": event_context.get("source_status"),
     })
     return result
 
@@ -952,6 +984,8 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
             "raw_net_gamma_m": metrics.get("net_gamma_m"),
             "raw_primary_flip": metrics.get("primary_flip"),
             "raw_zero_points": metrics.get("zero_points", []),
+            "decision_eligible": quality == "OK",
+            "tactical_weight": 1.0 if quality == "OK" else 0.0,
         })
         if quality != "OK":
             metrics["net_gamma_m"] = None
@@ -967,12 +1001,19 @@ def apply_gamma_quality_gate(structure, requested_counts, qualified_counts,
         bucket for bucket in ("0DTE", "1-7D")
         if result[bucket]["requested_contract_count"] > 0
     ]
-    if not active_near or any(result[bucket]["quality"] != "OK"
-                              for bucket in active_near):
+    all_quality_ok = result["ALL"]["quality"] == "OK"
+    if (not all_quality_ok or not active_near
+            or any(result[bucket]["quality"] != "OK"
+                   for bucket in active_near)):
         result["call_wall"] = None
         result["put_wall"] = None
         result["pin_strike"] = None
         result["pin_state"] = None
+    result["decision_eligible"] = all_quality_ok
+    result["tactical_weight"] = 1.0 if all_quality_ok else 0.0
+    result["usage"] = (
+        "GAMMA_DIRECTIONAL_STRUCTURE"
+        if all_quality_ok else "PRICE_ACTIVITY_ZONE_ONLY")
     result["quality"] = {
         bucket: result[bucket]["quality"] for bucket in GAMMA_BUCKETS
     }

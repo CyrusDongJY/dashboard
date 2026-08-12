@@ -21,6 +21,10 @@ from market_utils import (
     attach_metadata, safe_upsert, log_data_quality,
     lag_trading_days,
 )
+from economic_calendar import (
+    format_economic_event_summary,
+    resolve_next_major_event,
+)
 from pre_market_metrics import (
     DISTANCE_SIGN_VERSION,
     GAMMA_BUCKETS,
@@ -74,21 +78,6 @@ SYMBOLS = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA'
 supabase: Client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
 ib = IB()
 
-
-def configured_expected_move_event_status(symbol, report_date):
-    """Read an optional reviewed event calendar without inventing event dates."""
-    calendar = getattr(cfg, "EXPECTED_MOVE_EVENT_DATES", None)
-    complete = bool(getattr(cfg, "EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE", False))
-    if not calendar:
-        return "UNKNOWN"
-    if isinstance(calendar, dict):
-        dates = calendar.get(symbol, calendar.get("ALL", []))
-    else:
-        dates = calendar
-    normalized = {str(value)[:10] for value in (dates or [])}
-    if str(report_date)[:10] in normalized:
-        return "EVENT_DAY"
-    return "NORMAL" if complete else "UNKNOWN"
 
 # ================= 日志防干扰设置 =================
 logging.getLogger('ib_insync').setLevel(logging.ERROR)
@@ -477,6 +466,18 @@ def get_report():
         rows_written = 0  # 数据质量审计：成功入库的标的数
         quality_issues = []
 
+        event_context = resolve_next_major_event(
+            ny_now,
+            fred_api_key=getattr(cfg, "FRED_API_KEY", None),
+            configured_events=getattr(cfg, "MAJOR_ECONOMIC_EVENTS", None),
+            cache_path=getattr(
+                cfg, "ECONOMIC_EVENT_CACHE",
+                os.path.join(CONFIG_DIR, "cache", "economic_events.json")),
+        )
+        report += format_economic_event_summary(event_context)
+        if event_context.get("event_status") == "EVENT_CALENDAR_UNAVAILABLE":
+            quality_issues.append("economic_calendar:unavailable")
+
         # 模块一：宏观数据
         report += get_gex_dix()
         
@@ -719,8 +720,7 @@ def get_report():
                     price_snapshot.get("previous_close"),
                     curr_price,
                     report_date=today_str,
-                    event_status=configured_expected_move_event_status(
-                        sym, today_str),
+                    event_context=event_context,
                 )
                 if not expected_move["decision_eligible"]:
                     quality_issues.append(
@@ -940,6 +940,15 @@ def get_report():
                             expected_move["gap_consumed_pct"], 2),
                         "expected_move_event_status": expected_move[
                             "event_status"],
+                        "expected_move_event_name": expected_move["event_name"],
+                        "expected_move_event_at": expected_move["event_at"],
+                        "expected_move_event_trading_days": expected_move[
+                            "event_trading_days"],
+                        "expected_move_event_risk": expected_move["event_risk"],
+                        "expected_move_event_source": expected_move[
+                            "event_source"],
+                        "expected_move_event_source_status": expected_move[
+                            "event_source_status"],
                         "max_oi_strike": _round_or_none(max_oi["strike"], 4),
                         "max_oi_type": max_oi["right"],
                         "max_oi_expiry": (
@@ -960,6 +969,7 @@ def get_report():
                             "previous_close_date"),
                         "monthly_wall_method": monthly_walls["method"],
                         "monthly_wall_quality": monthly_walls["quality"],
+                        "monthly_wall_usage": "PRICE_ACTIVITY_ZONE_ONLY",
                         "iv_skew": _round_or_none(iv_skew, 6),
                         "iv_skew_quality": iv_skew_quality,
                         "short_gamma_m": _round_or_none(short_gamma_total, 6),
@@ -979,6 +989,9 @@ def get_report():
                         "gamma_roll_changed": gamma_roll_changed,
                         "gamma_flip_quality": gamma_flip_quality,
                         "gamma_quality": gamma["quality"],
+                        "gamma_decision_eligible": gamma["decision_eligible"],
+                        "gamma_tactical_weight": gamma["tactical_weight"],
+                        "gamma_usage": gamma["usage"],
                         "gamma_requested_contract_count": requested_counts["ALL"],
                         "gamma_qualified_contract_count": qualified_counts["ALL"],
                         "gamma_oi_valid_contract_count": oi_valid_counts["ALL"],
@@ -1071,6 +1084,8 @@ def get_report():
                             "strike_count": metrics["strike_count"],
                             "quality": metrics["quality"],
                             "flip_quality": metrics["flip_quality"],
+                            "decision_eligible": metrics["decision_eligible"],
+                            "tactical_weight": metrics["tactical_weight"],
                             "raw_net_gamma_m": _round_or_none(metrics["raw_net_gamma_m"], 6),
                             "raw_primary_flip": _round_or_none(metrics["raw_primary_flip"], 4),
                             "curve_version": gamma["curve_version"],

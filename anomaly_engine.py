@@ -25,6 +25,18 @@ from market_utils import trading_days_back, lag_trading_days
 
 logger = logging.getLogger(__name__)
 
+
+def gamma_decision_mask(frame):
+    """Return rows whose sampled Gamma structure is explicitly decision-eligible."""
+    if 'gamma_quality' not in frame.columns:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    mask = frame['gamma_quality'].apply(
+        lambda value: isinstance(value, dict)
+        and value.get('ALL') == 'OK')
+    if 'gamma_decision_eligible' in frame.columns:
+        mask &= frame['gamma_decision_eligible'].eq(True)
+    return mask
+
 # ============================================================
 # 指标注册表：唯一的"方向语义"真相源
 #   bad_dir = +1  表示"数值越高越危险"（如 MOVE、credit_spread）
@@ -604,24 +616,30 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
                             and 'expected_move_decision_eligible' in g.columns):
                         metric_series = g.loc[
                             g['expected_move_decision_eligible'] == True, m]  # noqa: E712
-                    if (m.startswith('gamma_') or m in (
-                            'short_gamma_m', 'long_gamma_m', 'zgl_price')):
-                        if 'gamma_quality' in g.columns:
-                            quality_ok = g['gamma_quality'].apply(
-                                lambda value: isinstance(value, dict)
-                                and value.get('ALL') == 'OK')
-                            metric_series = g.loc[quality_ok, m]
+                    gamma_dependent = {
+                        'short_gamma_m', 'long_gamma_m', 'zgl_price',
+                        'call_wall', 'put_wall',
+                        'distance_to_call_wall_pct',
+                        'distance_to_put_wall_pct', 'distance_to_zgl_pct',
+                        'vanna_m', 'charm_m',
+                    }
+                    if m.startswith('gamma_') or m in gamma_dependent:
+                        metric_series = g.loc[gamma_decision_mask(g), m]
                     if (m.startswith('distance_to_')
                             and 'distance_sign_version' in g.columns):
-                        metric_series = g.loc[
-                            g['distance_sign_version'] == 'LEVEL_MINUS_SPOT_V2', m]
+                        metric_series = metric_series.loc[
+                            g.loc[metric_series.index, 'distance_sign_version']
+                            == 'LEVEL_MINUS_SPOT_V2']
                     if m == 'dpsv_pct':
                         source_cols = ('dpsv_source_date', 'source_date')
                     elif m == 'expected_move_pct':
                         source_cols = ('expected_move_source_date', 'source_date')
                     else:
                         source_cols = ('source_date',)
-                    src = _metric_source_date(g, m, 'date', source_cols)
+                    source_frame = g.loc[metric_series.index].copy()
+                    source_frame[m] = metric_series
+                    src = _metric_source_date(
+                        source_frame, m, 'date', source_cols)
                     events += scan_metric(
                         m, metric_series, report_date, scope=tkr, source_date=src)
                     row = metric_snapshot(

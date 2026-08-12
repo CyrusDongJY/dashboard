@@ -87,6 +87,24 @@ def classify_breadth_status(value, prior_values, quote_age_seconds=None,
         else 'OK')
     return status, repeat_count
 
+
+def select_intraday_decision_framework(add_status):
+    """Select a fail-closed framework when NYSE AD cannot be trusted."""
+    if add_status == 'OK':
+        return {
+            'breadth_state': 'AVAILABLE',
+            'decision_framework': 'NYSE_AD_PRICE_VWAP_TRIN_CTICK',
+        }
+    return {
+        'breadth_state': 'UNAVAILABLE',
+        'decision_framework': 'PRICE_VWAP_TRIN_CTICK',
+    }
+
+
+def gamma_decision_value(value, decision_eligible):
+    """Expose a Gamma-derived value only after an explicit quality pass."""
+    return value if decision_eligible is True else None
+
 # 日志防干扰设置
 logging.getLogger('ib_insync').setLevel(logging.CRITICAL)
 
@@ -522,11 +540,15 @@ class GlobalSentinel:
         def display_signed(value, digits=0):
             return f"{value:+.{digits}f}" if value is not None else "NA"
 
-        zgl = optional_float(
-            self.opt_ctx.get('gamma_flip_all', self.opt_ctx.get('zgl_price')))
+        gamma_decision_eligible = (
+            self.opt_ctx.get('gamma_decision_eligible') is True)
+        zgl = gamma_decision_value(optional_float(
+            self.opt_ctx.get('gamma_flip_all', self.opt_ctx.get('zgl_price'))),
+            gamma_decision_eligible)
         gamma_flip_alert_enabled = bool(
             getattr(cfg, 'ENABLE_GAMMA_FLIP_ALERT', False)
             and self.context_quality == "OK"
+            and gamma_decision_eligible
             and self.opt_ctx.get('gamma_flip_quality') == 'OK'
             and zgl is not None)
         poc = optional_float(self.spot_ctx.get('poc_price'))
@@ -541,7 +563,10 @@ class GlobalSentinel:
             self.opt_ctx.get('previous_close', self.opt_ctx.get('current_price')))
 
         gamma_zeroes = self.opt_ctx.get('gamma_zeroes') or {}
-        all_zeroes = gamma_zeroes.get('ALL', []) if isinstance(gamma_zeroes, dict) else []
+        all_zeroes = (
+            gamma_zeroes.get('ALL', [])
+            if gamma_decision_eligible and isinstance(gamma_zeroes, dict)
+            else [])
         gamma_expirations = self.opt_ctx.get('gamma_expirations') or {}
         all_expirations = (
             gamma_expirations.get('ALL', [])
@@ -566,6 +591,10 @@ class GlobalSentinel:
             "gamma_curve_version": self.opt_ctx.get('gamma_curve_version') or 'LEGACY_UNKNOWN',
             "gamma_sign_model": self.opt_ctx.get('gamma_sign_model'),
             "gamma_flip_quality": self.opt_ctx.get('gamma_flip_quality'),
+            "gamma_decision_eligible": gamma_decision_eligible,
+            "gamma_tactical_weight": optional_float(
+                self.opt_ctx.get('gamma_tactical_weight')),
+            "gamma_usage": self.opt_ctx.get('gamma_usage'),
             "gamma_expirations": all_expirations,
             "gamma_zero_count": len(all_zeroes),
             "gamma_zeroes": all_zeroes,
@@ -675,6 +704,7 @@ class GlobalSentinel:
                 history_available=add_history_available)
             if add_status != 'OK':
                 add_val = None
+            framework = select_intraday_decision_framework(add_status)
             today_str = datetime.now(NY_TZ).strftime('%Y-%m-%d')
             breadth_backup = (
                 self.post_close_breadth_backup(today_str)
@@ -687,6 +717,8 @@ class GlobalSentinel:
                 "add_age_seconds": add_age_seconds,
                 "add_repeat_count": repeat_count,
                 "add_history_available": add_history_available,
+                "breadth_state": framework["breadth_state"],
+                "decision_framework": framework["decision_framework"],
                 "breadth_backup": breadth_backup,
                 "uvol_raw": None,
                 "dvol_raw": None,
@@ -792,11 +824,21 @@ class GlobalSentinel:
             )
             r += f"【日内高频刺客】\n"
             r += f"SPY 现价: ${spy_px:.2f} (VWAP: ${vwap_now:.2f})\n"
-            r += (
-                f"NYSE净上涨−下跌家数 (AD-NYSE): "
-                f"{display_signed(add_val)} ({add_status}; 原始={display_signed(add_raw)}; "
-                f"更新时间={add_as_of or 'NA'}; 连续相同={repeat_count})\n"
-            )
+            if add_status == 'OK':
+                r += (
+                    "盘中广度状态: 可用 | "
+                    f"AD-NYSE {display_signed(add_val)} | "
+                    f"更新时间={add_as_of or 'NA'}\n")
+            else:
+                r += (
+                    "盘中广度状态: 不可用 | "
+                    f"AD-NYSE={add_status} | 连续相同={repeat_count}\n"
+                    "说明: AD原始值仅保留在add_raw审计字段，禁止用于判断\n")
+            framework_label = "判定框架" if add_status == 'OK' else "替代判定框架"
+            framework_display = (
+                "NYSE AD + 价格/VWAP + TRIN + CTICK"
+                if add_status == 'OK' else "价格/VWAP + TRIN + CTICK")
+            r += f"{framework_label}: {framework_display}\n"
             if breadth_backup:
                 r += (
                     f"备用收盘广度: 上涨家数 {breadth_backup['pct_adv']:.1f}% "
@@ -829,6 +871,8 @@ class GlobalSentinel:
                 "add_as_of": add_as_of,
                 "add_age_seconds": add_age_seconds,
                 "add_repeat_count": repeat_count,
+                "breadth_state": framework["breadth_state"],
+                "decision_framework": framework["decision_framework"],
                 "breadth_pct_adv": (
                     breadth_backup.get('pct_adv') if breadth_backup else None),
                 "breadth_sample_size": (
