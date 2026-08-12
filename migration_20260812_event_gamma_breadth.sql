@@ -56,7 +56,7 @@ WHERE gamma_decision_eligible IS NULL
    OR monthly_wall_usage IS NULL;
 
 UPDATE option_gamma_buckets
-SET decision_eligible = (quality = 'OK'),
+SET decision_eligible = COALESCE(quality = 'OK', false),
     tactical_weight = CASE WHEN quality = 'OK' THEN 1 ELSE 0 END
 WHERE decision_eligible IS NULL OR tactical_weight IS NULL;
 
