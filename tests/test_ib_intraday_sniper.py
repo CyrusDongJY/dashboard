@@ -200,12 +200,12 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
         self.assertIn("GAMMA_DISPLAY_GATE_OK", output)
 
     def test_stale_ad_raw_value_is_audit_only_in_report(self):
-        source = Path("ib_intraday_sniper.py").read_text(encoding="utf-8")
+        source = SNIPER_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("原始值仅保留在add_raw审计字段", source)
         self.assertNotIn("原始={display_signed(add_raw)}", source)
 
     def test_post_close_breadth_uses_record_date_schema(self):
-        source = Path("ib_intraday_sniper.py").read_text(encoding="utf-8")
+        source = SNIPER_SCRIPT.read_text(encoding="utf-8")
         self.assertIn(".select('record_date,pct_adv", source)
         self.assertIn(".eq('record_date', today_str)", source)
         self.assertNotIn(".select('date,pct_adv", source)

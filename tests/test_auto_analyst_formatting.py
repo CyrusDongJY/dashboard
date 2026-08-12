@@ -7,6 +7,8 @@ import pandas as pd
 
 
 ANALYST_PATH = Path(__file__).resolve().parents[1] / "auto_analyst.py"
+if not ANALYST_PATH.exists():
+    ANALYST_PATH = Path.home() / "quant_bot" / "auto_analyst.py"
 
 
 class _Calendar:
