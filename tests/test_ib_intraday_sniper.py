@@ -199,6 +199,45 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
         """)
         self.assertIn("GAMMA_DISPLAY_GATE_OK", output)
 
+    def test_schema_rollout_fallback_preserves_core_intraday_insert(self):
+        output = self._isolated_run("""
+            import runpy
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="schema_fallback_test")
+
+            class Query:
+                def __init__(self, owner):
+                    self.owner = owner
+                def insert(self, payload):
+                    self.owner.payloads.append(payload)
+                    return self
+                def execute(self):
+                    if len(self.owner.payloads) == 1:
+                        raise RuntimeError("schema cache missing breadth_state")
+                    return object()
+
+            class Database:
+                def __init__(self):
+                    self.payloads = []
+                def table(self, _name):
+                    return Query(self)
+
+            database = Database()
+            gate = module["safe_db_insert"]
+            gate.__globals__["supabase"] = database
+            gate.__globals__["DB_MAX_RETRIES"] = 1
+            assert gate(
+                "intraday_logs",
+                {"spy_px": 600, "breadth_state": "UNAVAILABLE",
+                 "decision_framework": "PRICE_VWAP_TRIN_CTICK"},
+                fallback_omit=("breadth_state", "decision_framework"),
+            ) is True
+            assert database.payloads[-1] == {"spy_px": 600}
+            print("SCHEMA_FALLBACK_OK")
+        """)
+        self.assertIn("SCHEMA_FALLBACK_OK", output)
+
     def test_stale_ad_raw_value_is_audit_only_in_report(self):
         source = SNIPER_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("原始值仅保留在add_raw审计字段", source)

@@ -128,21 +128,35 @@ def market_data_subscription(ib_instance, contracts, sleep_time, tick_list=''):
                     ib_instance.cancelMktData(ticker.contract)
             except: pass
 
-def safe_db_insert(table_name, data):
+def safe_db_insert(table_name, data, fallback_omit=()):
     """【容灾模块】原生指数退避重试，绝不阻断主流程"""
+    last_error = None
     for attempt in range(DB_MAX_RETRIES):
         try:
             response = supabase.table(table_name).insert(data).execute()
             return True
         except Exception as e:
+            last_error = e
             if attempt < DB_MAX_RETRIES - 1:
                 sleep_time = 2 ** attempt 
                 print(f"⚠️ 数据库写入异常，{sleep_time}秒后重试...")
                 import time
                 time.sleep(sleep_time) 
-            else:
-                print(f"❌ 数据库写入最终失败: {e}")
-                return False
+    if fallback_omit:
+        fallback = {
+            key: value for key, value in data.items()
+            if key not in fallback_omit
+        }
+        try:
+            supabase.table(table_name).insert(fallback).execute()
+            print(
+                "⚠️ 数据库schema尚未升级，临时剥离可选列写入；"
+                "请尽快执行迁移")
+            return True
+        except Exception as fallback_error:
+            last_error = fallback_error
+    print(f"❌ 数据库写入最终失败: {last_error}")
+    return False
 
 # ================= 核心哨兵系统 =================
 class GlobalSentinel:
@@ -890,7 +904,9 @@ class GlobalSentinel:
                 "context_metadata": context_metadata,
             }
             
-            if safe_db_insert('intraday_logs', db_payload):
+            if safe_db_insert(
+                    'intraday_logs', db_payload,
+                    fallback_omit=('breadth_state', 'decision_framework')):
                 self.log("✅ 盘中数据切片已成功推入 Supabase。")
                 self.backfill_missing_checkpoints(
                     intra_bars, datetime.now(NY_TZ).strftime('%Y-%m-%d'))

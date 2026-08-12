@@ -114,10 +114,48 @@ def market_data_subscription(ib_instance, contracts, sleep_time):
                 logger.debug(f"取消订阅失败: {e}")
 
 # ✅ V9.0：统一走 market_utils.safe_upsert；保留包装以兼容 ib 事件循环的 sleep
-def safe_db_upsert(table_name, data, conflict_cols='date,ticker'):
-    """【容灾模块】原生指数退避重试，防止网络瞬间抖动导致数据丢失"""
-    return safe_upsert(supabase, table_name, data, conflict_cols=conflict_cols,
-                       max_retries=DB_MAX_RETRIES, sleep_fn=ib.sleep)
+def safe_db_upsert(table_name, data, conflict_cols='date,ticker',
+                   optional_columns=()):
+    """写入新契约；迁移尚未落地时保留核心数据写入能力。"""
+    result = safe_upsert(
+        supabase, table_name, data, conflict_cols=conflict_cols,
+        max_retries=DB_MAX_RETRIES, sleep_fn=ib.sleep)
+    if result is not None or not optional_columns:
+        return result
+
+    def strip_optional(row):
+        return {
+            key: value for key, value in row.items()
+            if key not in optional_columns
+        }
+
+    fallback = (
+        [strip_optional(row) for row in data]
+        if isinstance(data, list) else strip_optional(data))
+    logger.warning(
+        "数据库schema尚未升级，%s临时剥离可选列重试；请尽快执行迁移",
+        table_name)
+    return safe_upsert(
+        supabase, table_name, fallback, conflict_cols=conflict_cols,
+        max_retries=DB_MAX_RETRIES, sleep_fn=ib.sleep)
+
+
+PREMARKET_SCHEMA_V20260812_COLUMNS = {
+    "expected_move_event_name",
+    "expected_move_event_at",
+    "expected_move_event_trading_days",
+    "expected_move_event_risk",
+    "expected_move_event_source",
+    "expected_move_event_source_status",
+    "gamma_decision_eligible",
+    "gamma_tactical_weight",
+    "gamma_usage",
+    "monthly_wall_usage",
+}
+GAMMA_BUCKET_SCHEMA_V20260812_COLUMNS = {
+    "decision_eligible",
+    "tactical_weight",
+}
 
 # ================= 安全取价与数据清洗 =================
 def _safe_market_price(ticker):
@@ -1037,9 +1075,10 @@ def get_report():
                     attach_metadata(payload, source_date=today_str)
                     if price_snapshot.get("quote_as_of"):
                         payload["as_of_time"] = price_snapshot["quote_as_of"]
-                    main_result = safe_upsert(
-                        supabase, 'stock_options_pre_market', payload,
-                        conflict_cols='date,ticker')
+                    main_result = safe_db_upsert(
+                        'stock_options_pre_market', payload,
+                        conflict_cols='date,ticker',
+                        optional_columns=PREMARKET_SCHEMA_V20260812_COLUMNS)
                     if main_result is not None:
                         rows_written += 1
                     else:
@@ -1100,9 +1139,10 @@ def get_report():
                             price_snapshot.get("quote_as_of")
                             or datetime.now(timezone.utc).isoformat())
                         bucket_rows.append(bucket_row)
-                    bucket_result = safe_upsert(
-                        supabase, 'option_gamma_buckets', bucket_rows,
-                        conflict_cols='date,ticker,bucket')
+                    bucket_result = safe_db_upsert(
+                        'option_gamma_buckets', bucket_rows,
+                        conflict_cols='date,ticker,bucket',
+                        optional_columns=GAMMA_BUCKET_SCHEMA_V20260812_COLUMNS)
                     if bucket_result is None:
                         quality_issues.append(f"db_gamma_bucket:{sym}")
                     if main_result is not None and bucket_result is not None:
