@@ -9,6 +9,8 @@ import pandas as pd
 ANALYST_PATH = Path(__file__).resolve().parents[1] / "auto_analyst.py"
 if not ANALYST_PATH.exists():
     ANALYST_PATH = Path.home() / "quant_bot" / "auto_analyst.py"
+if str(ANALYST_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(ANALYST_PATH.parent))
 
 
 class _Calendar:
