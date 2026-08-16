@@ -273,6 +273,17 @@ def get_cash_acceptance_ib(ib, symbol):
 
         prefix = symbol.lower()
         result.update({
+            f'{prefix}_previous_close': round(float(daily_frame['close'].iloc[-2]), 4)
+            if daily and len(daily) >= 21 else None,
+            f'{prefix}_open_price': round(float(daily_frame['open'].iloc[-1]), 4)
+            if daily and len(daily) >= 21 else None,
+            f'{prefix}_close_price': round(float(daily_frame['close'].iloc[-1]), 4)
+            if daily and len(daily) >= 21 else None,
+            f'{prefix}_open_to_close_pct': round(
+                (float(daily_frame['close'].iloc[-1]) /
+                 float(daily_frame['open'].iloc[-1]) - 1.0) * 100.0, 4)
+            if daily and len(daily) >= 21 and float(daily_frame['open'].iloc[-1]) > 0
+            else None,
             f'{prefix}_gap_pct': round(gap['gap_pct'], 4)
             if gap['gap_pct'] is not None else None,
             f'{prefix}_gap_acceptance': round(gap['acceptance_ratio'], 4)
@@ -284,6 +295,13 @@ def get_cash_acceptance_ib(ib, symbol):
             f'{prefix}_vwap_volume_acceptance_pct': round(
                 vwap['volume_acceptance_pct'], 2)
             if vwap['volume_acceptance_pct'] is not None else None,
+            f'{prefix}_last_vwap': round(vwap['last_vwap'], 4)
+            if vwap['last_vwap'] is not None else None,
+            f'{prefix}_close_vs_vwap_pct': round(
+                (float(daily_frame['close'].iloc[-1]) / vwap['last_vwap'] - 1.0) * 100.0,
+                4)
+            if daily and len(daily) >= 21 and vwap['last_vwap'] is not None
+            and vwap['last_vwap'] > 0 else None,
             f'{prefix}_vwap_sample_count': vwap['sample_count'],
             f'{prefix}_vwap_missing_samples': vwap['missing_samples'],
             f'{prefix}_vwap_duplicate_samples': vwap['duplicate_samples'],
@@ -938,6 +956,8 @@ def get_report():
                 'qqq_poc_price', 'spy_poc_price', 'concentration_quality',
                 'spy_gap_quality', 'qqq_gap_quality',
                 'spy_vwap_quality', 'qqq_vwap_quality',
+                'spy_open_to_close_pct', 'qqq_open_to_close_pct',
+                'spy_close_vs_vwap_pct', 'qqq_close_vs_vwap_pct',
             ])
             log_data_quality(
                 supabase, job_name='daily_post_close', table_name='stock_spot_post_close',

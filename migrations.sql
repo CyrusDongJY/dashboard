@@ -457,9 +457,17 @@ ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS concentration_quality text
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_gap_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_gap_acceptance numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_gap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_previous_close numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_open_price numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_close_price numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_open_to_close_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_acceptance numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_gap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_previous_close numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_open_price numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_close_price numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_open_to_close_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_time_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_volume_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_sample_count int;
@@ -471,6 +479,8 @@ ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_first_bar timesta
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_last_bar timestamptz;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_independent_source boolean;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_vwap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_last_vwap numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS spy_close_vs_vwap_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_time_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_volume_acceptance_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_sample_count int;
@@ -482,6 +492,8 @@ ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_first_bar timesta
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_last_bar timestamptz;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_independent_source boolean;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_vwap_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_last_vwap numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_close_vs_vwap_pct numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_state text;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_flat_abs_threshold numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_flat_pct_threshold numeric;
@@ -513,6 +525,34 @@ CREATE TABLE IF NOT EXISTS option_volume_anomalies (
 );
 CREATE INDEX IF NOT EXISTS idx_option_volume_anomalies_pending
     ON option_volume_anomalies (symbol, report_date DESC, verification_date);
+
+-- Deterministic daily review. Full source snapshots remain in their native
+-- tables; this table stores only versioned states, evidence and scenarios.
+CREATE TABLE IF NOT EXISTS daily_review (
+    report_date        date        PRIMARY KEY,
+    rule_version       text        NOT NULL,
+    data_quality       text        NOT NULL
+                                CHECK (data_quality IN ('HIGH', 'MEDIUM', 'LOW')),
+    structure_state    text,
+    tactical_state     text,
+    risk_state         text,
+    summary            text,
+    quality_details    jsonb,
+    modules            jsonb,
+    changes            jsonb,
+    anomalies          jsonb,
+    price_map          jsonb,
+    scenarios          jsonb,
+    exposure_context   jsonb,
+    input_dates        jsonb,
+    computed_at        timestamptz,
+    source_date        date,
+    as_of_time         timestamptz,
+    ingested_at        timestamptz,
+    created_at         timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_daily_review_quality_date
+    ON daily_review (data_quality, report_date DESC);
 ALTER TABLE option_volume_anomalies ADD COLUMN IF NOT EXISTS same_snapshot_pattern text;
 ALTER TABLE option_volume_anomalies ADD COLUMN IF NOT EXISTS verification_attempt_date date;
 ALTER TABLE option_volume_anomalies ADD COLUMN IF NOT EXISTS verification_status text;
