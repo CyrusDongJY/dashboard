@@ -32,6 +32,9 @@ try:
     from liquidity_monitor import compute_liquidity_monitor, format_liquidity_summary
     from liquidity_report import build_liquidity_history, generate_liquidity_chart
     from liquidity_sources import OfficialLiquiditySources
+    from risk_capital_ladder import (
+        fetch_risk_capital_ladder, format_risk_capital_summary,
+    )
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -266,6 +269,19 @@ if __name__ == "__main__":
         liquidity_chart = None
         logging.warning(f"流动性水位仪降级为无图模式: {e}")
 
+    risk_capital_text = (
+        "=== 风险资本阶梯（影子观察，不触发预警） ===\n"
+        "本日数据尚未入库。")
+    try:
+        risk_capital = fetch_risk_capital_ladder(supabase, report_date)
+        risk_capital_text = format_risk_capital_summary(risk_capital)
+        logging.info(
+            "风险资本阶梯摘要完成: state=%s, coverage=%.0f%%",
+            risk_capital.get('state'),
+            float(risk_capital.get('coverage') or 0) * 100)
+    except Exception as e:
+        logging.warning(f"风险资本阶梯摘要降级: {e}")
+
     logging.info("📡 唤醒三大联邦探针...")
     # Keep all probes running for their existing capture/persistence side effects;
     # only the compact deterministic review is rendered in the email.
@@ -304,7 +320,8 @@ if __name__ == "__main__":
     email_sent = send_email(
         f"美股日度规则复盘 [{report_date}]",
         review_report,
-        supplemental_sections=[environment_text, liquidity_text],
+        supplemental_sections=[
+            environment_text, liquidity_text, risk_capital_text],
         image_paths=[environment_chart, liquidity_chart])
     if not email_sent:
         logging.warning("⚠️ 复盘数据已完成入库，但邮件投递失败，请检查SMTP日志。")

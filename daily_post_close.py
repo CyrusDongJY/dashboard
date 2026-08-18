@@ -30,6 +30,13 @@ from data_contracts import (
     volume_profile_nodes,
     vwap_acceptance,
 )
+from risk_capital_ladder import (
+    ALL_MEMBERS as RISK_CAPITAL_MEMBERS,
+    BENCHMARK as RISK_CAPITAL_BENCHMARK,
+    compute_risk_capital_ladder,
+    format_risk_capital_summary,
+    persistence_payloads as risk_capital_payloads,
+)
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -232,6 +239,53 @@ def get_market_breadth_ib(ib):
         "mag7_rsp_spread_pct": round(diff_perf, 2) if diff_perf is not None else None,
         "mag7_sample_count": len(mag7_perf),
     }
+
+
+def get_risk_capital_ladder_ib(ib_instance, report_date):
+    """Collect split-adjusted RTH daily bars and persist the shadow ladder."""
+    histories = {}
+    symbols = (RISK_CAPITAL_BENCHMARK, *RISK_CAPITAL_MEMBERS)
+    for symbol in symbols:
+        try:
+            contracts = ib_instance.qualifyContracts(Stock(symbol, 'SMART', 'USD'))
+            if not contracts:
+                logger.warning("%s 风险资本阶梯合约不可用", symbol)
+                continue
+            bars = ib_instance.reqHistoricalData(
+                contracts[0], endDateTime='', durationStr='9 M',
+                barSizeSetting='1 day', whatToShow='TRADES',
+                useRTH=True, formatDate=1)
+            if bars:
+                histories[symbol] = pd.DataFrame([{
+                    'date': pd.to_datetime(bar.date),
+                    'close': bar.close,
+                    'volume': bar.volume,
+                } for bar in bars])
+            ib_instance.sleep(0.15)
+        except Exception as exc:
+            logger.warning("%s 风险资本阶梯历史数据失败: %s", symbol, exc)
+
+    result = compute_risk_capital_ladder(histories, report_date)
+    summary_payload, member_payloads = risk_capital_payloads(result)
+    summary_write = safe_upsert(
+        supabase, 'risk_capital_daily', summary_payload,
+        conflict_cols='report_date', sleep_fn=ib_instance.sleep)
+    member_write = safe_upsert(
+        supabase, 'risk_capital_member_daily', member_payloads,
+        conflict_cols='report_date,ticker', sleep_fn=ib_instance.sleep)
+    write_ok = summary_write is not None and member_write is not None
+    log_data_quality(
+        supabase, job_name='daily_post_close',
+        table_name='risk_capital_daily',
+        status=('ok' if write_ok and result.get('state') != 'UNAVAILABLE'
+                else ('partial' if write_ok else 'failed')),
+        rows_written=(1 + len(member_payloads)) if write_ok else 0,
+        missing_fields=[row['ticker'] for row in member_payloads
+                        if not row.get('decision_eligible')] or None,
+        notes=(f"state={result.get('state')}; coverage="
+               f"{result.get('coverage', 0):.1%}; shadow=true"),
+    )
+    return format_risk_capital_summary(result), result
 
 
 def get_cash_acceptance_ib(ib, symbol):
@@ -887,6 +941,20 @@ def get_report():
         macro_data_db['concentration_quality'] = (
             'OK' if diff_c2c is not None and spy_rsp is not None
             and dict_breadth.get('mag7_sample_count') == 7 else 'PARTIAL')
+
+        report += "\n【模块一A：风险资本阶梯（影子观察）】\n"
+        try:
+            risk_capital_report, risk_capital = get_risk_capital_ladder_ib(
+                ib, today_str)
+            report += risk_capital_report + "\n"
+            logger.info(
+                "风险资本阶梯完成: state=%s, coverage=%.0f%%",
+                risk_capital.get('state'),
+                float(risk_capital.get('coverage') or 0) * 100)
+        except Exception as exc:
+            logger.exception("风险资本阶梯失败，盘后主流程继续: %s", exc)
+            report += (
+                "状态：数据不足\n说明：采集或计算失败；不影响其他盘后模块。\n")
 
         report += "\n【模块一B：现金市场接受度影子指标】\n"
         for acceptance_symbol in ('SPY', 'QQQ'):
