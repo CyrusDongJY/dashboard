@@ -108,7 +108,7 @@ def _robust_z(current, baseline):
     return (current - median) / scale
 
 
-def _benchmark_snapshot(frame, report_date):
+def benchmark_snapshot(frame, report_date):
     data = _normalize_history(frame, report_date)
     source_date = (data["date"].iloc[-1].strftime("%Y-%m-%d")
                    if not data.empty else None)
@@ -123,11 +123,12 @@ def _benchmark_snapshot(frame, report_date):
     }
 
 
-def _empty_member(report_date, symbol, status, source_name):
+def _empty_observation(report_date, symbol, layer, status, source_name,
+                       calc_version):
     return {
         "report_date": str(report_date),
         "ticker": symbol,
-        "layer": MEMBER_LAYER[symbol],
+        "layer": layer,
         "close": None,
         "return_1d_pct": None,
         "return_5d_pct": None,
@@ -148,115 +149,124 @@ def _empty_member(report_date, symbol, status, source_name):
         "sample_len": 0,
         "quality": status,
         "decision_eligible": False,
-        "calc_version": CALC_VERSION,
+        "calc_version": calc_version,
+    }
+
+
+def compute_symbol_observation(frame, benchmark, report_date, symbol, layer,
+                               source_name="IBKR:TRADES:1day:RTH",
+                               calc_version=CALC_VERSION):
+    """Calculate a comparable observation for one stock against QQQ."""
+    data = _normalize_history(frame, report_date)
+    if data.empty:
+        return _empty_observation(
+            report_date, symbol, layer, "MISSING", source_name, calc_version)
+
+    source_date = data["date"].iloc[-1].strftime("%Y-%m-%d")
+    close = data["close"]
+    volume = data["volume"]
+    ret_1d = _return_pct(close, 1)
+    ret_5d = _return_pct(close, 5)
+    qqq_1d = benchmark.get("return_1d_pct")
+    qqq_5d = benchmark.get("return_5d_pct")
+    dollar_volume = close * volume
+    current_dollar_volume = _finite(dollar_volume.iloc[-1])
+    prior_20 = dollar_volume.iloc[-21:-1]
+    prior_60_log = np.log(
+        dollar_volume.iloc[-61:-1].where(dollar_volume.iloc[-61:-1] > 0))
+    current_log = (math.log(current_dollar_volume)
+                   if current_dollar_volume is not None and
+                   current_dollar_volume > 0 else None)
+    median_20 = _finite(prior_20.median()) if len(prior_20) >= 20 else None
+    turnover_ratio = (current_dollar_volume / median_20
+                      if current_dollar_volume is not None and
+                      median_20 not in (None, 0) else None)
+    abnormal_z = _robust_z(current_log, prior_60_log)
+
+    quality = "OK"
+    if source_date != str(report_date):
+        quality = "STALE"
+    elif len(data) < MIN_HISTORY:
+        quality = "INSUFFICIENT_HISTORY"
+    elif current_dollar_volume is None or current_dollar_volume <= 0:
+        quality = "INVALID_VOLUME"
+    elif benchmark.get("quality") != "OK":
+        quality = "BENCHMARK_UNAVAILABLE"
+    required_values = (ret_1d, ret_5d, qqq_1d, qqq_5d, turnover_ratio,
+                       abnormal_z)
+    eligible = quality == "OK" and all(
+        value is not None for value in required_values)
+
+    relative_1d = (ret_1d - qqq_1d
+                   if ret_1d is not None and qqq_1d is not None else None)
+    relative_5d = (ret_5d - qqq_5d
+                   if ret_5d is not None and qqq_5d is not None else None)
+    current_close = _finite(close.iloc[-1])
+    sma20 = _finite(close.tail(20).mean()) if len(close) >= 20 else None
+    sma50 = _finite(close.tail(50).mean()) if len(close) >= 50 else None
+    above_20d = (current_close > sma20
+                 if current_close is not None and sma20 is not None else None)
+    above_50d = (current_close > sma50
+                 if current_close is not None and sma50 is not None else None)
+    score_inputs = [
+        relative_1d is not None and relative_1d > 0,
+        relative_5d is not None and relative_5d > 0,
+        ret_5d is not None and ret_5d > 0,
+        above_20d is True,
+        above_50d is True,
+    ]
+    member_score = (sum(score_inputs) / len(score_inputs) * 100.0
+                    if eligible else None)
+    active_direction = "NORMAL"
+    if eligible and abnormal_z >= ABNORMAL_TURNOVER_Z:
+        active_direction = (
+            "RISK_ON" if relative_1d >= ACTIVE_RELATIVE_MOVE_PCT else
+            ("DELEVERAGING"
+             if relative_1d <= -ACTIVE_RELATIVE_MOVE_PCT else "NORMAL"))
+    event_suspect = bool(
+        eligible and (abs(ret_1d) >= 15.0 or abnormal_z >= 5.0))
+
+    return {
+        "report_date": str(report_date),
+        "ticker": symbol,
+        "layer": layer,
+        "close": round(current_close, 4) if current_close is not None else None,
+        "return_1d_pct": round(ret_1d, 4) if ret_1d is not None else None,
+        "return_5d_pct": round(ret_5d, 4) if ret_5d is not None else None,
+        "qqq_return_1d_pct": round(qqq_1d, 4) if qqq_1d is not None else None,
+        "qqq_return_5d_pct": round(qqq_5d, 4) if qqq_5d is not None else None,
+        "relative_1d_pct": round(relative_1d, 4)
+        if relative_1d is not None else None,
+        "relative_5d_pct": round(relative_5d, 4)
+        if relative_5d is not None else None,
+        "dollar_volume_proxy": round(current_dollar_volume, 2)
+        if current_dollar_volume is not None else None,
+        "turnover_ratio_20d": round(turnover_ratio, 4)
+        if turnover_ratio is not None else None,
+        "abnormal_turnover_z60": round(abnormal_z, 4)
+        if abnormal_z is not None else None,
+        "above_20d": above_20d,
+        "above_50d": above_50d,
+        "member_score": round(member_score, 1)
+        if member_score is not None else None,
+        "active_direction": active_direction,
+        "event_suspect": event_suspect,
+        "source_date": source_date,
+        "source_name": source_name,
+        "sample_len": len(data),
+        "quality": quality,
+        "decision_eligible": eligible,
+        "calc_version": calc_version,
     }
 
 
 def compute_member_rows(histories, report_date, source_name="IBKR:TRADES:1day:RTH"):
     """Calculate member evidence from split-adjusted IBKR-style daily bars."""
-    benchmark = _benchmark_snapshot(histories.get(BENCHMARK), report_date)
-    rows = []
-    for symbol in ALL_MEMBERS:
-        data = _normalize_history(histories.get(symbol), report_date)
-        if data.empty:
-            rows.append(_empty_member(
-                report_date, symbol, "MISSING", source_name))
-            continue
-
-        source_date = data["date"].iloc[-1].strftime("%Y-%m-%d")
-        close = data["close"]
-        volume = data["volume"]
-        ret_1d = _return_pct(close, 1)
-        ret_5d = _return_pct(close, 5)
-        qqq_1d = benchmark.get("return_1d_pct")
-        qqq_5d = benchmark.get("return_5d_pct")
-        dollar_volume = close * volume
-        current_dollar_volume = _finite(dollar_volume.iloc[-1])
-        prior_20 = dollar_volume.iloc[-21:-1]
-        prior_60_log = np.log(
-            dollar_volume.iloc[-61:-1].where(dollar_volume.iloc[-61:-1] > 0))
-        current_log = (math.log(current_dollar_volume)
-                       if current_dollar_volume is not None and
-                       current_dollar_volume > 0 else None)
-        median_20 = _finite(prior_20.median()) if len(prior_20) >= 20 else None
-        turnover_ratio = (current_dollar_volume / median_20
-                          if current_dollar_volume is not None and
-                          median_20 not in (None, 0) else None)
-        abnormal_z = _robust_z(current_log, prior_60_log)
-
-        quality = "OK"
-        if source_date != str(report_date):
-            quality = "STALE"
-        elif len(data) < MIN_HISTORY:
-            quality = "INSUFFICIENT_HISTORY"
-        elif current_dollar_volume is None or current_dollar_volume <= 0:
-            quality = "INVALID_VOLUME"
-        elif benchmark.get("quality") != "OK":
-            quality = "BENCHMARK_UNAVAILABLE"
-        required_values = (ret_1d, ret_5d, qqq_1d, qqq_5d, turnover_ratio,
-                           abnormal_z)
-        eligible = quality == "OK" and all(
-            value is not None for value in required_values)
-
-        relative_1d = (ret_1d - qqq_1d
-                       if ret_1d is not None and qqq_1d is not None else None)
-        relative_5d = (ret_5d - qqq_5d
-                       if ret_5d is not None and qqq_5d is not None else None)
-        current_close = _finite(close.iloc[-1])
-        sma20 = _finite(close.tail(20).mean()) if len(close) >= 20 else None
-        sma50 = _finite(close.tail(50).mean()) if len(close) >= 50 else None
-        above_20d = (current_close > sma20
-                     if current_close is not None and sma20 is not None else None)
-        above_50d = (current_close > sma50
-                     if current_close is not None and sma50 is not None else None)
-        score_inputs = [
-            relative_1d is not None and relative_1d > 0,
-            relative_5d is not None and relative_5d > 0,
-            ret_5d is not None and ret_5d > 0,
-            above_20d is True,
-            above_50d is True,
-        ]
-        member_score = (sum(score_inputs) / len(score_inputs) * 100.0
-                        if eligible else None)
-        active_direction = "NORMAL"
-        if eligible and abnormal_z >= ABNORMAL_TURNOVER_Z:
-            active_direction = (
-                "RISK_ON" if relative_1d >= ACTIVE_RELATIVE_MOVE_PCT else
-                ("DELEVERAGING"
-                 if relative_1d <= -ACTIVE_RELATIVE_MOVE_PCT else "NORMAL"))
-        event_suspect = bool(
-            eligible and (abs(ret_1d) >= 15.0 or abnormal_z >= 5.0))
-
-        rows.append({
-            "report_date": str(report_date),
-            "ticker": symbol,
-            "layer": MEMBER_LAYER[symbol],
-            "close": round(current_close, 4) if current_close is not None else None,
-            "return_1d_pct": round(ret_1d, 4) if ret_1d is not None else None,
-            "return_5d_pct": round(ret_5d, 4) if ret_5d is not None else None,
-            "qqq_return_1d_pct": round(qqq_1d, 4) if qqq_1d is not None else None,
-            "qqq_return_5d_pct": round(qqq_5d, 4) if qqq_5d is not None else None,
-            "relative_1d_pct": round(relative_1d, 4) if relative_1d is not None else None,
-            "relative_5d_pct": round(relative_5d, 4) if relative_5d is not None else None,
-            "dollar_volume_proxy": round(current_dollar_volume, 2)
-            if current_dollar_volume is not None else None,
-            "turnover_ratio_20d": round(turnover_ratio, 4)
-            if turnover_ratio is not None else None,
-            "abnormal_turnover_z60": round(abnormal_z, 4)
-            if abnormal_z is not None else None,
-            "above_20d": above_20d,
-            "above_50d": above_50d,
-            "member_score": round(member_score, 1)
-            if member_score is not None else None,
-            "active_direction": active_direction,
-            "event_suspect": event_suspect,
-            "source_date": source_date,
-            "source_name": source_name,
-            "sample_len": len(data),
-            "quality": quality,
-            "decision_eligible": eligible,
-            "calc_version": CALC_VERSION,
-        })
+    benchmark = benchmark_snapshot(histories.get(BENCHMARK), report_date)
+    rows = [compute_symbol_observation(
+        histories.get(symbol), benchmark, report_date, symbol,
+        MEMBER_LAYER[symbol], source_name=source_name)
+        for symbol in ALL_MEMBERS]
     return rows, benchmark
 
 

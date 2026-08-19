@@ -37,6 +37,14 @@ from risk_capital_ladder import (
     format_risk_capital_summary,
     persistence_payloads as risk_capital_payloads,
 )
+from risk_event_pulse import (
+    BENCHMARK as RISK_EVENT_BENCHMARK,
+    SCAN_CODES as RISK_EVENT_SCAN_CODES,
+    compute_event_pulse,
+    format_event_pulse_summary,
+    merge_scan_candidates,
+    persistence_payloads as risk_event_payloads,
+)
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -286,6 +294,103 @@ def get_risk_capital_ladder_ib(ib_instance, report_date):
                f"{result.get('coverage', 0):.1%}; shadow=true"),
     )
     return format_risk_capital_summary(result), result
+
+
+def discover_risk_event_candidates_ib(ib_instance):
+    """Discover changing US-stock leaders without treating rank as evidence."""
+    scan_results = {}
+    scans_completed = []
+    for scan_code in RISK_EVENT_SCAN_CODES:
+        subscription = ScannerSubscription(
+            numberOfRows=15,
+            instrument='STK',
+            locationCode='STK.US.MAJOR',
+            scanCode=scan_code,
+            abovePrice=5.0,
+            aboveVolume=1_000_000,
+            marketCapAbove=1_000.0,
+            stockTypeFilter='CORP',
+        )
+        try:
+            scan_rows = ib_instance.reqScannerData(subscription)
+            normalized = []
+            for scan_row in scan_rows or []:
+                details = getattr(scan_row, 'contractDetails', None)
+                contract = getattr(details, 'contract', None)
+                symbol = getattr(contract, 'symbol', None)
+                if not symbol:
+                    continue
+                normalized.append({
+                    'ticker': symbol,
+                    'scanner_rank': getattr(scan_row, 'rank', 10_000),
+                    'industry': getattr(details, 'industry', None),
+                    'category': getattr(details, 'category', None),
+                    'subcategory': getattr(details, 'subcategory', None),
+                    'primary_exchange': getattr(
+                        contract, 'primaryExchange', None),
+                    'currency': getattr(contract, 'currency', None),
+                    'sec_type': getattr(contract, 'secType', None),
+                })
+            scan_results[scan_code] = normalized
+            scans_completed.append(scan_code)
+            logger.info("动态异动扫描 %s 返回 %d 只", scan_code, len(normalized))
+        except Exception as exc:
+            logger.warning("动态异动扫描 %s 失败: %s", scan_code, exc)
+        ib_instance.sleep(0.25)
+    return merge_scan_candidates(scan_results), scans_completed
+
+
+def get_risk_event_pulse_ib(ib_instance, report_date):
+    """Validate dynamic scanner candidates with daily price-volume history."""
+    discoveries, scans_completed = discover_risk_event_candidates_ib(ib_instance)
+    histories = {}
+    symbols = (RISK_EVENT_BENCHMARK,
+               *(item['ticker'] for item in discoveries))
+    for symbol in symbols:
+        try:
+            contracts = ib_instance.qualifyContracts(
+                Stock(symbol, 'SMART', 'USD'))
+            if not contracts:
+                logger.warning("%s 动态异动候选合约不可用", symbol)
+                continue
+            bars = ib_instance.reqHistoricalData(
+                contracts[0], endDateTime='', durationStr='9 M',
+                barSizeSetting='1 day', whatToShow='TRADES',
+                useRTH=True, formatDate=1)
+            if bars:
+                histories[symbol] = pd.DataFrame([{
+                    'date': pd.to_datetime(bar.date),
+                    'close': bar.close,
+                    'volume': bar.volume,
+                } for bar in bars])
+            ib_instance.sleep(0.15)
+        except Exception as exc:
+            logger.warning("%s 动态异动历史数据失败: %s", symbol, exc)
+
+    result = compute_event_pulse(
+        histories, discoveries, report_date,
+        scans_completed=scans_completed)
+    summary_payload, candidate_payloads = risk_event_payloads(result)
+    summary_write = safe_upsert(
+        supabase, 'risk_event_pulse_daily', summary_payload,
+        conflict_cols='report_date', sleep_fn=ib_instance.sleep)
+    candidate_write = (safe_upsert(
+        supabase, 'risk_event_candidate_daily', candidate_payloads,
+        conflict_cols='report_date,ticker', sleep_fn=ib_instance.sleep)
+        if candidate_payloads else True)
+    write_ok = summary_write is not None and candidate_write is not None
+    log_data_quality(
+        supabase, job_name='daily_post_close',
+        table_name='risk_event_pulse_daily',
+        status=('ok' if write_ok and result.get('state') != 'UNAVAILABLE'
+                else ('partial' if write_ok else 'failed')),
+        rows_written=(1 + len(candidate_payloads)) if write_ok else 0,
+        missing_fields=[row['ticker'] for row in candidate_payloads
+                        if not row.get('decision_eligible')] or None,
+        notes=(f"state={result.get('state')}; scans="
+               f"{','.join(scans_completed)}; shadow=true"),
+    )
+    return format_event_pulse_summary(result), result
 
 
 def get_cash_acceptance_ib(ib, symbol):
@@ -955,6 +1060,22 @@ def get_report():
             logger.exception("风险资本阶梯失败，盘后主流程继续: %s", exc)
             report += (
                 "状态：数据不足\n说明：采集或计算失败；不影响其他盘后模块。\n")
+
+        report += "\n【模块一A-2：当日动态异动脉冲（影子观察）】\n"
+        try:
+            event_pulse_report, event_pulse = get_risk_event_pulse_ib(
+                ib, today_str)
+            report += event_pulse_report + "\n"
+            logger.info(
+                "动态异动脉冲完成: state=%s, candidates=%d, eligible=%d",
+                event_pulse.get('state'),
+                int(event_pulse.get('candidate_count') or 0),
+                int(event_pulse.get('eligible_count') or 0))
+        except Exception as exc:
+            logger.exception("动态异动脉冲失败，盘后主流程继续: %s", exc)
+            report += (
+                "状态：数据不足\n说明：动态扫描或历史验证失败；"
+                "固定风险资本阶梯不受影响。\n")
 
         report += "\n【模块一B：现金市场接受度影子指标】\n"
         for acceptance_symbol in ('SPY', 'QQQ'):

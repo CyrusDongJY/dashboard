@@ -35,6 +35,9 @@ try:
     from risk_capital_ladder import (
         fetch_risk_capital_ladder, format_risk_capital_summary,
     )
+    from risk_event_pulse import (
+        fetch_event_pulse, format_event_pulse_summary,
+    )
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -282,6 +285,20 @@ if __name__ == "__main__":
     except Exception as e:
         logging.warning(f"风险资本阶梯摘要降级: {e}")
 
+    event_pulse_text = (
+        "=== 当日动态异动脉冲（影子观察，不触发预警） ===\n"
+        "本日数据尚未入库。")
+    try:
+        event_pulse = fetch_event_pulse(supabase, report_date)
+        event_pulse_text = format_event_pulse_summary(event_pulse)
+        logging.info(
+            "动态异动脉冲摘要完成: state=%s, candidates=%d, eligible=%d",
+            event_pulse.get('state'),
+            int(event_pulse.get('candidate_count') or 0),
+            int(event_pulse.get('eligible_count') or 0))
+    except Exception as e:
+        logging.warning(f"动态异动脉冲摘要降级: {e}")
+
     logging.info("📡 唤醒三大联邦探针...")
     # Keep all probes running for their existing capture/persistence side effects;
     # only the compact deterministic review is rendered in the email.
@@ -321,7 +338,8 @@ if __name__ == "__main__":
         f"美股日度规则复盘 [{report_date}]",
         review_report,
         supplemental_sections=[
-            environment_text, liquidity_text, risk_capital_text],
+            environment_text, liquidity_text, risk_capital_text,
+            event_pulse_text],
         image_paths=[environment_chart, liquidity_chart])
     if not email_sent:
         logging.warning("⚠️ 复盘数据已完成入库，但邮件投递失败，请检查SMTP日志。")
