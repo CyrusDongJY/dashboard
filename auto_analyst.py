@@ -38,6 +38,7 @@ try:
     from risk_event_pulse import (
         fetch_event_pulse, format_event_pulse_summary,
     )
+    from tactical_stress import format_tactical_stress_summary
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -272,6 +273,30 @@ if __name__ == "__main__":
         liquidity_chart = None
         logging.warning(f"流动性水位仪降级为无图模式: {e}")
 
+    tactical_stress_text = format_tactical_stress_summary({})
+    try:
+        response = (
+            supabase.table("market_history")
+            .select(
+                "record_date,eod_stress_score,micro_score,stress_components,"
+                "stress_coverage,stress_confidence,stress_calc_version,"
+                "stress_computed_at"
+            )
+            .eq("record_date", report_date).limit(1).execute()
+        )
+        tactical_stress_row = (
+            dict(response.data[0]) if response.data else {"record_date": report_date}
+        )
+        tactical_stress_text = format_tactical_stress_summary(
+            tactical_stress_row)
+        logging.info(
+            "盘后跨资产战术压力摘要完成: score=%s, coverage=%s",
+            tactical_stress_row.get("eod_stress_score"),
+            tactical_stress_row.get("stress_coverage"),
+        )
+    except Exception as e:
+        logging.warning(f"盘后跨资产战术压力摘要降级: {e}")
+
     risk_capital_text = (
         "=== 风险资本阶梯（影子观察，不触发预警） ===\n"
         "本日数据尚未入库。")
@@ -327,8 +352,8 @@ if __name__ == "__main__":
         logging.exception(f"❌ 日度复盘状态引擎失败，邮件进入只读降级模式: {e}")
         review_report = (
             f"美股日度复盘 | {report_date}\n"
-            "数据质量：LOW\n"
-            "状态：UNAVAILABLE\n"
+            "数据质量：低\n"
+            "状态：数据不可用\n"
             "原因：日度复盘规则引擎运行失败。原始数据和异常事件仍按原流程入库。\n\n"
             "异常矩阵：\n" + format_matrix(anomaly_events)
         )
@@ -338,7 +363,8 @@ if __name__ == "__main__":
         f"美股日度规则复盘 [{report_date}]",
         review_report,
         supplemental_sections=[
-            environment_text, liquidity_text, risk_capital_text,
+            environment_text, liquidity_text, tactical_stress_text,
+            risk_capital_text,
             event_pulse_text],
         image_paths=[environment_chart, liquidity_chart])
     if not email_sent:

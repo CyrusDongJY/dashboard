@@ -9,6 +9,67 @@ import math
 
 RULE_VERSION = "daily_review_v1.0-shadow"
 
+DISPLAY_LABELS = {
+    "quality": {
+        "HIGH": "高",
+        "MEDIUM": "中",
+        "LOW": "低",
+    },
+    "cash": {
+        "Accepted": "价格已获接受",
+        "Rejected": "价格未获接受",
+        "Partial": "部分接受",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "breadth": {
+        "Broad": "广泛扩散",
+        "Deterioration": "广度恶化",
+        "Rotation": "轮动",
+        "Concentrated": "集中",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "volatility": {
+        "Stress": "承压",
+        "Suppressed": "低波压制",
+        "Normal": "常态",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "credit": {
+        "Stress": "承压",
+        "Warning": "预警",
+        "Stable": "稳定",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "rates": {
+        "Headwind": "逆风",
+        "Tailwind": "顺风",
+        "Neutral": "中性",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "liquidity": {
+        "Inflow": "扩张",
+        "Drain": "收缩",
+        "Flat": "平稳",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "risk": {
+        "Risk-off": "风险规避",
+        "UNAVAILABLE": "数据不可用",
+    },
+    "vix_curve": {
+        "BACKWARDATION": "倒挂",
+        "CONTANGO": "正向升水",
+        "FLAT": "平坦",
+        "MISSING": "数据缺失",
+    },
+}
+
+
+def _display_label(category, value):
+    """Translate report labels without changing persisted rule enums."""
+    label = str(value) if value is not None else "UNAVAILABLE"
+    return DISPLAY_LABELS.get(category, {}).get(label, label)
+
 
 def _finite(value):
     if value is None or isinstance(value, bool):
@@ -211,7 +272,8 @@ def _cash_module(spot, fresh):
         evidence.append(
             f"{symbol} O→C {_fmt(item['open_to_close_pct'], 2, '%')} | "
             f"VWAP时间/成交量 {_fmt(item['time_pct'])}%/{_fmt(item['volume_pct'])}% | "
-            f"收盘-VWAP {_fmt(item['close_vs_vwap_pct'], 2, '%')} | {item['state']}"
+            f"收盘-VWAP {_fmt(item['close_vs_vwap_pct'], 2, '%')} | "
+            f"{_display_label('cash', item['state'])}"
         )
     return _module(
         state, quality, evidence, decision_eligible=quality == "HIGH",
@@ -281,9 +343,10 @@ def _volatility_module(market, spot, metric_rows, fresh):
         "source_date": gex.get("source_date"),
     }
     evidence = [
-        f"VIX={_fmt(vix, 2)} | VVIX={_fmt(vvix, 2)} | VIX期货={curve} ({_fmt(contango, 2)}%)",
+        f"VIX={_fmt(vix, 2)} | VVIX={_fmt(vvix, 2)} | "
+        f"VIX期货={_display_label('vix_curve', curve)} ({_fmt(contango, 2)}%)",
         (f"GEX={_fmt(gex_context['value'], 2)} | 分位={_fmt(gex_context['percentile'])}% | "
-         f"Z={_fmt(gex_context['zscore'], 2)} | context-only"),
+         f"Z={_fmt(gex_context['zscore'], 2)} | 仅作背景"),
     ]
     return _module(state, quality, evidence, decision_eligible=quality == "HIGH",
                    values={"vix": vix, "vvix": vvix, "contango_pct": contango,
@@ -490,7 +553,7 @@ def build_daily_review(report_date, *, market_row, spot_row,
         risk = "风险状态不可用"
 
     structure_state = structure["state"]
-    summary = f"{structure_state}｜{tactical}｜{risk}"
+    summary = f"{structure_state}｜{tactical}｜{_display_label('risk', risk)}"
     changes = _meaningful_changes(
         market_row, prior_market_row, spot_row, prior_spot_row)
     if not changes:
@@ -500,18 +563,18 @@ def build_daily_review(report_date, *, market_row, spot_row,
 
     scenarios = {
         "bull": [
-            "SPY与QQQ现金市场均转为Accepted",
-            "广度维持Broad或由Concentrated改善为Broad",
-            "VIX期货不进入Backwardation，信用保持Stable",
+            "SPY与QQQ现金市场均转为价格已获接受",
+            "广度维持广泛扩散，或由集中改善为广泛扩散",
+            "VIX期限结构不进入倒挂，信用保持稳定",
         ],
         "base": [
             f"当前基准：{summary}",
             "关键质量字段不降级，价格围绕有效VWAP中轴消化",
         ],
         "bear": [
-            "SPY与QQQ动态VWAP连续Rejected",
-            "上涨家数与Top500 TRIN共同确认Deterioration",
-            "VIX结构转Stress；若信用同时Stress则升级为Regime-change",
+            "SPY与QQQ动态VWAP连续未获价格接受",
+            "上涨家数与Top500 TRIN共同确认广度恶化",
+            "VIX结构转为承压；若信用同步承压则升级为环境切换",
         ],
     }
     exposure = {
@@ -572,17 +635,18 @@ def format_daily_review_email(review, prior_review=None):
         "=" * 52,
         "① 今日一句话结论",
         review.get("summary", "状态不可用"),
-        f"数据质量：{quality} | 规则版本：{review.get('rule_version')}",
+        f"数据质量：{_display_label('quality', quality)} | "
+        f"规则版本：{review.get('rule_version')}",
         "",
         "② 状态总表",
         (f"市场结构：{review.get('structure_state')} "
          f"[{_state_change(review.get('structure_state'), prior_review.get('structure_state'))}]"),
-        (f"现金市场：{modules.get('cash', {}).get('state', 'UNAVAILABLE')} | "
-         f"广度：{modules.get('breadth', {}).get('state', 'UNAVAILABLE')}"),
-        (f"波动率：{modules.get('volatility', {}).get('state', 'UNAVAILABLE')} | "
-         f"信用：{modules.get('credit', {}).get('state', 'UNAVAILABLE')}"),
-        (f"利率：{modules.get('rates', {}).get('state', 'UNAVAILABLE')} | "
-         f"流动性：{modules.get('liquidity', {}).get('state', 'UNAVAILABLE')}"),
+        (f"现金市场：{_display_label('cash', modules.get('cash', {}).get('state'))} | "
+         f"广度：{_display_label('breadth', modules.get('breadth', {}).get('state'))}"),
+        (f"波动率：{_display_label('volatility', modules.get('volatility', {}).get('state'))} | "
+         f"信用：{_display_label('credit', modules.get('credit', {}).get('state'))}"),
+        (f"利率：{_display_label('rates', modules.get('rates', {}).get('state'))} | "
+         f"流动性：{_display_label('liquidity', modules.get('liquidity', {}).get('state'))}"),
         "",
         "③ 较昨日的重要变化",
     ]
@@ -625,14 +689,15 @@ def format_daily_review_email(review, prior_review=None):
         )
 
     lines.extend(["", "⑩ 三情景（只列触发条件）"])
-    for key, label in (("bull", "Bull"), ("base", "Base"), ("bear", "Bear")):
+    for key, label in (("bull", "乐观"), ("base", "基准"), ("bear", "悲观")):
         lines.append(f"{label}: " + "；".join(review.get("scenarios", {}).get(key, [])))
 
     exposure = review.get("exposure_context", {})
     lines.extend([
         "", "⑪ 风险暴露观察（影子）",
-        (f"Beta={exposure.get('beta', 'NA')} | Theta={exposure.get('theta', 'NA')} | "
-         f"Convexity={exposure.get('convexity', 'NA')}"),
+        (f"方向暴露={exposure.get('beta', '数据不可用')} | "
+         f"时间价值暴露={exposure.get('theta', '数据不可用')} | "
+         f"凸性暴露={exposure.get('convexity', '数据不可用')}"),
         exposure.get("disclaimer", ""),
         "", "数据归档：market_history / macro_spot_daily / "
         "stock_options_pre_market / stock_spot_post_close / anomaly_events / daily_review",

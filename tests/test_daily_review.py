@@ -164,6 +164,43 @@ class DailyReviewTests(unittest.TestCase):
         self.assertNotIn("机密附件一", email)
         self.assertLess(len(email.splitlines()), 70)
 
+    def test_email_translates_rule_enums_without_mutating_internal_states(self):
+        rejected = spot_row(
+            spy_vwap_time_acceptance_pct=25.0,
+            spy_vwap_volume_acceptance_pct=30.0,
+            spy_close_vs_vwap_pct=-0.8,
+            qqq_vwap_time_acceptance_pct=20.0,
+            qqq_vwap_volume_acceptance_pct=28.0,
+            qqq_close_vs_vwap_pct=-1.0,
+            qqq_mom_pct=-1.2,
+        )
+        mixed = market_row(
+            pct_adv=50.0,
+            trin=1.0,
+            up_down_volume_ratio=1.0,
+            vix=20.0,
+            liq_roc=-3.0,
+        )
+        review = self.build(market_row=mixed, spot_row=rejected)
+        email = format_daily_review_email(review)
+
+        self.assertEqual(review["modules"]["cash"]["state"], "Rejected")
+        self.assertEqual(review["modules"]["breadth"]["state"], "Rotation")
+        self.assertEqual(review["modules"]["volatility"]["state"], "Normal")
+        self.assertEqual(review["modules"]["credit"]["state"], "Stable")
+        self.assertEqual(review["modules"]["rates"]["state"], "Neutral")
+        self.assertEqual(review["modules"]["liquidity"]["state"], "Drain")
+        self.assertIn("数据质量：高", email)
+        self.assertIn("现金市场：价格未获接受 | 广度：轮动", email)
+        self.assertIn("波动率：常态 | 信用：稳定", email)
+        self.assertIn("利率：中性 | 流动性：收缩", email)
+        self.assertIn("乐观:", email)
+        self.assertIn("基准:", email)
+        self.assertIn("悲观:", email)
+        for raw_state in (
+                "Rejected", "Rotation", "Normal", "Stable", "Neutral", "Drain"):
+            self.assertNotIn(raw_state, email)
+
 
 if __name__ == "__main__":
     unittest.main()

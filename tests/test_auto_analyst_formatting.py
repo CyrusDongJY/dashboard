@@ -61,6 +61,20 @@ class AutoAnalystFormattingTests(unittest.TestCase):
         self.assertIn("风险HIGH", text)
         self.assertIn("Gamma数据不足", text)
 
+    def test_tactical_stress_section_is_restored_below_liquidity(self):
+        source = ANALYST_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "from tactical_stress import format_tactical_stress_summary",
+            source,
+        )
+        section_order = source.index(
+            "environment_text, liquidity_text, tactical_stress_text")
+        self.assertGreater(section_order, source.index("supplemental_sections=["))
+        self.assertIn(
+            '"record_date,eod_stress_score,micro_score,stress_components,"',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
