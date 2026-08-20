@@ -25,6 +25,8 @@ References:
 ## Production contract
 
 - Discovery: IBKR `TOP_PERC_GAIN`, `TOP_PERC_LOSE`, and `HOT_BY_VOLUME`.
+- Scanner rows can omit industry metadata; request full IBKR contract details
+  for those candidates before evaluating cross-industry confirmation.
 - Universe filters: US major stocks, USD, common stock, price at least $5,
   daily volume at least 1 million, scanner market cap at least $1 billion.
 - The fixed ladder's eight names and QQQ are excluded from the dynamic list to

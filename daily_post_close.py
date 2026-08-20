@@ -337,7 +337,29 @@ def discover_risk_event_candidates_ib(ib_instance):
         except Exception as exc:
             logger.warning("动态异动扫描 %s 失败: %s", scan_code, exc)
         ib_instance.sleep(0.25)
-    return merge_scan_candidates(scan_results), scans_completed
+    candidates = merge_scan_candidates(scan_results)
+    for candidate in candidates:
+        if candidate.get('industry'):
+            continue
+        try:
+            details = ib_instance.reqContractDetails(
+                Stock(candidate['ticker'], 'SMART', 'USD'))
+            if not details:
+                continue
+            full = details[0]
+            contract = getattr(full, 'contract', None)
+            candidate.update({
+                'industry': getattr(full, 'industry', None),
+                'category': getattr(full, 'category', None),
+                'subcategory': getattr(full, 'subcategory', None),
+                'primary_exchange': getattr(
+                    contract, 'primaryExchange', None),
+            })
+            ib_instance.sleep(0.05)
+        except Exception as exc:
+            logger.warning("%s 动态异动行业补全失败: %s",
+                           candidate['ticker'], exc)
+    return candidates, scans_completed
 
 
 def get_risk_event_pulse_ib(ib_instance, report_date):
