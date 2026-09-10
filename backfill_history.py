@@ -190,9 +190,12 @@ def build_metric_series(yf_df, fred_df, squeeze_df=None):
         if {"HYG", "TLT"}.issubset(yf_df.columns):
             add("hyg_tlt_ratio", yf_df["HYG"] / yf_df["TLT"], "yfinance")
         if {"^VIX", "SPY"}.issubset(yf_df.columns):
-            spy_log_return = np.log(yf_df["SPY"] / yf_df["SPY"].shift(1))
+            spy = pd.to_numeric(yf_df["SPY"], errors="coerce").dropna()
+            vix = pd.to_numeric(yf_df["^VIX"], errors="coerce").dropna()
+            spy_log_return = np.log(spy / spy.shift(1))
             hv20 = spy_log_return.rolling(20, min_periods=20).std() * np.sqrt(252) * 100
-            add("vrp_num", yf_df["^VIX"] - hv20, "yfinance:^VIX+SPY_HV20")
+            add("vrp_num", vix.reindex(hv20.index) - hv20,
+                "yfinance:^VIX+SPY_HV20")
         for family, spec in MARKET_SHOCK_SPECS.items():
             ticker = spec["ticker"]
             if ticker not in yf_df:

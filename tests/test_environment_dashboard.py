@@ -416,6 +416,17 @@ class BackfillTests(unittest.TestCase):
             self.assertIn(metric, metrics)
             self.assertTrue(metrics[metric]["source_name"].startswith("yfinance:"))
 
+    def test_vrp_backfill_ignores_crypto_weekend_rows(self):
+        index = pd.date_range("2026-01-01", periods=60, freq="D")
+        weekdays = index.dayofweek < 5
+        frame = pd.DataFrame(index=index)
+        frame["SPY"] = np.where(weekdays, np.linspace(500.0, 520.0, len(index)), np.nan)
+        frame["^VIX"] = np.where(weekdays, np.linspace(18.0, 20.0, len(index)), np.nan)
+        frame["BTC-USD"] = np.linspace(60000.0, 65000.0, len(index))
+        metrics = build_metric_series(frame, pd.DataFrame())
+        self.assertIn("vrp_num", metrics)
+        self.assertGreater(len(metrics["vrp_num"]["series"]), 0)
+
 
 class _Query:
     def __init__(self, rows):
