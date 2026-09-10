@@ -12,6 +12,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import requests
@@ -21,7 +22,13 @@ CONFIG_DIR = os.path.expanduser("~/market_dashboard")
 if CONFIG_DIR not in sys.path:
     sys.path.append(CONFIG_DIR)
 
-from anomaly_engine import METRIC_REGISTRY, metric_snapshot, window_change  # noqa: E402
+from anomaly_engine import (  # noqa: E402
+    MARKET_SHOCK_SPECS,
+    METRIC_REGISTRY,
+    build_market_shock_series,
+    metric_snapshot,
+    window_change,
+)
 from market_utils import safe_upsert  # noqa: E402
 
 logger = logging.getLogger("backfill")
@@ -29,7 +36,8 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(m
 
 YF_TICKERS = [
     "^VIX", "^MOVE", "^VVIX", "^SKEW", "^VIX3M",
-    "DX-Y.NYB", "HYG", "TLT",
+    "DX-Y.NYB", "JPY=X", "CL=F", "GC=F", "BTC-USD", "^TNX",
+    "HYG", "TLT", "SPY",
 ]
 FRED_MAP = {
     "BAMLH0A0HYM2": "credit_spread",
@@ -181,6 +189,17 @@ def build_metric_series(yf_df, fred_df, squeeze_df=None):
                 "yfinance")
         if {"HYG", "TLT"}.issubset(yf_df.columns):
             add("hyg_tlt_ratio", yf_df["HYG"] / yf_df["TLT"], "yfinance")
+        if {"^VIX", "SPY"}.issubset(yf_df.columns):
+            spy_log_return = np.log(yf_df["SPY"] / yf_df["SPY"].shift(1))
+            hv20 = spy_log_return.rolling(20, min_periods=20).std() * np.sqrt(252) * 100
+            add("vrp_num", yf_df["^VIX"] - hv20, "yfinance:^VIX+SPY_HV20")
+        for family, spec in MARKET_SHOCK_SPECS.items():
+            ticker = spec["ticker"]
+            if ticker not in yf_df:
+                continue
+            for metric, series in build_market_shock_series(
+                    family, yf_df[ticker]).items():
+                add(metric, series, f"yfinance:{ticker}")
 
     if not fred_df.empty:
         if "credit_spread" in fred_df:

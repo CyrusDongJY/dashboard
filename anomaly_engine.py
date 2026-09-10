@@ -59,8 +59,6 @@ METRIC_REGISTRY = {
     "skew":            {"cn": "Cboe SKEW", "bad_dir": +1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
     "vrp_num":         {"cn": "VRP风险溢价", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 10, 1)], "z": (2.0, 3.0)},
-    "vix_term_ratio":  {"cn": "VIX/VIX3M", "bad_dir": +1, "scope": "MACRO",
-                          "abs": [(">=", 1.0, 2)], "z": (2.0, 3.0)},
     "dix_pct":         {"cn": "DIX场外短售代理", "bad_dir": 0, "scope": "MACRO",
                           "abs": None, "z": (2.0, 3.0)},
     "gex_billions":    {"cn": "GEX做市商Gamma代理", "bad_dir": 0, "scope": "MACRO",
@@ -92,7 +90,8 @@ METRIC_REGISTRY = {
     "trin":            {"cn": "前500大市值样本TRIN", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 2.0, 1)], "z": (2.5, 3.5)},
     # 跨资产
-    "dxy":             {"cn": "美元指数", "bad_dir": +1, "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
+    "dxy":             {"cn": "美元指数", "bad_dir": +1, "scope": "MACRO", "abs": None,
+                          "z": (2.0, 3.0), "cluster_family": "market_shock:dxy"},
     "cg_z":            {"cn": "铜金比Z", "bad_dir": -1, "scope": "MACRO",
                           "abs": [("<", -2.0, 2), ("<", -1.0, 1)], "z": (2.0, 3.0)},
     "tqqq_drag_pct":   {"cn": "TQQQ损耗", "bad_dir": -1, "scope": "MACRO",
@@ -125,9 +124,76 @@ METRIC_REGISTRY = {
     "iv_skew":         {"cn": "IV偏斜", "bad_dir": 0, "scope": "STOCK", "abs": None, "z": (2.5, 3.5)},
 }
 
+# 非平稳价格不能直接用绝对水位 z-score 解释为异常。这里统一把跨资产价格
+# 转成滚动收益率，把收益率转成基点变化，再做双向统计扫描。min_abs 是噪声
+# 地板，z 阈值负责判断相对历史是否极端；这些指标暂不进入环境指数或共振。
+MARKET_SHOCK_SPECS = {
+    "dxy": {
+        "field": "dxy", "ticker": "DX-Y.NYB", "cn": "美元指数", "mode": "pct",
+        "up_label": "美元走强", "down_label": "美元走弱",
+        "windows": {1: ("dxy_return_1d_pct", 0.5),
+                    5: ("dxy_return_5d_pct", 1.0),
+                    21: ("dxy_return_21d_pct", 2.0)},
+    },
+    "usdjpy": {
+        "field": "jpy", "ticker": "JPY=X", "cn": "美元兑日元", "mode": "pct",
+        "up_label": "日元走弱", "down_label": "日元走强",
+        "windows": {1: ("usdjpy_return_1d_pct", 1.0),
+                    5: ("usdjpy_return_5d_pct", 2.0),
+                    21: ("usdjpy_return_21d_pct", 4.0)},
+    },
+    "oil": {
+        "field": "oil", "ticker": "CL=F", "cn": "WTI原油", "mode": "pct",
+        "up_label": "油价上行", "down_label": "油价下行",
+        "windows": {1: ("oil_return_1d_pct", 3.0),
+                    5: ("oil_return_5d_pct", 6.0),
+                    21: ("oil_return_21d_pct", 10.0)},
+    },
+    "gold": {
+        "field": "gold", "ticker": "GC=F", "cn": "黄金", "mode": "pct",
+        "up_label": "金价上行", "down_label": "金价下行",
+        "windows": {1: ("gold_return_1d_pct", 2.0),
+                    5: ("gold_return_5d_pct", 4.0),
+                    21: ("gold_return_21d_pct", 8.0)},
+    },
+    "btc": {
+        "field": "btc", "ticker": "BTC-USD", "cn": "比特币", "mode": "pct",
+        "up_label": "风险资产上行", "down_label": "风险资产下行",
+        "windows": {1: ("btc_return_1d_pct", 5.0),
+                    5: ("btc_return_5d_pct", 10.0),
+                    21: ("btc_return_21d_pct", 20.0)},
+    },
+    "us10y": {
+        "field": "us10y", "ticker": "^TNX", "cn": "10年期美债收益率", "mode": "bp",
+        "up_label": "收益率上行", "down_label": "收益率下行",
+        "windows": {1: ("us10y_change_1d_bp", 10.0),
+                    5: ("us10y_change_5d_bp", 20.0),
+                    21: ("us10y_change_21d_bp", 40.0)},
+    },
+}
+
+for _family, _spec in MARKET_SHOCK_SPECS.items():
+    for _days, (_metric, _min_abs) in _spec["windows"].items():
+        _unit = "bp" if _spec["mode"] == "bp" else "%"
+        METRIC_REGISTRY[_metric] = {
+            "cn": f"{_spec['cn']}{_days}日变动",
+            "bad_dir": 0,
+            "scope": "MACRO",
+            "abs": None,
+            "z": (2.5, 3.0),
+            "two_sided": True,
+            "min_abs": _min_abs,
+            "baseline_obs": 126,
+            "observation_window": f"{_days}D",
+            "unit": _unit,
+            "up_label": _spec["up_label"],
+            "down_label": _spec["down_label"],
+            "cluster_family": f"market_shock:{_family}",
+        }
+
 WINDOWS = {"1D": 1, "5D": 5, "21D": 21, "63D": 63}
 BASELINE = 252  # 统计基准窗口（交易日）
-CALC_VERSION = "env_v2"
+CALC_VERSION = "env_v2.1"
 
 
 @dataclass
@@ -190,12 +256,13 @@ def window_change(series, n):
         return None
     return float(s.iloc[-1] - s.iloc[-(n + 1)])
 
-def freshness_confidence(sample_len, lag_days, needs_baseline=True):
+def freshness_confidence(sample_len, lag_days, needs_baseline=True,
+                         baseline_obs=BASELINE):
     """置信度 = 样本充分度 × 新鲜度。
-    needs_baseline=True（z-score/分位类）：252 样本满分，样本不足线性降权；
+    needs_baseline=True（z-score/分位类）：达到指标基准样本数满分，样本不足线性降权；
     needs_baseline=False（绝对阈值类）：数值本身即有含义，样本惩罚下限 0.5。
     滞后每交易日打 0.85 折。"""
-    sample_factor = min(1.0, sample_len / BASELINE) if sample_len else 0.0
+    sample_factor = min(1.0, sample_len / baseline_obs) if sample_len else 0.0
     if not needs_baseline:
         sample_factor = max(0.5, sample_factor)
     fresh_factor = 0.85 ** max(0, lag_days)
@@ -221,7 +288,9 @@ def scan_metric(metric, series, report_date, scope=None, source_date=None):
     lag = lag_trading_days(source_date, report_date) if source_date else 0
     z, n = zscore_252(s)
     pct = percentile_252(s)
-    conf_baseline = freshness_confidence(n, lag, needs_baseline=True)   # z/分位类
+    baseline_obs = int(reg.get("baseline_obs", BASELINE))
+    conf_baseline = freshness_confidence(
+        n, lag, needs_baseline=True, baseline_obs=baseline_obs)         # z/分位类
     conf_abs = freshness_confidence(n, lag, needs_baseline=False)       # 绝对阈值类
     cur = float(s.iloc[-1])
     bad_dir = reg["bad_dir"]
@@ -245,7 +314,25 @@ def scan_metric(metric, series, report_date, scope=None, source_date=None):
         ))
 
     # ---- z-score 异常（作用于危险方向）----
-    if z is not None and bad_dir != 0:
+    if z is not None and reg.get("two_sided"):
+        s2, s3 = reg["z"]
+        min_abs = float(reg.get("min_abs", 0.0))
+        z_sev = 3 if abs(z) >= s3 else (2 if abs(z) >= s2 else 0)
+        if z_sev > 0 and abs(cur) >= min_abs:
+            move_label = reg["up_label"] if cur > 0 else reg["down_label"]
+            unit = reg.get("unit", "")
+            events.append(AnomalyEvent(
+                report_date=report_date, metric=metric, scope=scope,
+                window=reg.get("observation_window", "252D"),
+                value=round(cur, 4), change=round(cur, 4), zscore=round(z, 2),
+                percentile=round(pct, 1) if pct is not None else None,
+                direction="up" if cur > 0 else "down",
+                severity=z_sev, confidence=conf_baseline,
+                source_date=source_date, lag_days=lag, layer="single",
+                explanation=(f"{reg['cn']}：{move_label} {cur:+.2f}{unit}，"
+                             f"偏离历史变动基准 {z:+.2f}σ"),
+            ))
+    elif z is not None and bad_dir != 0:
         z_dir = z * bad_dir  # 折算成"越大越危险"
         s2, s3 = reg["z"]
         z_sev = 3 if z_dir >= s3 else (2 if z_dir >= s2 else 0)
@@ -345,7 +432,11 @@ def metric_snapshot(metric, series, report_date, scope=None, source_date=None,
         for op, thr, sv in reg["abs"]:
             if _cmp(op, cur, thr):
                 sev = max(sev, sv)
-    if z is not None and reg["bad_dir"] != 0:
+    if z is not None and reg.get("two_sided"):
+        s2, s3 = reg["z"]
+        if abs(cur) >= float(reg.get("min_abs", 0.0)):
+            sev = max(sev, 3 if abs(z) >= s3 else (2 if abs(z) >= s2 else 0))
+    elif z is not None and reg["bad_dir"] != 0:
         z_dir = z * reg["bad_dir"]
         s2, s3 = reg["z"]
         sev = max(sev, 3 if z_dir >= s3 else (2 if z_dir >= s2 else 0))
@@ -476,6 +567,43 @@ def _metric_source_date(df, metric, date_col, preferred_source_cols=()):
     return str(value) if value is not None and not pd.isna(value) else None
 
 
+def _metric_source_name(df, metric, preferred_source_cols=(), fallback=None):
+    if metric not in df.columns:
+        return fallback
+    valid = pd.to_numeric(df[metric], errors='coerce').notna()
+    if not valid.any():
+        return fallback
+    row = df.loc[valid].iloc[-1]
+    for col in preferred_source_cols:
+        value = row.get(col)
+        if value is not None and not pd.isna(value):
+            return str(value)
+    return fallback
+
+
+def _metric_series_by_source_date(df, metric, date_col, source_col=None):
+    """De-duplicate repeated low-frequency observations before statistics."""
+    if metric not in df.columns:
+        return pd.Series(dtype=float)
+    values = pd.to_numeric(df[metric], errors='coerce')
+    records = []
+    for index in df.index[values.notna()]:
+        row = df.loc[index]
+        source_date = row.get(source_col) if source_col else None
+        source_date = source_date if source_date is not None and not pd.isna(
+            source_date) else row.get(date_col)
+        try:
+            native_date = pd.Timestamp(source_date).normalize().tz_localize(None)
+        except (TypeError, ValueError):
+            continue
+        records.append((native_date, float(values.loc[index])))
+    if not records:
+        return pd.Series(dtype=float)
+    native = pd.DataFrame(records, columns=['date', 'value'])
+    native = native.drop_duplicates('date', keep='last').sort_values('date')
+    return pd.Series(native['value'].values, index=native['date'], dtype=float)
+
+
 def _expand_market_history_metrics(frame):
     """Expose JSON-only market metrics with explicit, stable calculations."""
     if frame.empty or 'full_metrics' not in frame.columns:
@@ -485,7 +613,118 @@ def _expand_market_history_metrics(frame):
         lambda value: value.get('vix_term_ratio')
         if isinstance(value, dict) else None), errors='coerce')
     expanded['vix_ratio_contango_pct'] = (1.0 - vix_ratio) * 100.0
+    expanded['vrp_num'] = pd.to_numeric(expanded['full_metrics'].map(
+        lambda value: value.get('vrp_num')
+        if isinstance(value, dict) else None), errors='coerce')
+
+    fred_lineage = {
+        'credit_spread': 'Credit_Spread', 'credit_z': 'Credit_Spread',
+        'nfci': 'NFCI', 'us10y': 'US10Y',
+    }
+
+    def lineage_value(value, metric, key):
+        if not isinstance(value, dict):
+            return None
+        lineage = value.get('market_metric_lineage')
+        item = lineage.get(metric) if isinstance(lineage, dict) else None
+        if isinstance(item, dict) and item.get(key):
+            return item.get(key)
+        if metric == 'net_liq' and key == 'source_date':
+            return value.get('net_liq_source_date')
+        fred_key = fred_lineage.get(metric)
+        if fred_key:
+            legacy = (value.get('fred_source_dates') if key == 'source_date'
+                      else value.get('liquidity_source_names'))
+            if isinstance(legacy, dict):
+                return legacy.get(fred_key)
+        return None
+
+    lineage_metrics = {
+        spec['field'] for spec in MARKET_SHOCK_SPECS.values()
+    } | {
+        'vix', 'move', 'vvix', 'skew', 'credit_spread', 'credit_z',
+        'nfci', 'net_liq', 'hyg_tlt_ratio', 'cg_z', 'vrp_num',
+        'vix_ratio_contango_pct', 'us10y',
+    }
+    for metric in lineage_metrics:
+        expanded[f'{metric}_source_date'] = expanded['full_metrics'].map(
+            lambda value, name=metric: lineage_value(value, name, 'source_date'))
+        expanded[f'{metric}_source_name'] = expanded['full_metrics'].map(
+            lambda value, name=metric: lineage_value(value, name, 'source_name'))
     return expanded
+
+
+def _market_lineage_item(row, field):
+    full_metrics = row.get('full_metrics')
+    if not isinstance(full_metrics, dict):
+        return {}
+    lineage = full_metrics.get('market_metric_lineage')
+    if not isinstance(lineage, dict):
+        return {}
+    item = lineage.get(field)
+    return item if isinstance(item, dict) else {}
+
+
+def market_native_series(frame, field, date_col='record_date'):
+    """Return one native-observation series and its latest source name.
+
+    New rows carry per-field lineage in full_metrics. Repeated source dates are
+    de-duplicated so a stale close is not counted as a fresh zero-return sample.
+    Legacy rows fall back to record_date until the historical backfill replaces
+    their derived metric_daily snapshots.
+    """
+    if frame.empty or field not in frame.columns:
+        return pd.Series(dtype=float), None
+    values = pd.to_numeric(frame[field], errors='coerce')
+    records = []
+    for index in frame.index[values.notna()]:
+        row = frame.loc[index]
+        lineage = _market_lineage_item(row, field)
+        source_date = lineage.get('source_date') or row.get(date_col)
+        try:
+            native_date = pd.Timestamp(source_date).normalize().tz_localize(None)
+        except (TypeError, ValueError):
+            continue
+        records.append((native_date, float(values.loc[index]), lineage.get('source_name')))
+    if not records:
+        return pd.Series(dtype=float), None
+    native = pd.DataFrame(records, columns=['date', 'value', 'source_name'])
+    native = native.drop_duplicates('date', keep='last').sort_values('date')
+    source_names = native['source_name'].dropna()
+    source_name = str(source_names.iloc[-1]) if not source_names.empty else None
+    return pd.Series(native['value'].values, index=native['date'], dtype=float), source_name
+
+
+def build_market_shock_series(family, raw_series):
+    """Build registered rolling-return or yield-change series for one asset."""
+    spec = MARKET_SHOCK_SPECS.get(family)
+    if spec is None:
+        return {}
+    raw = _clean(raw_series)
+    if raw.empty:
+        return {}
+    result = {}
+    for days, (metric, _min_abs) in spec['windows'].items():
+        if spec['mode'] == 'pct':
+            transformed = raw.pct_change(periods=days, fill_method=None) * 100.0
+        else:
+            transformed = raw.diff(periods=days) * 100.0
+        result[metric] = transformed.replace([np.inf, -np.inf], np.nan).dropna()
+    return result
+
+
+def collapse_events_by_cluster_family(events):
+    """Keep the strongest event per scope and independent metric family."""
+    strongest = {}
+    for event in events:
+        family = METRIC_REGISTRY.get(event.metric, {}).get(
+            'cluster_family', event.metric)
+        key = (event.scope, family)
+        current = strongest.get(key)
+        if current is None or (event.severity, event.confidence) > (
+                current.severity, current.confidence):
+            strongest[key] = event
+    return list(strongest.values())
 
 
 def _event_identity(row):
@@ -535,24 +774,58 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
     if not mh.empty:
         mh = _expand_market_history_metrics(mh)
         macro_metrics = [
-            'vix', 'move', 'vvix', 'credit_spread', 'credit_z', 'nfci',
+            'vix', 'move', 'vvix', 'skew', 'vrp_num',
+            'credit_spread', 'credit_z', 'nfci',
             'hyg_tlt_ratio', 'net_liq', 'pct_200ma', 'pct_50ma', 'pct_20ma',
             'pct_adv', 'trin', 'dxy', 'cg_z', 'vix_ratio_contango_pct',
         ]
         for m in macro_metrics:
             if m in mh.columns:
-                src = _metric_source_date(mh, m, 'record_date', ('source_date',))
+                source_date_col = f'{m}_source_date'
+                src = _metric_source_date(
+                    mh, m, 'record_date', (source_date_col, 'source_date'))
+                source_name = _metric_source_name(
+                    mh, m, (f'{m}_source_name',), fallback="market_history")
+                metric_series = _metric_series_by_source_date(
+                    mh, m, 'record_date', source_date_col)
                 # The ratio curve feeds the shadow environment model only. Keep
                 # the existing futures-curve alert contract as the formal signal.
                 if m != 'vix_ratio_contango_pct':
                     events += scan_metric(
-                        m, mh[m], report_date, scope="MACRO", source_date=src)
+                        m, metric_series, report_date,
+                        scope="MACRO", source_date=src)
                 row = metric_snapshot(
-                    m, mh[m], report_date, scope="MACRO", source_date=src,
-                    session=session, is_final=is_final, source_name="market_history")
+                    m, metric_series, report_date, scope="MACRO", source_date=src,
+                    session=session, is_final=is_final, source_name=source_name,
+                    is_filled=bool(src and str(src)[:10] != report_date))
                 if row: snap_rows.append(row)
-                clean = _clean(mh[m])
+                clean = _clean(metric_series)
                 snapshot[m] = float(clean.iloc[-1]) if not clean.empty else None
+
+        # 非平稳跨资产价格改扫收益率/基点变化。这里只形成独立异常和曲线，
+        # 不修改既有环境指数及共振权重。
+        for family, spec in MARKET_SHOCK_SPECS.items():
+            raw_series, lineage_source = market_native_series(mh, spec['field'])
+            if raw_series.empty:
+                continue
+            source_date = raw_series.index[-1].strftime('%Y-%m-%d')
+            source_name = lineage_source or f"yfinance:{spec['ticker']}"
+            for metric, transformed in build_market_shock_series(
+                    family, raw_series).items():
+                if transformed.empty:
+                    continue
+                events += scan_metric(
+                    metric, transformed, report_date, scope="MACRO",
+                    source_date=source_date)
+                row = metric_snapshot(
+                    metric, transformed, report_date, scope="MACRO",
+                    source_date=source_date, session=session,
+                    is_final=is_final, source_name=source_name,
+                    is_filled=source_date != report_date,
+                    effective_obs_count=len(transformed))
+                if row:
+                    snap_rows.append(row)
+                snapshot[metric] = float(transformed.iloc[-1])
         # 派生量：hyg_tlt 21日 ROC
         if 'hyg_tlt_ratio' in mh.columns:
             s = _clean(mh['hyg_tlt_ratio'])

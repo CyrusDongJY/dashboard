@@ -23,6 +23,7 @@ def scan_macro_regime(supabase, cutoff_date):
     alert_level = 0
 
     mac_score = today.get('macro_score', 'N/A')
+    mac_score = 'N/A' if pd.isna(mac_score) else mac_score
     if 'eod_stress_score' in today.index:
         stress_score = today.get('eod_stress_score')
     else:
@@ -65,8 +66,9 @@ def scan_macro_regime(supabase, cutoff_date):
     hyg_trend = today.get('hyg_tlt_trend', '')
     if "避险" in str(hyg_trend): report_lines.append(f"⚠️ 避险剪刀差告警: {hyg_trend}"); alert_level += 1
 
-    # 动能扫描：观察最新值 vs 至多252个交易日基准（此前是"最近约20天"短样本，切换期误报高）
-    numeric_cols = ['reserves', 'jpy', 'cmf', 'us10y', 'dxy', 'oil', 'btc']
+    # 非平稳跨资产价格和低频流动性序列已交给 anomaly_engine 的变化率、
+    # 基点变化和逐指标新鲜度契约；旧探针只保留有界的 CMF 背景观察。
+    numeric_cols = ['cmf']
     for col in numeric_cols:
         if col not in df.columns: continue
         col_data = df[col].apply(pd.to_numeric, errors='coerce').dropna()

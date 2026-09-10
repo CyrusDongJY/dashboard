@@ -70,14 +70,15 @@ class UltimateDashboard:
         return s.loc[~s.index.duplicated(keep='last')]
 
     def calc_zscore(self, series, window=252):
-        # min_periods 保证样本不足 window 时用可得历史计算，而不是整列 NaN 后静默返回 0
+        # 样本不足必须保持不可计算，不能把缺数伪装成零压力。
         s = self.clean_trading_days(series)
-        if len(s) < 30: return 0.0
+        if len(s) < 30:
+            return None
         min_p = max(30, min(window, len(s)) // 2)
         rolling_mean = s.rolling(window=window, min_periods=min_p).mean()
         rolling_std = s.rolling(window=window, min_periods=min_p).std()
         z = (s - rolling_mean) / rolling_std
-        return float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else 0.0
+        return float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else None
 
     def fetch_market_data(self):
         try:
@@ -92,6 +93,11 @@ class UltimateDashboard:
             if not recent_df.empty:
                 if isinstance(recent_df, pd.Series): recent_df = recent_df.to_frame(name=real_time_tickers[0])
                 recent_df.index = pd.to_datetime(recent_df.index).normalize().tz_localize(None)
+                report_day = pd.Timestamp.now(
+                    tz="America/New_York").tz_localize(None).normalize()
+                # FX/crypto may expose a next-calendar-day partial bar after the
+                # US close. Never let that future label contaminate today's EOD.
+                recent_df = recent_df.loc[recent_df.index <= report_day]
                 self.data_cache['raw_close'] = recent_df
                 self.data_cache['close'] = recent_df.ffill()
                 for symbol in recent_df.columns:
@@ -103,6 +109,9 @@ class UltimateDashboard:
             vol_data = yf.download(['QQQ'], period="2y", interval="1d", progress=False).dropna(how='all')
             if not vol_data.empty:
                 vol_data.index = pd.to_datetime(vol_data.index).normalize().tz_localize(None)
+                report_day = pd.Timestamp.now(
+                    tz="America/New_York").tz_localize(None).normalize()
+                vol_data = vol_data.loc[vol_data.index <= report_day]
                 self.data_cache['qqq_full'] = vol_data[~vol_data.index.duplicated(keep='last')]
                 self.market_source_dates['QQQ_OHLCV'] = (
                     vol_data.index.max().strftime('%Y-%m-%d'))
@@ -445,7 +454,7 @@ class UltimateDashboard:
         fh = self.data_cache.get('fred_historical', pd.DataFrame())
         
         self.score_details.update({
-            'macro_score': 0, 'micro_score': None,
+            'macro_score': None, 'micro_score': None,
             'eod_stress_score': None, 'vix': '-', 'move': '-',
             'pcr': '-', 'cmf': '-',
         })
@@ -583,13 +592,13 @@ class UltimateDashboard:
                 self.num['tlt_return_21d'] = round(float(tlt_return), 2)
                 self.num['hyg_tlt_state'] = state
 
-        cg_val = cg_z = '-'
+        cg_val = cg_z = None
         if 'HG=F' in df.columns and 'GC=F' in df.columns:
             cg_series = self.clean_trading_days((df['HG=F'] * 100) / df['GC=F'])
             if not cg_series.empty:
                 cg_val = round(cg_series.iloc[-1], 2)
                 cg_z = self.calc_zscore(cg_series)
-        self.regime['cg_ratio'] = cg_val
+        self.regime['cg_ratio'] = cg_val if cg_val is not None else '-'
 
         self.sector_rs = {}
         if 'SPY' in df.columns:
@@ -609,13 +618,22 @@ class UltimateDashboard:
 
         # ==================== 修复的宏观打分引擎 (Macro Score) ====================
         m_score = 0
+        m_available_weight = 0
         
         # 1. 10Y美债急升度 (TNX)
         if '^TNX' in df.columns:
             z = self.calc_zscore(df['^TNX'], 63)
-            self.macro_engines['tnx'] = f"Z: {z:+.2f}"
-            self.num['tnx_z'] = round(z, 2)
-            m_score += 15 if z > 2.0 else (5 if z > 1.0 else 0)
+            if z is not None:
+                self.macro_engines['tnx'] = f"Z: {z:+.2f}"
+                self.num['tnx_z'] = round(z, 2)
+                m_available_weight += 15
+                m_score += 15 if z > 2.0 else (5 if z > 1.0 else 0)
+            else:
+                self.macro_engines['tnx'] = "数据不足"
+                self.num['tnx_z'] = None
+        else:
+            self.macro_engines['tnx'] = "数据缺失"
+            self.num['tnx_z'] = None
         
         # 2. 原油暴涨率 (OIL)
         if 'CL=F' in df.columns:
@@ -624,59 +642,116 @@ class UltimateDashboard:
                 oil_roc = (oil.iloc[-1] / oil.iloc[-21] - 1) * 100
                 self.macro_engines['oil'] = f"ROC: {oil_roc:+.2f}%"
                 self.num['oil_roc'] = round(float(oil_roc), 2)
+                m_available_weight += 15
                 m_score += 15 if oil_roc > 15.0 else (10 if oil_roc > 10.0 else 0)
-            else: self.macro_engines['oil'] = "-"
-        else: self.macro_engines['oil'] = "-"
+            else:
+                self.macro_engines['oil'] = "数据不足"
+                self.num['oil_roc'] = None
+        else:
+            self.macro_engines['oil'] = "数据缺失"
+            self.num['oil_roc'] = None
 
         if not fh.empty:
             # 3. 10Y-2Y利差变动 (Yield Curve)
             if 'Spread_10Y2Y' in fh.columns and len(fh['Spread_10Y2Y']) >= 21:
-                yc_cur = fh['Spread_10Y2Y'].iloc[-1]
-                yc_1m = fh['Spread_10Y2Y'].iloc[-21]
-                yc_chg = yc_cur - yc_1m
-                self.macro_engines['yc'] = f"{yc_chg:+.2f}%"
-                self.num['yc_chg'] = round(float(yc_chg), 3)
-                # 只有在倒挂期恶化时才计算宏观压力
-                if yc_cur < 0: 
-                    m_score += 15 if yc_chg > 0.2 else (5 if yc_chg > 0.0 else 0)
-            else: self.macro_engines['yc'] = "-"
+                yc_series = pd.to_numeric(
+                    fh['Spread_10Y2Y'], errors='coerce').dropna()
+                if len(yc_series) >= 21:
+                    yc_cur = yc_series.iloc[-1]
+                    yc_1m = yc_series.iloc[-21]
+                    yc_chg = yc_cur - yc_1m
+                    self.macro_engines['yc'] = f"{yc_chg:+.2f}%"
+                    self.num['yc_chg'] = round(float(yc_chg), 3)
+                    m_available_weight += 15
+                    # 只有在倒挂期恶化时才计算宏观压力
+                    if yc_cur < 0:
+                        m_score += 15 if yc_chg > 0.2 else (5 if yc_chg > 0.0 else 0)
+                else:
+                    self.macro_engines['yc'] = "数据不足"
+                    self.num['yc_chg'] = None
+            else:
+                self.macro_engines['yc'] = "数据缺失"
+                self.num['yc_chg'] = None
 
             # 4. 短期净流动性抽水 (Liquidity)
-            nl = (fh['Fed_Assets']/1000) - (fh['TGA']/1000) - fh['RRP']
-            if len(nl) >= 63:
-                l_roc = (nl.iloc[-1] / nl.iloc[-63] - 1) * 100
-                self.macro_engines['liq'] = f"63业务日ROC: {l_roc:+.2f}%"
-                self.num['liq_roc'] = round(float(l_roc), 2)
-                self.num['liq_roc_window'] = 63
-                m_score += 15 if l_roc < -5.0 else (8 if l_roc < -2.0 else 0)
+            if {'Fed_Assets', 'TGA', 'RRP'}.issubset(fh.columns):
+                nl = ((fh['Fed_Assets'] / 1000)
+                      - (fh['TGA'] / 1000) - fh['RRP']).dropna()
+                if len(nl) >= 63 and nl.iloc[-63] != 0:
+                    l_roc = (nl.iloc[-1] / nl.iloc[-63] - 1) * 100
+                    self.macro_engines['liq'] = f"63业务日ROC: {l_roc:+.2f}%"
+                    self.num['liq_roc'] = round(float(l_roc), 2)
+                    self.num['liq_roc_window'] = 63
+                    m_available_weight += 15
+                    m_score += 15 if l_roc < -5.0 else (8 if l_roc < -2.0 else 0)
+                else:
+                    self.macro_engines['liq'] = "数据不足"
+                    self.num['liq_roc'] = None
+            else:
+                self.macro_engines['liq'] = "数据缺失"
+                self.num['liq_roc'] = None
             
             # 5. M2 货币供应 (M2)
-            if len(fh['M2_Money_Supply']) >= 252:
-                m2_yoy = (fh['M2_Money_Supply'].iloc[-1] / fh['M2_Money_Supply'].iloc[-252] - 1) * 100
-                self.macro_engines['m2'] = f"YoY: {m2_yoy:+.2f}%"
-                self.num['m2_yoy'] = round(float(m2_yoy), 2)
-                m_score += 10 if m2_yoy < 0 else (5 if m2_yoy < 2.0 else 0)
+            if 'M2_Money_Supply' in fh.columns:
+                m2 = pd.to_numeric(fh['M2_Money_Supply'], errors='coerce').dropna()
+                if len(m2) >= 252 and m2.iloc[-252] != 0:
+                    m2_yoy = (m2.iloc[-1] / m2.iloc[-252] - 1) * 100
+                    self.macro_engines['m2'] = f"YoY: {m2_yoy:+.2f}%"
+                    self.num['m2_yoy'] = round(float(m2_yoy), 2)
+                    m_available_weight += 10
+                    m_score += 10 if m2_yoy < 0 else (5 if m2_yoy < 2.0 else 0)
+                else:
+                    self.macro_engines['m2'] = "数据不足"
+                    self.num['m2_yoy'] = None
+            else:
+                self.macro_engines['m2'] = "数据缺失"
+                self.num['m2_yoy'] = None
             
             # 6. 金融摩擦压力 (NFCI)
             if 'NFCI' in fh.columns:
-                nfci_val = fh['NFCI'].iloc[-1]
-                self.macro_engines['stress'] = f"{nfci_val:.2f} (NFCI)"
-                self.num['nfci'] = round(float(nfci_val), 3)
-                m_score += 10 if nfci_val > 1.0 else (5 if nfci_val > 0.5 else 0)
+                nfci = pd.to_numeric(fh['NFCI'], errors='coerce').dropna()
+                if not nfci.empty:
+                    nfci_val = nfci.iloc[-1]
+                    self.macro_engines['stress'] = f"{nfci_val:.2f} (NFCI)"
+                    self.num['nfci'] = round(float(nfci_val), 3)
+                    m_available_weight += 10
+                    m_score += 10 if nfci_val > 1.0 else (5 if nfci_val > 0.5 else 0)
+                else:
+                    self.macro_engines['stress'] = "数据不足"
+                    self.num['nfci'] = None
+            else:
+                self.macro_engines['stress'] = "数据缺失"
+                self.num['nfci'] = None
                 
             # 7. 信用利差 (Credit Spread)
-            cs_z = self.calc_zscore(fh['Credit_Spread'])
-            self.macro_engines['credit'] = f"Z: {cs_z:+.2f}"
-            self.num['credit_z'] = round(cs_z, 2)
-            m_score += 10 if cs_z > 2.0 else (5 if cs_z > 1.0 else 0)
+            cs_z = (self.calc_zscore(fh['Credit_Spread'])
+                    if 'Credit_Spread' in fh.columns else None)
+            if cs_z is not None:
+                self.macro_engines['credit'] = f"Z: {cs_z:+.2f}"
+                self.num['credit_z'] = round(cs_z, 2)
+                m_available_weight += 10
+                m_score += 10 if cs_z > 2.0 else (5 if cs_z > 1.0 else 0)
+            else:
+                self.macro_engines['credit'] = "数据不足"
+                self.num['credit_z'] = None
             
-            # 8. 铜金比避险偏离 (Copper/Gold)
-            self.macro_engines['cg'] = f"Z: {cg_z:+.2f}" if cg_z != '-' else '-'
-            if cg_z != '-':
-                self.num['cg_z'] = round(float(cg_z), 2)
-                m_score += 10 if float(cg_z) < -2.0 else (5 if float(cg_z) < -1.0 else 0)
-            
-        self.score_details['macro_score'] = min(100, m_score)
+        # 8. 铜金比避险偏离 (Copper/Gold)
+        self.macro_engines['cg'] = (
+            f"Z: {cg_z:+.2f}" if cg_z is not None else "数据不足")
+        if cg_z is not None:
+            self.num['cg_z'] = round(float(cg_z), 2)
+            m_available_weight += 10
+            m_score += 10 if float(cg_z) < -2.0 else (5 if float(cg_z) < -1.0 else 0)
+        else:
+            self.num['cg_z'] = None
+
+        macro_coverage = m_available_weight / 100.0
+        self.num['macro_score_coverage'] = round(macro_coverage, 3)
+        self.num['macro_score_status'] = (
+            'OK' if macro_coverage == 1.0
+            else ('PARTIAL' if macro_coverage >= 0.70 else 'UNAVAILABLE'))
+        self.score_details['macro_score'] = (
+            min(100, m_score) if macro_coverage >= 0.70 else None)
         # ==================== 修复的宏观打分引擎结束 ====================
 
         # ==================== EOD跨资产战术压力（V8.6公式可靠性加固） ====================
@@ -824,6 +899,11 @@ class UltimateDashboard:
 
     def generate_outputs(self):
         mac_s, mic_s = self.score_details.get('macro_score', 0), self.score_details.get('micro_score', 0)
+        macro_coverage = self.num.get('macro_score_coverage')
+        macro_quality_text = (
+            f"status={self.num.get('macro_score_status', 'UNAVAILABLE')} | "
+            f"coverage={macro_coverage:.0%}"
+            if macro_coverage is not None else "status=UNAVAILABLE")
         stress_score_text = "N/A" if mic_s is None else str(mic_s)
         stress_coverage = self.stress_details.get('coverage')
         stress_confidence = self.stress_details.get('confidence')
@@ -946,7 +1026,7 @@ class UltimateDashboard:
 [资金流向CMF]: {self.score_details.get('cmf', '-')}
 
 ==== 附加数据 ====
-[宏观压力得分]: {mac_s}
+[宏观压力得分]: {mac_s if mac_s is not None else 'N/A'} ({macro_quality_text})
 [盘后跨资产战术压力观察值]: {stress_score_text}
 [压力评分质量]: {stress_quality_text}
 【判定象限】: {self.regime.get('desc', '-')}
@@ -1009,10 +1089,72 @@ class UltimateDashboard:
             'status': stress.get('status', 'UNAVAILABLE'),
             'reasons': stress.get('reasons', []),
         }
+        market_metric_lineage = {}
+        market_symbols = {
+            'vix': '^VIX', 'move': '^MOVE', 'vvix': '^VVIX', 'skew': '^SKEW',
+            'dxy': 'DX-Y.NYB', 'jpy': 'JPY=X', 'oil': 'CL=F',
+            'gold': 'GC=F', 'btc': 'BTC-USD',
+        }
+        for metric, symbol in market_symbols.items():
+            source_date = self.market_source_dates.get(symbol)
+            if source_date:
+                market_metric_lineage[metric] = {
+                    'source_date': source_date,
+                    'source_name': f'yfinance:{symbol}',
+                }
+
+        def add_derived_lineage(metric, symbols, source_name):
+            dates = [self.market_source_dates.get(symbol) for symbol in symbols]
+            if all(dates):
+                market_metric_lineage[metric] = {
+                    'source_date': min(dates),
+                    'source_name': source_name,
+                }
+
+        add_derived_lineage(
+            'vix_ratio_contango_pct', ('^VIX', '^VIX3M'),
+            'yfinance:^VIX/^VIX3M')
+        add_derived_lineage(
+            'vrp_num', ('^VIX', 'SPY'), 'yfinance:^VIX+SPY_HV20')
+        add_derived_lineage(
+            'hyg_tlt_ratio', ('HYG', 'TLT'), 'yfinance:HYG/TLT')
+        add_derived_lineage(
+            'cg_z', ('HG=F', 'GC=F'), 'yfinance:HG=F/GC=F')
+
+        for metric, fred_key in {
+            'credit_spread': 'Credit_Spread', 'credit_z': 'Credit_Spread',
+            'nfci': 'NFCI',
+        }.items():
+            source_date = self.fred_source_dates.get(fred_key)
+            if source_date:
+                market_metric_lineage[metric] = {
+                    'source_date': source_date,
+                    'source_name': self.liquidity_source_names.get(fred_key),
+                }
+        net_liq_dates = [
+            self.fred_source_dates.get(key)
+            for key in ('Fed_Assets', 'TGA', 'RRP')
+            if self.fred_source_dates.get(key)
+        ]
+        if net_liq_dates:
+            market_metric_lineage['net_liq'] = {
+                'source_date': min(net_liq_dates),
+                'source_name': 'FRED:WALCL+WTREGEN+RRPONTSYD',
+            }
+        us10y_source_date = self.fred_source_dates.get('US10Y')
+        us10y_source_name = self.liquidity_source_names.get('US10Y')
+        if not us10y_source_date:
+            us10y_source_date = self.market_source_dates.get('^TNX')
+            us10y_source_name = 'yfinance:^TNX' if us10y_source_date else None
+        if us10y_source_date:
+            market_metric_lineage['us10y'] = {
+                'source_date': us10y_source_date,
+                'source_name': us10y_source_name,
+            }
 
         payload = {
             "record_date": date_str,
-            "macro_score": int(sd.get('macro_score', 0) or 0),
+            "macro_score": nullable_int(sd.get('macro_score')),
             "micro_score": nullable_int(sd.get('micro_score')),
             "eod_stress_score": nullable_int(sd.get('eod_stress_score')),
             "stress_components": stress_components,
@@ -1083,9 +1225,12 @@ class UltimateDashboard:
             "vrp_num": num.get('vrp'), "hv20": num.get('hv20'),
             "vix_term_ratio": num.get('vix_term_ratio'),
             "hyg_tlt_roc21": num.get('hyg_tlt_roc21'),
+            "macro_score_coverage": num.get('macro_score_coverage'),
+            "macro_score_status": num.get('macro_score_status'),
             "breadth_sample": "top500_by_mktcap",
             "fred_source_dates": self.fred_source_dates,
             "liquidity_source_names": self.liquidity_source_names,
+            "market_metric_lineage": market_metric_lineage,
             "liquidity_source_contract": "official_liquidity_v2",
             "etf_share_metrics": self.smf.get('etf_share_metrics', {}),
             "contribution_attribution_status": num.get(

@@ -26,7 +26,11 @@ sys.modules.setdefault("yfinance", yfinance_module)
 from anomaly_engine import (  # noqa: E402
     AnomalyEvent,
     _expand_market_history_metrics,
+    _metric_series_by_source_date,
+    build_market_shock_series,
+    collapse_events_by_cluster_family,
     gamma_decision_mask,
+    market_native_series,
     metric_snapshot,
     scan_metric,
 )
@@ -240,9 +244,22 @@ class SnapshotTests(unittest.TestCase):
     def test_market_history_vix_ratio_uses_canonical_contango_basis(self):
         expanded = _expand_market_history_metrics(pd.DataFrame([{
             "record_date": "2026-07-14",
-            "full_metrics": {"vix_term_ratio": 0.9},
+            "full_metrics": {
+                "vix_term_ratio": 0.9,
+                "vrp_num": 7.5,
+                "market_metric_lineage": {
+                    "vix_ratio_contango_pct": {
+                        "source_date": "2026-07-13",
+                        "source_name": "yfinance:^VIX/^VIX3M",
+                    },
+                },
+            },
         }]))
         self.assertAlmostEqual(expanded.iloc[0]["vix_ratio_contango_pct"], 10.0)
+        self.assertEqual(expanded.iloc[0]["vrp_num"], 7.5)
+        self.assertEqual(
+            expanded.iloc[0]["vix_ratio_contango_pct_source_date"],
+            "2026-07-13")
 
     def test_snapshot_preserves_session_and_quality_contract(self):
         values = pd.Series(np.linspace(10, 20, 80))
@@ -265,6 +282,74 @@ class SnapshotTests(unittest.TestCase):
         values = pd.Series(np.linspace(60, 20, 100))
         events = scan_metric("dpsv_pct", values, "2026-07-14", scope="SPY")
         self.assertEqual(events, [])
+
+    def test_market_lineage_deduplicates_stale_source_dates(self):
+        frame = pd.DataFrame([
+            {"record_date": "2026-09-04", "jpy": 156.0,
+             "full_metrics": {"market_metric_lineage": {"jpy": {
+                 "source_date": "2026-09-04", "source_name": "yfinance:JPY=X"}}}},
+            {"record_date": "2026-09-07", "jpy": 156.0,
+             "full_metrics": {"market_metric_lineage": {"jpy": {
+                 "source_date": "2026-09-04", "source_name": "yfinance:JPY=X"}}}},
+            {"record_date": "2026-09-08", "jpy": 153.7,
+             "full_metrics": {"market_metric_lineage": {"jpy": {
+                 "source_date": "2026-09-08", "source_name": "yfinance:JPY=X"}}}},
+        ])
+        series, source = market_native_series(frame, "jpy")
+        self.assertEqual(len(series), 2)
+        self.assertEqual(source, "yfinance:JPY=X")
+        self.assertEqual(series.index[-1], pd.Timestamp("2026-09-08"))
+
+    def test_low_frequency_metric_uses_native_dates_for_statistics(self):
+        frame = pd.DataFrame({
+            "record_date": ["2026-09-04", "2026-09-07", "2026-09-08"],
+            "nfci": [-0.5, -0.5, -0.4],
+            "nfci_source_date": ["2026-09-04", "2026-09-04", "2026-09-08"],
+        })
+        series = _metric_series_by_source_date(
+            frame, "nfci", "record_date", "nfci_source_date")
+        self.assertEqual(series.tolist(), [-0.5, -0.4])
+
+    def test_market_shocks_use_returns_and_basis_points(self):
+        prices = pd.Series([100.0, 99.0, 97.0, 96.0, 95.0, 94.0],
+                           index=pd.bdate_range("2026-09-01", periods=6))
+        fx = build_market_shock_series("usdjpy", prices)
+        self.assertAlmostEqual(fx["usdjpy_return_5d_pct"].iloc[-1], -6.0)
+
+        yields = pd.Series([4.0, 4.1], index=pd.bdate_range("2026-09-01", periods=2))
+        rates = build_market_shock_series("us10y", yields)
+        self.assertAlmostEqual(rates["us10y_change_1d_bp"].iloc[-1], 10.0)
+
+    def test_two_sided_market_shock_detects_large_negative_move(self):
+        baseline = pd.Series(np.linspace(-1.0, 1.0, 126))
+        values = pd.concat([baseline, pd.Series([-4.2])], ignore_index=True)
+        events = scan_metric(
+            "usdjpy_return_5d_pct", values, "2026-09-09",
+            source_date="2026-09-09")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].direction, "down")
+        self.assertEqual(events[0].severity, 3)
+        self.assertIn("日元走强", events[0].explanation)
+        self.assertEqual(events[0].confidence, 1.0)
+
+    def test_noise_floor_blocks_tiny_statistical_outlier(self):
+        values = pd.Series([0.0] * 126 + [0.2])
+        events = scan_metric(
+            "dxy_return_1d_pct", values, "2026-09-09",
+            source_date="2026-09-09")
+        self.assertEqual(events, [])
+
+    def test_cluster_counts_one_asset_once_across_windows(self):
+        events = [
+            AnomalyEvent("2026-09-09", metric, "MACRO", window,
+                         severity=2, confidence=1.0)
+            for metric, window in [
+                ("usdjpy_return_1d_pct", "1D"),
+                ("usdjpy_return_5d_pct", "5D"),
+                ("usdjpy_return_21d_pct", "21D"),
+            ]
+        ]
+        self.assertEqual(len(collapse_events_by_cluster_family(events)), 1)
 
 
 class BackfillTests(unittest.TestCase):
@@ -310,6 +395,26 @@ class BackfillTests(unittest.TestCase):
             metrics["vix_ratio_contango_pct"]["series"].iloc[0],
             (1.0 - 20.0 / 22.0) * 100,
         )
+
+    def test_yfinance_backfill_includes_cross_asset_shocks(self):
+        index = pd.bdate_range("2025-01-02", periods=140)
+        yf_frame = pd.DataFrame({
+            "JPY=X": np.linspace(150.0, 140.0, len(index)),
+            "CL=F": np.linspace(70.0, 80.0, len(index)),
+            "GC=F": np.linspace(2000.0, 2200.0, len(index)),
+            "BTC-USD": np.linspace(50000.0, 70000.0, len(index)),
+            "^TNX": np.linspace(4.0, 4.5, len(index)),
+            "DX-Y.NYB": np.linspace(100.0, 105.0, len(index)),
+            "^VIX": np.linspace(15.0, 20.0, len(index)),
+            "SPY": np.linspace(500.0, 550.0, len(index)),
+        }, index=index)
+        metrics = build_metric_series(yf_frame, pd.DataFrame())
+        for metric in (
+                "usdjpy_return_1d_pct", "oil_return_5d_pct",
+                "gold_return_21d_pct", "btc_return_1d_pct",
+                "us10y_change_5d_bp", "dxy_return_21d_pct", "vrp_num"):
+            self.assertIn(metric, metrics)
+            self.assertTrue(metrics[metric]["source_name"].startswith("yfinance:"))
 
 
 class _Query:

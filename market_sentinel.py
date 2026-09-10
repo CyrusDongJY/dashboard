@@ -44,7 +44,7 @@ from supabase import create_client, Client
 
 try:
     import market_config as cfg
-    from anomaly_engine import run_engine, format_matrix
+    from anomaly_engine import collapse_events_by_cluster_family, run_engine, format_matrix
     from market_utils import log_data_quality
 except ImportError as e:
     print(f"❌ 致命错误：共享模块缺失 ({e})。请确认 market_config.py / anomaly_engine.py / "
@@ -151,13 +151,18 @@ def evaluate_gate(events):
         triggering.append(e)
 
     # 4) 中度异常聚集
-    cluster = [e for e in eligible
-               if e.layer == "single"
-               and e.severity >= ALERT_GATE["cluster_severity"]
-               and e.confidence >= ALERT_GATE["cluster_min_confidence"]]
+    cluster_candidates = [e for e in eligible
+                          if e.layer == "single"
+                          and e.severity >= ALERT_GATE["cluster_severity"]
+                          and e.confidence >= ALERT_GATE["cluster_min_confidence"]]
+    # 同一底层指标可能同时产生绝对阈值、z-score 或多个滚动窗口事件。
+    # 聚集规则按独立指标族计数，防止一个资产自行凑成“多指标共振”。
+    cluster = collapse_events_by_cluster_family(cluster_candidates)
     if len(cluster) >= ALERT_GATE["cluster_count"]:
         names = "、".join(sorted({e.explanation.split(" ")[0] for e in cluster}))
-        reasons.append(f"中度异常聚集：{len(cluster)} 条 sev≥{ALERT_GATE['cluster_severity']} 同现 [{names}]")
+        reasons.append(
+            f"中度异常聚集：{len(cluster)} 个独立指标族 "
+            f"sev≥{ALERT_GATE['cluster_severity']} 同现 [{names}]")
         # 聚集触发时，把这些也纳入触发集（去重在下游做）
         triggering.extend(cluster)
 
