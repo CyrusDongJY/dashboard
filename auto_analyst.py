@@ -39,6 +39,8 @@ try:
         fetch_event_pulse, format_event_pulse_summary,
     )
     from tactical_stress import format_tactical_stress_summary
+    from temporal_monitor import format_temporal_summary, run_temporal_pipeline
+    from temporal_report import generate_temporal_chart
 except ImportError as e:
     print(f"❌ 致命错误：缺少核心配置文件或探针库 ({e})！")
     sys.exit(1)
@@ -324,6 +326,36 @@ if __name__ == "__main__":
     except Exception as e:
         logging.warning(f"动态异动脉冲摘要降级: {e}")
 
+    # 五个影子板块统一到“数值越高=压力越大”的时间解释层。历史回放与
+    # LIVE_SHADOW 分开落库，未来结果只在完整1/5/21日窗口成熟后写入。
+    temporal_text = (
+        "=== 核心板块时间状态（影子观察，不触发预警） ===\n"
+        "本日时间状态计算失败或数据库迁移尚未完成。")
+    temporal_chart = None
+    temporal_output_path = os.path.join(
+        report_dir, f"temporal_shadow_{report_date}.png")
+    try:
+        temporal_result = run_temporal_pipeline(
+            supabase, report_date=report_date, persist=True)
+        temporal_text = format_temporal_summary(temporal_result)
+        temporal_chart = generate_temporal_chart(
+            temporal_result.get("history") or [], report_date,
+            output_path=temporal_output_path)
+        if temporal_chart and os.path.isfile(temporal_chart):
+            logging.info(
+                "✅ 核心板块时间状态图生成完成: %s (%.1f KB, shadow only)",
+                temporal_chart, os.path.getsize(temporal_chart) / 1024)
+        else:
+            temporal_chart = None
+            logging.warning("⚠️ 时间状态图未生成：有效历史不足")
+        logging.info(
+            "时间状态影子层完成: persistence=%s, evaluations=%d",
+            temporal_result.get("persistence_status"),
+            len(temporal_result.get("evaluations") or []))
+    except Exception as e:
+        temporal_chart = None
+        logging.exception(f"时间状态影子层降级，不影响原报告与预警: {e}")
+
     logging.info("📡 唤醒三大联邦探针...")
     # Keep all probes running for their existing capture/persistence side effects;
     # only the compact deterministic review is rendered in the email.
@@ -363,10 +395,10 @@ if __name__ == "__main__":
         f"美股日度规则复盘 [{report_date}]",
         review_report,
         supplemental_sections=[
-            environment_text, liquidity_text, tactical_stress_text,
+            temporal_text, environment_text, liquidity_text, tactical_stress_text,
             risk_capital_text,
             event_pulse_text],
-        image_paths=[environment_chart, liquidity_chart])
+        image_paths=[temporal_chart, environment_chart, liquidity_chart])
     if not email_sent:
         logging.warning("⚠️ 复盘数据已完成入库，但邮件投递失败，请检查SMTP日志。")
     logging.info(">>> 流水线执行完毕，司令部休眠 <<<")

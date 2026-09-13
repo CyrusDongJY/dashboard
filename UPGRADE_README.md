@@ -92,6 +92,8 @@ EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE = False
    - `metric_daily`（按 PRE/INTRADAY/EOD 分会话的每日全指标快照）
    - `environment_daily`（环境指数影子台账，不参与正式预警）
    - `liquidity_daily`（六柱流动性水位、覆盖率、状态和可解释明细）
+   - `temporal_state_daily`（五板块时间状态，严格区分历史回放与实盘影子）
+   - `temporal_shadow_evaluation`（成熟后的未来1/5/21日客观结果）
    - `market_history` 新增盘后跨资产战术压力值、覆盖率、置信度、版本与分项 JSON
    - `option_gamma_buckets`（盘前Gamma分期限净值、全部零点与实际采样到期日）
    - 现有表补 `source_date` / `as_of_time` / `ingested_at` 三列
@@ -114,6 +116,9 @@ EXPECTED_MOVE_EVENT_CALENDAR_COMPLETE = False
    | `liquidity_sources.py` | 新增（官方数据源适配，**必须**放这里） |
    | `liquidity_monitor.py` | 新增（六柱评分与状态机，**必须**放这里） |
    | `liquidity_report.py` | 新增（盘后水位仪PNG，**必须**放这里） |
+   | `temporal_monitor.py` | 新增（时间状态与影子评估，**必须**放这里） |
+   | `temporal_report.py` | 新增（统一压力曲线与状态带PNG，**必须**放这里） |
+   | `backfill_temporal_states.py` | 新增（默认dry-run的时间状态回放） |
    | `backfill_history.py` | 新增（一次性历史回补） |
    | `backfill_option_fragility.py` | 新增（IB/ThetaData期权脆弱度一次性回补） |
    | `requirements-env-dashboard.txt` | 新增（PNG依赖清单） |
@@ -453,3 +458,51 @@ Flip、Gamma Call/Put Wall 与派生距离不参与异常引擎；标准月度OI
   /home/winters_dong426/quant_bot/auto_analyst.py \
   /home/winters_dong426/TradingRadar/ib_intraday_sniper.py
 ```
+
+## 十、核心板块时间状态与影子评估（2026-09-13）
+
+先执行 `migration_20260913_temporal_state.sql`，或直接执行最新版 `migrations.sql`。
+该层只读取既有的环境指数、流动性水位、盘后战术压力、风险资本阶梯和动态异动脉冲，
+不会修改源评分，也不接入 `market_sentinel.py` 的 `ALERT_GATE`。
+
+时间状态统一使用“数值越高表示压力越大”的内部刻度。流动性水位和风险资本扩散会
+反向标准化；邮件仍展示其原始水位，避免改变原业务含义。动态异动脉冲不生成伪精确
+连续分数，只统计5日/20日事件次数、方向、行业扩散和持续性。
+
+首次部署可先做只读回放：
+
+```bash
+cd /home/winters_dong426/market_dashboard
+/usr/bin/python3 backfill_temporal_states.py --days 180
+```
+
+确认日志中的状态行数与成熟评估行数合理后，再显式写库：
+
+```bash
+/usr/bin/python3 backfill_temporal_states.py --days 180 --write
+```
+
+回放写入 `observation_mode=REPLAY`，不会计入60至120个交易日的真实影子观察周期，
+也不会覆盖已经存在的 `LIVE_SHADOW` 行。日常 `16:45 auto_analyst.py` 无需新增cron：
+它每天写五条 `LIVE_SHADOW` 状态，并只为已经拥有完整未来窗口的旧信号补写结果。
+
+部署后检查：
+
+```sql
+SELECT report_date, panel, level_value, risk_value, change_5d,
+       persistence_days, temporal_state_cn, quality_status,
+       observation_mode, calc_version
+FROM public.temporal_state_daily
+ORDER BY report_date DESC, panel
+LIMIT 25;
+
+SELECT panel, observation_mode, COUNT(DISTINCT signal_date) AS signal_days,
+       COUNT(*) FILTER (WHERE horizon_days = 21) AS matured_21d_rows
+FROM public.temporal_shadow_evaluation
+GROUP BY panel, observation_mode
+ORDER BY panel, observation_mode;
+```
+
+邮件会新增“核心板块时间状态”正文和 `temporal_shadow_YYYY-MM-DD.png` 附件。
+真实影子观察满60个交易日才做第一次阶段审阅，满120日才考虑校准；历史回放只用于
+发现实现错误和形成初步假设，不能替代前瞻观察或直接产生仓位建议。

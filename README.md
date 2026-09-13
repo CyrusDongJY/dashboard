@@ -57,7 +57,8 @@ Tag 只标识不可移动的代码恢复点，不表示云端已经部署。根�
 | 异常判定 | `anomaly_engine.py`, `market_sentinel.py` | 单指标、多窗口和跨资产共振 |
 | 环境观察 | `environment_indices.py`, `environment_report.py` | 长周期环境指数和 PNG |
 | 流动性观察 | `liquidity_sources.py`, `liquidity_monitor.py`, `liquidity_report.py` | 六柱流动性水位和 PNG |
-| 历史回补 | `backfill_history.py`, `backfill_option_fragility.py` | 宏观、尾部与期权脆弱度的无前视回补 |
+| 时间状态 | `temporal_monitor.py`, `temporal_report.py` | 五板块水位、冲量、持续性、转折和影子结果 |
+| 历史回补 | `backfill_history.py`, `backfill_option_fragility.py`, `backfill_temporal_states.py` | 无前视回补，回放与实盘影子分离 |
 | 盘后归因 | `auto_analyst.py`, `market_probes.py` | 邮件汇总和 AI 叙述 |
 | 运维与审计 | `market_utils.py`, `migrations.sql`, `tests/` | 幂等写入、质量日志、迁移和测试 |
 
@@ -76,6 +77,8 @@ Tag 只标识不可移动的代码恢复点，不表示云端已经部署。根�
 | `sentinel_runs` | 哨兵运行、去重指纹和发信结果 |
 | `environment_daily` | 环境指数影子历史 |
 | `liquidity_daily` | 流动性六柱影子历史 |
+| `temporal_state_daily` | 五个核心板块的统一时间状态，区分回放与实盘影子 |
+| `temporal_shadow_evaluation` | 已成熟的未来1/5/21日收益、回撤、波动率和跳空结果 |
 | `data_quality` | 任务状态、缺失、滞后和写入行数 |
 
 数据库升级统一执行 `migrations.sql`。脚本为幂等设计，但生产执行前仍应备份并在

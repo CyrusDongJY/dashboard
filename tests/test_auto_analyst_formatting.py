@@ -75,6 +75,22 @@ class AutoAnalystFormattingTests(unittest.TestCase):
             source,
         )
 
+    def test_temporal_shadow_summary_and_chart_are_attached(self):
+        source = ANALYST_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "from temporal_monitor import format_temporal_summary, run_temporal_pipeline",
+            source,
+        )
+        self.assertIn("temporal_shadow_{report_date}.png", source)
+        self.assertIn(
+            "temporal_text, environment_text, liquidity_text, tactical_stress_text",
+            source,
+        )
+        self.assertIn(
+            "image_paths=[temporal_chart, environment_chart, liquidity_chart]",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
