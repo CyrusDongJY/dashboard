@@ -48,6 +48,7 @@ from pre_market_metrics import (
     time_to_expiry_years,
     validate_iv_skew,
 )
+from qqq_signal_bridge import render_qqq_signal_section
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -1180,6 +1181,13 @@ def get_report():
             + format_premarket_quality_summary(
                 rows_written, len(SYMBOLS), quality_issues)
             + "\n完整期权链、Gamma零点、样本覆盖、最大OI及对冲代理已保留在数据库。"
+        )
+
+        # QQQ冻结信号在本程序完成当日墙数据落库后复核；失败不影响原盘前报告。
+        report += render_qqq_signal_section(
+            "pre_market",
+            python_executable=getattr(cfg, "QQQ_BUILDER_PYTHON", None),
+            builder_path=getattr(cfg, "QQQ_BUILDER_PATH", None),
         )
 
         if send_email(f"美股盘前监测摘要 | {today_str}", report):

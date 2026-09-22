@@ -108,3 +108,16 @@ git status --short --branch
 git log --graph --decorate --oneline --all -20
 git tag --list --sort=-version:refname
 ```
+# QQQ冻结信号分阶段集成
+
+盘后与盘前主程序通过 `qqq_signal_bridge.py` 调用TradingRadar中的同一个
+`multi_tenor_builder.py`，不会增加独立的盘后或盘前cron任务：
+
+- `daily_post_close.py` 保留16:02原始抓取时点，在全部原有数据落库后等待至
+  NYSE实际收盘+10分钟，将盘后冻结信号附加到原邮件；
+- `daily_pre_market.py` 在当日期权墙数据落库后，将盘前复核附加到原邮件；
+- 桥接失败会在原邮件中明确标记为不可执行，但不会中断原有报告、数据库写入或邮件。
+
+默认调用 `~/trading_venv/bin/python3` 和
+`~/TradingRadar/multi_tenor_builder.py`；可用 `market_config.py` 中的
+`QQQ_BUILDER_PYTHON`、`QQQ_BUILDER_PATH` 覆盖。

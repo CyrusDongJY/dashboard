@@ -45,6 +45,7 @@ from risk_event_pulse import (
     merge_scan_candidates,
     persistence_payloads as risk_event_payloads,
 )
+from qqq_signal_bridge import render_qqq_signal_section
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -1181,6 +1182,13 @@ def get_report():
             logger.warning(f"⚠️ 数据质量记录失败: {e}")
 
         report += rep_drag
+        # 保留16:02原始抓取；全部落库后等待到收盘+10分钟并冻结QQQ信号。
+        # 调用失败仅在报告中标记，不影响原盘后数据、邮件或数据库写入。
+        report += render_qqq_signal_section(
+            "post_close",
+            python_executable=getattr(cfg, "QQQ_BUILDER_PYTHON", None),
+            builder_path=getattr(cfg, "QQQ_BUILDER_PATH", None),
+        )
         report += "="*55 + "\n[声明] 轨道一：盘后数据切片生成完毕！"
         
         append_to_spot_db_local(macro_data_db, today_str)
