@@ -1,10 +1,13 @@
 import os
 import sys
 import csv
+import json
 import math
 import logging
 import smtplib
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from email.mime.text import MIMEText
 from email.header import Header
 from contextlib import contextmanager
@@ -64,6 +67,10 @@ BATCH_SIZE = 50
 SLEEP_SHORT = 2
 SLEEP_LONG = 6
 DB_MAX_RETRIES = 3 
+IB_CONNECT_TIMEOUT = 20
+IB_CONNECT_ATTEMPTS = 3
+SMTP_TIMEOUT = 15
+POST_CLOSE_REPORT_DIR = Path(__file__).resolve().parent / 'state' / 'post_close_reports'
 
 SYMBOLS = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'ORCL']
 
@@ -78,7 +85,7 @@ logger.setLevel(logging.INFO)
 if not logger.handlers:
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
-    formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
+    formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S%z')
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
@@ -88,6 +95,32 @@ def onError(reqId, errorCode, errorString, contract):
 ib.errorEvent += onError
 
 # ================= 🛡️ 架构级资源管理与重试机制 =================
+
+def connect_ib_with_retry(ib_instance, client_id=318):
+    for attempt in range(1, IB_CONNECT_ATTEMPTS + 1):
+        started = time.monotonic()
+        try:
+            ib_instance.connect(
+                '127.0.0.1', 4001, clientId=client_id,
+                timeout=IB_CONNECT_TIMEOUT, readonly=True, account='')
+            if not ib_instance.isConnected():
+                raise ConnectionError('IB initialization did not complete')
+            logger.info(
+                'IB初始化完成: attempt=%d/%d, elapsed=%.2fs',
+                attempt, IB_CONNECT_ATTEMPTS, time.monotonic() - started)
+            return
+        except Exception as exc:
+            logger.warning(
+                'IB初始化失败: attempt=%d/%d, elapsed=%.2fs, %s: %r',
+                attempt, IB_CONNECT_ATTEMPTS, time.monotonic() - started,
+                type(exc).__name__, exc, exc_info=True)
+            try:
+                ib_instance.disconnect()
+            except Exception:
+                logger.exception('IB失败连接清理异常')
+            if attempt == IB_CONNECT_ATTEMPTS:
+                raise
+            time.sleep(3 * attempt)
 
 @contextmanager
 # ✅ 修复: 增加了 tick_list 参数。期权传 '100,101'，VIX期货传 ''
@@ -167,20 +200,52 @@ def append_to_spot_db_local(macro_data, date_str):
 
 # ================= 邮件发送与节假日门卫 =================
 def send_email(subject, body):
-    msg = MIMEText(body, 'plain', 'utf-8')
-    # 从金库读取发送人与收件人
-    msg['From'] = cfg.SENDER_EMAIL
-    msg['To'] = cfg.RECEIVER_EMAIL
-    msg['Subject'] = Header(subject, 'utf-8')
-    
+    server = None
     try:
-        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        msg = MIMEText(body, 'plain', 'utf-8')
+        msg['From'] = cfg.SENDER_EMAIL
+        msg['To'] = cfg.RECEIVER_EMAIL
+        msg['Subject'] = Header(subject, 'utf-8')
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=SMTP_TIMEOUT)
         server.login(cfg.SENDER_EMAIL, cfg.APP_PASSWORD)
-        server.sendmail(cfg.SENDER_EMAIL, [cfg.RECEIVER_EMAIL], msg.as_string())
-        server.quit()
+        refused = server.sendmail(
+            cfg.SENDER_EMAIL, [cfg.RECEIVER_EMAIL], msg.as_string())
+        if refused:
+            logger.error('SMTP拒绝收件人: %s', list(refused))
+            return False
         return True
-    except Exception as e: 
-        logger.warning(f"邮件发送失败: {e}")
+    except Exception as exc:
+        logger.exception('邮件发送失败: %s: %r', type(exc).__name__, exc)
+        return False
+    finally:
+        if server is not None:
+            # SMTP已接受邮件后，QUIT失败不应误报发送失败或触发重复发送。
+            try:
+                server.quit()
+            except Exception:
+                logger.warning('SMTP会话清理失败', exc_info=True)
+                try:
+                    server.close()
+                except Exception:
+                    logger.warning('SMTP连接关闭失败', exc_info=True)
+
+def save_post_close_artifacts(report, run_state):
+    try:
+        POST_CLOSE_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = POST_CLOSE_REPORT_DIR / (run_state['run_id'] + '.txt')
+        report_path.write_text(report, encoding='utf-8')
+        run_state['report_path'] = str(report_path)
+        run_state['archive_status'] = 'saved'
+        payload = json.dumps(run_state, ensure_ascii=False, indent=2) + '\n'
+        (POST_CLOSE_REPORT_DIR / (run_state['run_id'] + '.json')).write_text(
+            payload, encoding='utf-8')
+        pending_path = POST_CLOSE_REPORT_DIR / (run_state['run_id'] + '.tmp')
+        pending_path.write_text(payload, encoding='utf-8')
+        pending_path.replace(POST_CLOSE_REPORT_DIR / 'latest.json')
+        return True
+    except Exception:
+        run_state['archive_status'] = 'failed'
+        logger.exception('盘后报告及运行状态备份失败；仍尝试发送邮件')
         return False
 
 def check_market_status():
@@ -1004,11 +1069,25 @@ def get_report():
     report = f"📊 美股战略日报 [轨道一] 盘后绝对客观数据切片\n生成时间: {ny_now.strftime('%Y-%m-%d %H:%M')}\n" + "="*55 + "\n"
     
     macro_data_db = {"date": today_str}
+    run_state = {
+        'run_id': ny_now.strftime('%Y%m%dT%H%M%S%f%z'),
+        'trading_date': today_str,
+        'started_at': ny_now.isoformat(),
+        'collection_status': 'running',
+        'email_status': 'pending',
+        'qqq_signal_status': 'not_started',
+        'stock_spot_rows_written': 0,
+    }
+    stage = 'IB连接初始化'
+    logger.info('盘后任务开始: run_id=%s, trading_date=%s',
+                run_state['run_id'], today_str)
+    save_post_close_artifacts(report, run_state)
     
     try:
-        ib.connect('127.0.0.1', 4001, clientId=318, readonly=True, account='')
+        connect_ib_with_retry(ib)
         ib.reqMarketDataType(4)
 
+        stage = '双轨动能'
         report += "\n【模块零：日内动能绝对值】\n"
         comparison_symbols = ['QQQ', 'QQQE', 'SPY', 'RSP']
         ib.qualifyContracts(*[
@@ -1057,6 +1136,7 @@ def get_report():
         report += f"- QQQE 开收到收盘: {perf_text(qqqe_o2c)}\n"
         report += f"- 日内市值权重差: {perf_text(diff_o2c)}\n\n"
         
+        stage = '市场广度'
         rep_breadth, dict_breadth = get_market_breadth_ib(ib)
         report += rep_breadth
         macro_data_db.update(dict_breadth)
@@ -1070,6 +1150,7 @@ def get_report():
             'OK' if diff_c2c is not None and spy_rsp is not None
             and dict_breadth.get('mag7_sample_count') == 7 else 'PARTIAL')
 
+        stage = '风险资本阶梯'
         report += "\n【模块一A：风险资本阶梯（影子观察）】\n"
         try:
             risk_capital_report, risk_capital = get_risk_capital_ladder_ib(
@@ -1084,6 +1165,7 @@ def get_report():
             report += (
                 "状态：数据不足\n说明：采集或计算失败；不影响其他盘后模块。\n")
 
+        stage = '当日动态异动脉冲'
         report += "\n【模块一A-2：当日动态异动脉冲（影子观察）】\n"
         try:
             event_pulse_report, event_pulse = get_risk_event_pulse_ib(
@@ -1100,6 +1182,7 @@ def get_report():
                 "状态：数据不足\n说明：动态扫描或历史验证失败；"
                 "固定风险资本阶梯不受影响。\n")
 
+        stage = '现金市场接受度'
         report += "\n【模块一B：现金市场接受度影子指标】\n"
         for acceptance_symbol in ('SPY', 'QQQ'):
             acceptance_report, acceptance_data = get_cash_acceptance_ib(
@@ -1107,9 +1190,11 @@ def get_report():
             report += acceptance_report
             macro_data_db.update(acceptance_data)
 
+        stage = 'ETF结构损耗'
         rep_drag, dict_drag = get_etf_structural_drag(ib, 'QQQ', 'TQQQ', leverage=3)
         macro_data_db.update(dict_drag)
 
+        stage = '宏观波动率'
         report += "\n【模块二：宏观波动率与异动雷达】"
         rep_vix, dict_vix = get_vix_term_structure(ib)
         report += rep_vix
@@ -1119,6 +1204,7 @@ def get_report():
 
         rows_written = 0
         for sym in SYMBOLS:
+            stage = f'{sym}现货与情绪'
             logger.info(f"-> 正在计算 {sym} 盘后现货与情绪底牌...")
             rep_poc, dict_poc = get_spot_poc_obv_ib(ib, sym)
             report += rep_poc
@@ -1156,7 +1242,9 @@ def get_report():
             attach_metadata(spot_payload, source_date=today_str)
             if safe_upsert(supabase, 'stock_spot_post_close', spot_payload, conflict_cols='date,ticker') is not None:
                 rows_written += 1
+                run_state['stock_spot_rows_written'] = rows_written
 
+        stage = '宏观落库'
         attach_metadata(macro_data_db, source_date=today_str)
         safe_upsert(supabase, 'macro_spot_daily', macro_data_db, conflict_cols='date')
         logger.info("☁️ ✅ 现货大势与VIX宏观数据已完美推送到 Supabase (macro_spot_daily)！")
@@ -1184,19 +1272,63 @@ def get_report():
         report += rep_drag
         # 保留16:02原始抓取；全部落库后等待到收盘+10分钟并冻结QQQ信号。
         # 调用失败仅在报告中标记，不影响原盘后数据、邮件或数据库写入。
+        stage = 'QQQ盘后冻结信号'
+        run_state['qqq_signal_status'] = 'running'
         report += render_qqq_signal_section(
             "post_close",
             python_executable=getattr(cfg, "QQQ_BUILDER_PYTHON", None),
             builder_path=getattr(cfg, "QQQ_BUILDER_PATH", None),
         )
+        run_state['qqq_signal_status'] = 'section_rendered'
         report += "="*55 + "\n[声明] 轨道一：盘后数据切片生成完毕！"
         
+        stage = '本地CSV备份'
         append_to_spot_db_local(macro_data_db, today_str)
-        
-        send_email(f"美股盘后复盘 - 客观数据切片", report)
-        logger.info("\n✅ 轨道一运行完毕并发送成功！")
+        run_state['collection_status'] = 'completed'
 
-    except Exception as e: logger.error(f"❌ 运行失败: {e}")
-    finally: ib.disconnect()
+    except Exception as exc:
+        run_state.update({
+            'collection_status': 'failed',
+            'failed_stage': stage,
+            'error_type': type(exc).__name__,
+            'error_detail': repr(exc),
+        })
+        logger.exception('盘后运行失败: stage=%s, %s: %r',
+                         stage, type(exc).__name__, exc)
+        report = (
+            f'[盘后抓取异常] 交易日: {today_str}\n'
+            f'失败阶段: {stage}\n'
+            f'异常类型: {type(exc).__name__}\n异常详情: {exc!r}\n'
+            '本次盘后复盘未完成；以下仅保留退出前已生成的内容，'
+            '不可视为完整收盘结果。\n'
+            f"QQQ冻结信号调用状态: {run_state['qqq_signal_status']}；"
+            '不得将旧信号视为当日已更新。\n\n' + report)
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:
+            logger.exception('盘后IB连接清理失败；继续备份和邮件流程')
 
-if __name__ == "__main__": get_report()
+    run_state['collection_finished_at'] = datetime.now(NY_TZ).isoformat()
+    save_post_close_artifacts(report, run_state)
+    subject = '美股盘后复盘 - 客观数据切片'
+    if run_state['collection_status'] == 'failed':
+        subject += f' [抓取失败 {today_str}]'
+    email_ok = send_email(subject, report)
+    run_state['email_status'] = 'smtp_accepted' if email_ok else 'failed'
+    run_state['finished_at'] = datetime.now(NY_TZ).isoformat()
+    save_post_close_artifacts(report, run_state)
+    if email_ok:
+        logger.info('盘后邮件已获SMTP接受: collection_status=%s, run_id=%s',
+                    run_state['collection_status'], run_state['run_id'])
+    else:
+        logger.error('盘后邮件发送失败: run_id=%s, report_path=%s',
+                     run_state['run_id'], run_state.get('report_path'))
+    return run_state
+
+if __name__ == "__main__":
+    result = get_report()
+    if result is not None and (
+            result['collection_status'] == 'failed'
+            or result['email_status'] == 'failed'):
+        sys.exit(1)
