@@ -273,6 +273,118 @@ class IntradaySniperDeploymentTests(unittest.TestCase):
         """)
         self.assertIn("IB_ERROR_CAPTURE_OK", output)
 
+    def test_farm_notices_are_state_transitions_and_upgrade_is_deduplicated(self):
+        output = self._isolated_run("""
+            import runpy
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="farm_notice_test")
+            sentinel = module["GlobalSentinel"].__new__(
+                module["GlobalSentinel"])
+            sentinel.ib_errors = []
+            messages = []
+            sentinel.log = messages.append
+            connecting = "Market data farm is connecting:usfarm.nj"
+            sentinel._capture_ib_error(-1, 2119, connecting)
+            sentinel._capture_ib_error(-1, 2119, connecting)
+            assert sentinel.ib_errors == []
+            assert len(messages) == 1
+            assert "⚠️" not in messages[0]
+            state = sentinel.ib_market_data_farms["usfarm.nj"]
+            assert state["status"] == "CONNECTING"
+            assert state["duplicate_count"] == 1
+            sentinel._capture_ib_error(
+                -1, 2104, "Market data farm connection is OK:usfarm.nj")
+            assert sentinel.ib_market_data_farms["usfarm.nj"]["status"] == "READY"
+            assert sentinel._ib_farm_connecting_since == {}
+            assert len(messages) == 2
+            sentinel._capture_ib_error(-1, 2172, "Upgrade TWS by December")
+            sentinel._capture_ib_error(13, 2172, "Upgrade TWS by December")
+            assert len(sentinel.ib_errors) == 1
+            assert sentinel.ib_errors[0]["code"] == 2172
+            assert len(messages) == 3
+            print("FARM_NOTICES_OK")
+        """)
+        self.assertIn("FARM_NOTICES_OK", output)
+
+    def test_pending_farm_does_not_invalidate_quotes_and_waits_for_missing(self):
+        output = self._isolated_run("""
+            import runpy
+            from types import SimpleNamespace
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="farm_readiness_test")
+            sentinel = module["GlobalSentinel"].__new__(
+                module["GlobalSentinel"])
+            sentinel.ib_errors = []
+            sentinel.log = lambda message: None
+            clock = [100.0]
+            module["time"].monotonic = lambda: clock[0]
+            sleeps = []
+            def sleep(seconds):
+                sleeps.append(seconds)
+                clock[0] += seconds
+            sentinel.ib = SimpleNamespace(sleep=sleep)
+            sentinel._capture_ib_error(
+                -1, 2119, "Market data farm is connecting:usfarm.nj")
+            clock[0] += 8
+            quotes = {
+                "SPY": SimpleNamespace(last=650),
+                "TRIN": SimpleNamespace(last=1.2),
+                "TICK": SimpleNamespace(last=0),
+                "AD": SimpleNamespace(last=0),
+            }
+            health = sentinel._check_market_data_readiness(quotes)
+            assert health["status"] == "QUOTES_AVAILABLE"
+            assert sleeps == []
+            assert sentinel.ib_errors == []
+            quotes["AD"].last = float("nan")
+            health = sentinel._check_market_data_readiness(quotes)
+            assert sleeps == [2.0]
+            assert health["status"] == "MARKET_DATA_FARM_NOT_READY"
+            assert health["missing_live_symbols"] == ["AD"]
+            assert health["farm_symbol_association"] == "UNKNOWN"
+            assert sentinel.ib_errors[-1]["symbol"] == "AD"
+            assert quotes["SPY"].last == 650
+            sentinel._capture_ib_error(
+                -1, 2104, "Market data farm connection is OK:usfarm.nj")
+            health = sentinel._check_market_data_readiness(quotes)
+            assert health["status"] == "MISSING_LIVE_QUOTES"
+            assert len(sentinel.ib_errors) == 1
+            print("FARM_READINESS_OK")
+        """)
+        self.assertIn("FARM_READINESS_OK", output)
+
+    def test_farm_ready_during_wait_does_not_raise_timeout(self):
+        output = self._isolated_run("""
+            import runpy
+            from types import SimpleNamespace
+
+            module = runpy.run_path(
+                "ib_intraday_sniper.py", run_name="farm_recovery_test")
+            sentinel = module["GlobalSentinel"].__new__(
+                module["GlobalSentinel"])
+            sentinel.ib_errors = []
+            sentinel.log = lambda message: None
+            clock = [100.0]
+            module["time"].monotonic = lambda: clock[0]
+            sentinel._capture_ib_error(
+                -1, 2119, "Market data farm is connecting:usfarm.nj")
+            quotes = {"AD": SimpleNamespace(last=float("nan"))}
+            def recover(seconds):
+                clock[0] += seconds
+                sentinel._capture_ib_error(
+                    -1, 2104, "Market data farm connection is OK:usfarm.nj")
+                quotes["AD"].last = -12
+            sentinel.ib = SimpleNamespace(sleep=recover)
+            health = sentinel._check_market_data_readiness(quotes)
+            assert health["status"] == "QUOTES_AVAILABLE"
+            assert health["pending_farms"] == []
+            assert sentinel.ib_errors == []
+            print("FARM_RECOVERY_OK")
+        """)
+        self.assertIn("FARM_RECOVERY_OK", output)
+
     def test_send_email_returns_delivery_status(self):
         output = self._isolated_run("""
             import runpy

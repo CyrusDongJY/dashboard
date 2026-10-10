@@ -453,3 +453,31 @@ Flip、Gamma Call/Put Wall 与派生距离不参与异常引擎；标准月度OI
   /home/winters_dong426/quant_bot/auto_analyst.py \
   /home/winters_dong426/TradingRadar/ib_intraday_sniper.py
 ```
+
+## 十、IB行情通知与VIX标准月口径（2026-10-11）
+
+在 Supabase SQL Editor 执行 `migrations/20261010_vix_curve_quality.sql`。
+此迁移仅为 `macro_spot_daily` 新增质量、合约血缘和价格日期三列，不改历史值。
+未执行时，采集器继续保存其他宏观字段，VIX列留空并提示
+`VIX_MIGRATION_REQUIRED`；已归档的报告仍保留采集证据。
+
+同步部署 `vix_futures.py`、`vix_index_ratio.py` 及引用它们的
+`daily_post_close.py`、`ultimate_dashboard.py`、`anomaly_engine.py`、
+`market_probes.py`、`daily_review.py`、`liquidity_monitor.py`。
+盘中程序单独部署到 `~/TradingRadar/ib_intraday_sniper.py`。
+
+- VX期货按标准月结算日期选M1/M2，含美国假日调整。采用16:00美东截止、
+  两腿共同且有成交的5分钟K线（最晚15分钟内），输出合约、DTE、conId及截面。
+  无有效共同报价时输出不可用，不混用旧收盘价与实时价。
+- 只有 `vix_curve_quality=OK` 且 `selection=STANDARD_MONTHLY` 的曲线参与
+  正式下游信号。旧周/月混合历史仍可审计，但不进入新期货历史基准。
+- VIX指数比值使用原生同日VIX/VIX3M，标签为“VIX 30D/3M期限比”；平坦区间
+  和期货分类共用0.10点/0.50%规则，两类曲线保持独立。
+- IB 2119记录为去重的CONNECTING状态，2104更新READY；2119不进入错误摘要。
+  报价缺失且farm持续未就绪时才补充连接超时诊断，2172升级提示继续保留。
+- cron中15点任务由 `0,15,30 15 * * 1-5` 改为
+  `0,15,30,45 15 * * 1-5`，补齐15:45采样。
+
+回滚时恢复部署备份里的代码和crontab；新增数据库列可以保留。
+运行检查使用 `python3 -m unittest discover -s tests`，不要通过完整采集入口做
+导入测试，以免触发落库或报告邮件。

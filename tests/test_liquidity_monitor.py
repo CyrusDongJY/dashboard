@@ -333,6 +333,10 @@ class LiquiditySourceTests(unittest.TestCase):
             "date": "2026-01-09",
             "source_date": "2026-01-09",
             "vix_contango_pct": 4.85,
+            "vix_m1": 20.0,
+            "vix_m2": 20.97,
+            "vix_curve_quality": "OK",
+            "vix_curve_metadata": {"selection": "STANDARD_MONTHLY"},
             "pct_20ma": 61.0,
         }]
 
@@ -375,12 +379,17 @@ class LiquiditySourceTests(unittest.TestCase):
             {
                 "report_date": "2026-01-08", "metric": "vix_contango_pct",
                 "value": 4.5, "source_date": "2026-01-08",
-                "source_name": "macro_spot_daily",
+                "source_name": "macro_spot_daily:STANDARD_MONTHLY",
             },
             {
                 "report_date": "2026-01-09", "metric": "vix_contango_pct",
                 "value": 99.0, "source_date": "2026-01-09",
                 "source_name": "unknown_legacy_source",
+            },
+            {
+                "report_date": "2026-01-12", "metric": "vix_contango_pct",
+                "value": -6.0, "source_date": "2026-01-12",
+                "source_name": "macro_spot_daily",
             },
         ])
         fallback = _metric_daily_fallback_frame(rows)
@@ -398,6 +407,20 @@ class LiquiditySourceTests(unittest.TestCase):
             4.5,
         )
         self.assertNotIn(pd.Timestamp("2026-01-09"), fallback.index)
+        self.assertNotIn(pd.Timestamp("2026-01-12"), fallback.index)
+
+    def test_unverified_raw_futures_history_is_not_normalized(self):
+        def fake_rows(_supabase, table, _date_col, _start, _end):
+            if table == "macro_spot_daily":
+                return pd.DataFrame([{
+                    "date": "2026-01-09", "vix_contango_pct": -6.0,
+                    "vix_m1": 20.0, "vix_m2": 18.8,
+                }])
+            return pd.DataFrame()
+        with patch("liquidity_monitor._fetch_rows", side_effect=fake_rows), patch(
+                "liquidity_monitor._fetch_metric_daily_rows", return_value=pd.DataFrame()):
+            frame = build_database_frame(None, "2026-01-01", "2026-01-09")
+        self.assertTrue(frame["vix_futures_contango_pct"].isna().all())
 
     def test_raw_table_values_win_over_metric_daily_fallback(self):
         index = pd.to_datetime(["2026-01-08", "2026-01-09"])

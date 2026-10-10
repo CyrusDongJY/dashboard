@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from vix_futures import validated_curve
 
 
 logger = logging.getLogger(__name__)
@@ -139,7 +140,7 @@ COMPONENTS = [
 
     # Dealer/tail context. DIX and GEX remain context-only until direction is validated.
     ComponentSpec("vix_futures_curve", "tail_resilience",
-                  "VIX futures contango", "vix_futures_contango_pct",
+                  "VX standard monthly M1/M2", "vix_futures_contango_pct",
                   0.80, +1, min_obs=60),
     ComponentSpec("vix_spot_curve", "tail_resilience",
                   "VIX/VIX3M contango", "vix_ratio_contango_pct",
@@ -288,7 +289,7 @@ def _metric_daily_fallback_frame(rows: pd.DataFrame) -> pd.DataFrame:
         legacy_ratio_basis = False
         if metric == "vix_contango_pct":
             source = str(row.get("source_name") or "").strip().lower()
-            if source == "macro_spot_daily":
+            if source == "macro_spot_daily:standard_monthly":
                 target = "vix_futures_contango_pct"
             elif source.startswith("yfinance"):
                 target = "vix_ratio_contango_pct"
@@ -481,9 +482,10 @@ def build_database_frame(supabase, start_date: str,
             continue
         if extra.empty:
             continue
-        if table == "macro_spot_daily" and "vix_contango_pct" in extra:
-            extra = extra.rename(columns={
-                "vix_contango_pct": "vix_futures_contango_pct"})
+        if table == "macro_spot_daily":
+            extra["vix_futures_contango_pct"] = extra.apply(
+                lambda row: validated_curve(row)[1], axis=1)
+            extra = extra.drop(columns=["vix_contango_pct"], errors="ignore")
         union_index = frame.index.union(extra.index).sort_values()
         frame = frame.reindex(union_index)
         extra_source = (
@@ -498,10 +500,14 @@ def build_database_frame(supabase, start_date: str,
             else:
                 frame[column] = extra[column]
             source_col = f"{column}_source_date"
+            column_source = extra_source
+            if (column == "vix_futures_contango_pct"
+                    and "vix_curve_source_date" in extra):
+                column_source = pd.to_datetime(extra["vix_curve_source_date"], errors="coerce")
             if source_col in frame:
-                frame[source_col] = extra_source.combine_first(frame[source_col])
+                frame[source_col] = column_source.combine_first(frame[source_col])
             else:
-                frame[source_col] = extra_source
+                frame[source_col] = column_source
 
     try:
         metric_fallback = _metric_daily_fallback_frame(

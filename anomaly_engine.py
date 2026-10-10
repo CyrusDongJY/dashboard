@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 
 from market_utils import trading_days_back, lag_trading_days
+from data_contracts import VIX_FLAT_PCT
+from vix_futures import validated_curve
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +49,9 @@ def gamma_decision_mask(frame):
 # ============================================================
 METRIC_REGISTRY = {
     # 波动率结构
-    "vix_contango_pct": {"cn": "VIX期限结构", "bad_dir": -1, "scope": "MACRO",
-                          "abs": [("<", 0, 3), ("<", 3, 1)], "z": (2.0, 3.0)},
-    "vix_ratio_contango_pct": {"cn": "VIX/VIX3M升贴水", "bad_dir": -1,
+    "vix_contango_pct": {"cn": "VX标准月M1/M2升贴水", "bad_dir": -1, "scope": "MACRO",
+                          "abs": [("<=", -VIX_FLAT_PCT, 3), ("<", 3, 1)], "z": (2.0, 3.0)},
+    "vix_ratio_contango_pct": {"cn": "VIX 30D/3M升贴水", "bad_dir": -1,
                           "scope": "MACRO", "abs": None, "z": (2.0, 3.0)},
     "move":            {"cn": "MOVE债市波动", "bad_dir": +1, "scope": "MACRO",
                           "abs": [(">", 120, 2), (">", 100, 1)], "z": (2.0, 3.0)},
@@ -275,7 +277,7 @@ def _cmp(op, a, b):
 # ============================================================
 # 第一层 + 第二层：逐指标扫描
 # ============================================================
-def scan_metric(metric, series, report_date, scope=None, source_date=None):
+def scan_metric(metric, series, report_date, scope=None, source_date=None, curve_state=None):
     """对单指标的时间序列（升序）跑一层+二层，返回 [AnomalyEvent]。"""
     reg = METRIC_REGISTRY.get(metric)
     if reg is None:
@@ -300,6 +302,8 @@ def scan_metric(metric, series, report_date, scope=None, source_date=None):
     hit_sev = 0
     if reg.get("abs"):
         for op, thr, sev in reg["abs"]:
+            if metric == 'vix_contango_pct' and sev >= 3 and curve_state != 'BACKWARDATION':
+                continue
             if _cmp(op, cur, thr):
                 hit_sev = max(hit_sev, sev)
     if hit_sev > 0:
@@ -409,7 +413,7 @@ def _days_in_risk(series, reg):
 
 def metric_snapshot(metric, series, report_date, scope=None, source_date=None,
                     session="EOD", is_final=False, source_name=None,
-                    is_filled=False, effective_obs_count=None):
+                    is_filled=False, effective_obs_count=None, curve_state=None):
     """输出单指标的每日派生向量（dict），供 metric_daily 落库画曲线。
     与 scan_metric 用同一套统计口径，但无条件产出（不依赖是否越线）。"""
     reg = METRIC_REGISTRY.get(metric)
@@ -430,6 +434,8 @@ def metric_snapshot(metric, series, report_date, scope=None, source_date=None,
     sev = 0
     if reg.get("abs"):
         for op, thr, sv in reg["abs"]:
+            if metric == 'vix_contango_pct' and sv >= 3 and curve_state != 'BACKWARDATION':
+                continue
             if _cmp(op, cur, thr):
                 sev = max(sev, sv)
     if z is not None and reg.get("two_sided"):
@@ -835,6 +841,7 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
     # ---- 现货波动率：macro_spot_daily ----
     ms = _fetch_history(supabase, 'macro_spot_daily', 'date', end_date=report_date)
     if not ms.empty:
+        ms['vix_contango_pct'] = ms.apply(lambda row: validated_curve(row)[1], axis=1)
         for m in [
             'vix_contango_pct', 'breadth_diff_pct', 'tqqq_drag_pct',
             'qqq_qqqe_spread_pct', 'spy_rsp_spread_pct',
@@ -843,11 +850,25 @@ def run_engine(supabase, report_date=None, persist=True, session="EOD", is_final
             'qqq_vwap_time_acceptance_pct',
         ]:
             if m in ms.columns:
-                src = _metric_source_date(ms, m, 'date', ('source_date',))
-                events += scan_metric(m, ms[m], report_date, scope="MACRO", source_date=src)
+                curve_state = None
+                source_name = 'macro_spot_daily'
+                if m == 'vix_contango_pct':
+                    curve_state = validated_curve(ms.iloc[-1])[0]
+                    # A missing latest curve must not repeat an older curve as a
+                    # new official signal or normalized observation.
+                    if curve_state == 'UNAVAILABLE':
+                        snapshot[m] = None
+                        continue
+                    source_name = 'macro_spot_daily:STANDARD_MONTHLY'
+                source_cols = (('vix_curve_source_date', 'source_date')
+                               if m == 'vix_contango_pct' else ('source_date',))
+                src = _metric_source_date(ms, m, 'date', source_cols)
+                events += scan_metric(m, ms[m], report_date, scope="MACRO", source_date=src,
+                                      curve_state=curve_state)
                 row = metric_snapshot(
                     m, ms[m], report_date, scope="MACRO", source_date=src,
-                    session=session, is_final=is_final, source_name="macro_spot_daily")
+                    session=session, is_final=is_final, source_name=source_name,
+                    curve_state=curve_state)
                 if row: snap_rows.append(row)
                 clean = _clean(ms[m])
                 snapshot[m] = float(clean.iloc[-1]) if not clean.empty else None

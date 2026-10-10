@@ -81,6 +81,57 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(self.ib.connect.call_count, 3)
 
 
+class VixCollectionTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_report_module()
+
+    def test_collection_requests_same_close_cutoff_for_both_months(self):
+        from datetime import date
+        from test_vix_futures import contract, bar
+        first, second = contract('20261021', 2), contract('20261118', 4)
+        broker = MagicMock()
+        broker.reqContractDetails.return_value = [
+            SimpleNamespace(contract=contract('20261014', 1)),
+            SimpleNamespace(contract=first), SimpleNamespace(contract=second)]
+        broker.reqHistoricalData.side_effect = [
+            [bar('2026-10-09T19:55:00Z', 17.1)],
+            [bar('2026-10-09T19:55:00Z', 17.85)]]
+        calendar = SimpleNamespace(valid_days=lambda **_kw: pd.bdate_range('2026-09-01', '2028-12-01'))
+        with patch.object(self.module, 'Future', create=True), patch.object(
+                self.module.mcal, 'get_calendar', return_value=calendar):
+            report, result = self.module.get_vix_term_structure(broker, date(2026, 10, 9))
+        self.assertEqual(result['vix_curve_quality'], 'OK')
+        for request in broker.reqHistoricalData.call_args_list:
+            self.assertEqual(request.kwargs['endDateTime'], '20261009 16:00:00 America/New_York')
+            self.assertEqual(request.kwargs['formatDate'], 2)
+            self.assertEqual(request.kwargs['barSizeSetting'], '5 mins')
+        self.assertIn('2026-11-18', report)
+        self.assertIn('共同截面', report)
+        broker.reqMktData.assert_not_called()
+
+    def test_missing_schema_withholds_curve_but_preserves_other_macro_fields(self):
+        client = MagicMock()
+        client.table.return_value.select.return_value.limit.return_value.execute.side_effect = (
+            RuntimeError('42703 column macro_spot_daily.vix_curve_quality does not exist'))
+        payload = {'date': '2026-10-09', 'spy_poc_price': 775,
+                   'vix_m1': 17, 'vix_m2': 18, 'vix_contango_pct': 5.88,
+                   'vix_curve_state': 'CONTANGO', 'vix_curve_quality': 'OK',
+                   'vix_curve_metadata': {}, 'vix_curve_source_date': '2026-10-09'}
+        with patch.object(self.module, 'safe_upsert', return_value=object()) as save, self.assertLogs(
+                self.module.logger, level='WARNING'):
+            self.assertFalse(self.module.persist_macro_snapshot(client, payload))
+        persisted = save.call_args.args[2]
+        self.assertEqual(persisted['spy_poc_price'], 775)
+        self.assertIsNone(persisted['vix_contango_pct'])
+        self.assertNotIn('vix_curve_quality', persisted)
+        self.assertEqual(payload['vix_curve_quality'], 'OK')
+
+    def test_db_failure_is_not_logged_as_success(self):
+        with patch.object(self.module, 'safe_upsert', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, '写入失败'):
+                self.module.persist_macro_snapshot(MagicMock(), {'date': '2026-10-09'})
+
+
 class MailTests(unittest.TestCase):
     def setUp(self):
         self.module = load_report_module()

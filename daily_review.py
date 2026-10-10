@@ -6,6 +6,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import json
 import math
+from vix_futures import validated_curve
 
 RULE_VERSION = "daily_review_v1.0-shadow"
 
@@ -61,6 +62,7 @@ DISPLAY_LABELS = {
         "CONTANGO": "正向升水",
         "FLAT": "平坦",
         "MISSING": "数据缺失",
+        "UNAVAILABLE": "数据不可用",
     },
 }
 
@@ -321,10 +323,9 @@ def _breadth_module(market, fresh):
 def _volatility_module(market, spot, metric_rows, fresh):
     vix = _finite(market.get("vix"))
     vvix = _finite(market.get("vvix"))
-    contango = _finite(spot.get("vix_contango_pct"))
-    curve = str(spot.get("vix_curve_state") or "MISSING")
-    quality = "HIGH" if fresh and vix is not None and curve != "MISSING" else (
-        "MEDIUM" if fresh and (vix is not None or curve != "MISSING") else "LOW")
+    curve, contango = validated_curve(spot)
+    quality = "HIGH" if fresh and vix is not None and curve != "UNAVAILABLE" else (
+        "MEDIUM" if fresh and (vix is not None or curve != "UNAVAILABLE") else "LOW")
     if quality == "LOW":
         state = "UNAVAILABLE"
     elif curve == "BACKWARDATION" or (vix is not None and vix >= 30) or (vvix is not None and vvix >= 130):
@@ -344,7 +345,7 @@ def _volatility_module(market, spot, metric_rows, fresh):
     }
     evidence = [
         f"VIX={_fmt(vix, 2)} | VVIX={_fmt(vvix, 2)} | "
-        f"VIX期货={_display_label('vix_curve', curve)} ({_fmt(contango, 2)}%)",
+        f"VX标准月 M1→M2={_display_label('vix_curve', curve)} ({_fmt(contango, 2)}%)",
         (f"GEX={_fmt(gex_context['value'], 2)} | 分位={_fmt(gex_context['percentile'])}% | "
          f"Z={_fmt(gex_context['zscore'], 2)} | 仅作背景"),
     ]
@@ -427,6 +428,10 @@ def _rank_anomalies(events):
 
 
 def _meaningful_changes(market, prior_market, spot, prior_spot):
+    # Recompute only from audited monthly contracts; legacy mixed expiries cannot
+    # establish a day-over-day futures move.
+    spot = dict(spot, vix_contango_pct=validated_curve(spot)[1])
+    prior_spot = dict(prior_spot, vix_contango_pct=validated_curve(prior_spot)[1])
     specs = [
         ("200MA广度", market, prior_market, "pct_200ma", 2.0, "%"),
         ("50MA广度", market, prior_market, "pct_50ma", 3.0, "%"),
@@ -436,7 +441,7 @@ def _meaningful_changes(market, prior_market, spot, prior_spot):
         ("VIX", market, prior_market, "vix", 1.5, ""),
         ("信用Z", market, prior_market, "credit_z", 0.4, ""),
         ("10Y Z", market, prior_market, "tnx_z", 0.4, ""),
-        ("VIX期货升贴水", spot, prior_spot, "vix_contango_pct", 1.5, "%"),
+        ("VX标准月升贴水", spot, prior_spot, "vix_contango_pct", 1.5, "%"),
     ]
     changes = []
     for label, current_row, prior_row, key, threshold, suffix in specs:
@@ -558,7 +563,11 @@ def build_daily_review(report_date, *, market_row, spot_row,
         market_row, prior_market_row, spot_row, prior_spot_row)
     if not changes:
         changes = ["没有达到预设变化阈值的核心变量。"]
-    anomalies = _rank_anomalies(anomaly_events)
+    anomalies = _rank_anomalies([
+        event for event in (anomaly_events or [])
+        if (asdict(event) if is_dataclass(event) else event).get("metric") != "vix_contango_pct"
+        or validated_curve(spot_row)[0] != "UNAVAILABLE"
+    ])
     price_map = _price_map(micro_rows, cash["values"])
 
     scenarios = {

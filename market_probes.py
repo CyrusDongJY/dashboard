@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from vix_futures import validated_curve
 
 # ==========================================
 # V9.0 说明：
@@ -57,8 +58,11 @@ def scan_macro_regime(supabase, cutoff_date):
     if "🚨" in str(today.get('dix_div', '')):
         report_lines.append(f"ℹ️ 【DIX结构代理】{today['dix_div']} -> 仅作场外成交结构观察，方向需价格确认。")
 
-    if "倒挂" in str(today.get('vix_term', '')):
-        report_lines.append(f"🩸 【波动率倒挂】VIX结构崩溃 ({today.get('vix_term')})，市场进入极度恐慌！")
+    full_metrics = today.get('full_metrics')
+    ratio_quality = (full_metrics.get('vix_term_ratio_quality') or {}) if isinstance(full_metrics, dict) else {}
+    if (isinstance(ratio_quality, dict) and ratio_quality.get('status') == 'OK'
+            and ratio_quality.get('state') == 'BACKWARDATION'):
+        report_lines.append(f"⚠️ 【VIX 30D/3M期限比】短端高于3个月期限 ({today.get('vix_term')})。")
         alert_level += 2
 
     vrp = today.get('vrp', '')
@@ -214,11 +218,21 @@ def scan_volatility_spot(supabase, cutoff_date):
     report_lines = []
     alert_level = 0
 
-    contango = pd.to_numeric(today.get('vix_contango_pct', np.nan), errors='coerce')
-    if pd.notna(contango):
-        if contango < 0: report_lines.append(f"🩸 【极度高危】VIX期货 Backwardation 倒挂 ({contango:+.2f}%)"); alert_level += 2
-        elif contango < 3: report_lines.append(f"⚠️ VIX升水极窄 ({contango:+.2f}%)，市场脆弱平衡。"); alert_level += 1
-        else: report_lines.append(f"🟢 VIX期限结构健康 (升水 {contango:+.2f}%)。")
+    curve, contango = validated_curve(today)
+    if curve == 'BACKWARDATION':
+        report_lines.append(f"🩸 【高危】VX标准月 M1→M2倒挂 ({contango:+.2f}%)")
+        alert_level += 2
+    elif curve == 'FLAT':
+        report_lines.append(f"⚠️ VX标准月 M1→M2平坦 ({contango:+.2f}%)。")
+        alert_level += 1
+    elif curve == 'CONTANGO':
+        if contango < 3:
+            report_lines.append(f"⚠️ VX标准月 M1→M2升水较窄 ({contango:+.2f}%)。")
+            alert_level += 1
+        else:
+            report_lines.append(f"🟢 VX标准月 M1→M2升水 {contango:+.2f}%。")
+    else:
+        report_lines.append("ℹ️ VX标准月期限结构不可用（合约或报价质量未通过）。")
 
     breadth_diff = pd.to_numeric(today.get('breadth_diff_pct', np.nan), errors='coerce')
     if pd.notna(breadth_diff):

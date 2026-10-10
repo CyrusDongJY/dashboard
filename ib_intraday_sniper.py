@@ -39,6 +39,7 @@ IB_CONNECT_RETRIES = 3
 AD_MAX_QUOTE_AGE_SECONDS = 180
 AD_REPEAT_THRESHOLD = 3
 IB_INFORMATION_CODES = {2104, 2106, 2107, 2108, 2158}
+IB_FARM_READY_TIMEOUT_SECONDS = 10
 IBKR_BREADTH_CONTRACTS = {
     'TICK': ('TICK-NYSE', 'NYSE'),
     'TRIN': ('TRIN-NYSE', 'NYSE'),
@@ -168,13 +169,53 @@ class GlobalSentinel:
         self.spot_ctx = {}
         self.context_quality = "MISSING"
         self.ib_errors = []
+        self.ib_market_data_farms = {}
+        self._ib_farm_connecting_since = {}
+        self._ib_notice_keys = set()
         self.ib.errorEvent += self._capture_ib_error
 
     def _capture_ib_error(self, req_id, error_code, error_string,
                           contract=None):
-        """Persist actionable IB errors instead of suppressing their cause."""
+        """Separate farm lifecycle notices from actionable IB failures."""
+        if error_code in (2119, 2104):
+            # Farm lifecycle messages have no contract/request association.
+            # A pending farm must never invalidate another symbol's quote.
+            farm = error_string.rsplit(':', 1)[-1].strip()
+            if ':' in error_string and farm:
+                farms = getattr(self, 'ib_market_data_farms', {})
+                timers = getattr(self, '_ib_farm_connecting_since', {})
+                state = 'CONNECTING' if error_code == 2119 else 'READY'
+                previous = farms.get(farm, {})
+                repeated = previous.get('status') == state
+                farms[farm] = {
+                    'status': state,
+                    'code': error_code,
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                    'duplicate_count': (
+                        previous.get('duplicate_count', 0) + 1
+                        if repeated else 0),
+                }
+                if state == 'CONNECTING':
+                    if not repeated:
+                        timers[farm] = time.monotonic()
+                else:
+                    timers.pop(farm, None)
+                self.ib_market_data_farms = farms
+                self._ib_farm_connecting_since = timers
+                if not repeated:
+                    self.log(f"ℹ️ IB行情农场状态 farm={farm}: {state}")
+            return
         if error_code in IB_INFORMATION_CODES:
             return
+        # Keep upgrade warnings visible, but IB may repeat the same notice
+        # for several requests during one scan.
+        if error_code == 2172:
+            notice_keys = getattr(self, '_ib_notice_keys', set())
+            notice_key = (error_code, error_string)
+            if notice_key in notice_keys:
+                return
+            notice_keys.add(notice_key)
+            self._ib_notice_keys = notice_keys
         error = {
             'req_id': req_id,
             'code': error_code,
@@ -186,6 +227,59 @@ class GlobalSentinel:
         self.log(
             f"⚠️ IB错误 code={error_code} "
             f"symbol={error['symbol'] or 'NA'}: {error_string}")
+
+    def _missing_live_quotes(self, tickers):
+        missing = []
+        for symbol, ticker in tickers.items():
+            try:
+                value = float(getattr(ticker, 'last', None))
+                available = math.isfinite(value) and (
+                    symbol not in ('SPY', 'TRIN') or value > 0)
+            except (TypeError, ValueError):
+                available = False
+            if not available:
+                missing.append(symbol)
+        return sorted(missing)
+
+    def _check_market_data_readiness(self, tickers):
+        """Wait briefly only when farm startup coincides with absent quotes.
+
+        IB does not identify which farm serves each request. Persist the two
+        observations without claiming a causal link or rejecting valid quotes.
+        """
+        timers = getattr(self, '_ib_farm_connecting_since', {})
+        missing = self._missing_live_quotes(tickers)
+        if missing and timers:
+            elapsed = max(0, time.monotonic() - min(timers.values()))
+            remaining = IB_FARM_READY_TIMEOUT_SECONDS - elapsed
+            if remaining > 0:
+                self.ib.sleep(min(remaining, IB_FARM_READY_TIMEOUT_SECONDS))
+            missing = self._missing_live_quotes(tickers)
+        now = time.monotonic()
+        pending = sorted(
+            farm for farm, since in timers.items()
+            if now - since >= IB_FARM_READY_TIMEOUT_SECONDS)
+        health = {
+            'missing_live_symbols': missing,
+            'pending_farms': pending,
+            'farm_symbol_association': 'UNKNOWN',
+            'status': 'QUOTES_AVAILABLE' if not missing else 'MISSING_LIVE_QUOTES',
+        }
+        if missing and pending:
+            health['status'] = 'MARKET_DATA_FARM_NOT_READY'
+            error = {
+                'req_id': None,
+                'code': health['status'],
+                'symbol': ','.join(missing),
+                'message': (
+                    f"缺少实时报价={','.join(missing)}; "
+                    f"连接超过{IB_FARM_READY_TIMEOUT_SECONDS}秒未就绪的farm="
+                    f"{','.join(pending)}; 标的与farm关联未确认"),
+            }
+            self.ib_errors.append(error)
+            self.ib_errors = self.ib_errors[-50:]
+            self.log(f"⚠️ {error['code']}: {error['message']}")
+        return health
 
     def is_trading_day(self):
         try:
@@ -247,6 +341,7 @@ class GlobalSentinel:
             noise_keywords = [
                 "正在装载 Supabase", 
                 "分析完成。警报状态: False", 
+                "IB行情农场状态",
                 "盘中数据切片已成功推入"
                 # ✅ 修复：移除了 "运行崩溃"，杜绝掩耳盗铃，确保崩溃日志能进入次日复盘
             ]
@@ -539,6 +634,9 @@ class GlobalSentinel:
             return
 
         self.ib_errors = []
+        self.ib_market_data_farms = {}
+        self._ib_farm_connecting_since = {}
+        self._ib_notice_keys = set()
         self.load_sentinel_context()
         
         def optional_float(val):
@@ -667,6 +765,11 @@ class GlobalSentinel:
                 def ticker_for(key):
                     contract = qualified_contracts.get(key)
                     return t_dict.get(getattr(contract, 'conId', None))
+
+                context_metadata['ib_market_data_readiness'] = (
+                    self._check_market_data_readiness({
+                        key: ticker_for(key) for key in qualified_contracts
+                    }))
 
                 spy_px = self.get_robust_index_val(
                     qualified_contracts['SPY'], ticker_for('SPY'),
@@ -876,6 +979,8 @@ class GlobalSentinel:
 
             # ✅ 写入纯粹的 NY 字符串时间，屏蔽 Supabase 时区错乱
             context_metadata["ib_errors"] = self.ib_errors[-20:]
+            context_metadata["ib_market_data_farms"] = (
+                self.ib_market_data_farms)
             db_payload = {
                 "record_time": ny_timestamp_str,
                 "spy_px": spy_px, "sma20": sma20, "vwap_now": vwap_now, "vwap_30m": vwap_30m,

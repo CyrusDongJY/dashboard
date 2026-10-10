@@ -38,6 +38,10 @@ def spot_row(**updates):
         "qqq_mom_pct": 1.0,
         "vix_curve_state": "CONTANGO",
         "vix_contango_pct": 5.2,
+        "vix_m1": 20.0,
+        "vix_m2": 21.04,
+        "vix_curve_quality": "OK",
+        "vix_curve_metadata": {"selection": "STANDARD_MONTHLY"},
     }
     for symbol, vwap in (("spy", 640.0), ("qqq", 575.0)):
         row.update({
@@ -101,6 +105,27 @@ class DailyReviewTests(unittest.TestCase):
         self.assertEqual(review["risk_state"], "低风险")
         self.assertEqual(review["modules"]["cash"]["state"], "Accepted")
         self.assertEqual(review["modules"]["breadth"]["state"], "Broad")
+
+    def test_unverified_legacy_futures_do_not_create_stress_or_changes(self):
+        review = self.build(spot_row=spot_row(
+            vix_curve_quality=None, vix_curve_state="BACKWARDATION",
+            vix_contango_pct=-9.0, vix_m2=18.2), anomaly_events=[{
+                "metric": "vix_contango_pct", "severity": 3,
+                "confidence": 1.0, "explanation": "legacy inversion",
+            }])
+        volatility = review["modules"]["volatility"]
+        self.assertEqual(volatility["values"]["curve_state"], "UNAVAILABLE")
+        self.assertFalse(volatility["decision_eligible"])
+        self.assertNotEqual(volatility["state"], "Stress")
+        self.assertEqual(review["anomalies"], [])
+
+    def test_small_negative_monthly_spread_is_flat_not_stress(self):
+        review = self.build(spot_row=spot_row(
+            vix_m1=10.0, vix_m2=9.92,
+            vix_curve_state="BACKWARDATION", vix_contango_pct=-0.8))
+        volatility = review["modules"]["volatility"]
+        self.assertEqual(volatility["values"]["curve_state"], "FLAT")
+        self.assertEqual(volatility["state"], "Normal")
 
     def test_stale_cash_data_is_zero_weight_not_neutral(self):
         stale_spot = spot_row(date="2026-08-13")

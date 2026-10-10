@@ -49,6 +49,9 @@ from risk_event_pulse import (
     persistence_payloads as risk_event_payloads,
 )
 from qqq_signal_bridge import render_qqq_signal_section
+from vix_futures import (
+    aligned_curve, select_monthly_contracts, unavailable_curve,
+)
 
 # ================= 🔐 安全挂载全局金库 =================
 CONFIG_DIR = os.path.expanduser('~/market_dashboard')
@@ -145,6 +148,36 @@ def safe_db_upsert(table_name, data):
     conflict_cols = 'date,ticker' if table_name == 'stock_options_daily' else 'date'
     return safe_upsert(supabase, table_name, data, conflict_cols=conflict_cols,
                        max_retries=DB_MAX_RETRIES, sleep_fn=ib.sleep)
+
+
+def persist_macro_snapshot(client, payload):
+    """A pending additive migration must not break unrelated macro fields."""
+    provenance_fields = (
+        'vix_curve_quality', 'vix_curve_metadata', 'vix_curve_source_date')
+    schema_ready = True
+    try:
+        client.table('macro_spot_daily').select(
+            ','.join(provenance_fields)).limit(1).execute()
+    except Exception as exc:
+        message = str(exc)
+        if (any(field in message for field in provenance_fields)
+                and any(code in message for code in ('42703', 'PGRST204'))):
+            schema_ready = False
+        else:
+            raise
+    persisted = dict(payload)
+    if not schema_ready:
+        for field in provenance_fields:
+            persisted.pop(field, None)
+        for field in ('vix_m1', 'vix_m2', 'vix_contango_pct'):
+            persisted[field] = None
+        persisted['vix_curve_state'] = 'UNAVAILABLE'
+        logger.warning('VIX_MIGRATION_REQUIRED: VIX数值暂不发布；其他宏观字段继续落库')
+    response = safe_upsert(
+        client, 'macro_spot_daily', persisted, conflict_cols='date')
+    if response is None:
+        raise RuntimeError('macro_spot_daily 写入失败')
+    return schema_ready
 
 # ================= 辅助安全函数 =================
 def _safe_market_price(ticker):
@@ -666,71 +699,54 @@ def get_spot_poc_obv_ib(ib, symbol, duration='6 M'):
     except Exception as e: 
         return report + f"⚠️ 现货筹码计算异常: {e}\n", {}
 
-def get_vix_term_structure(ib):
-    report = f"\n--- 🌋 VIX 期限结构宏观状态 ---\n"
+def get_vix_term_structure(ib, as_of=None):
+    """Observe standard-monthly VX at one fixed cash-close cutoff."""
+    report = "\n--- 🌋 VX标准月 M1→M2升贴水 ---\n"
+    as_of = as_of or datetime.now(NY_TZ).date()
     try:
-        cds = ib.reqContractDetails(Future('VIX', exchange='CFE'))
-        if not cds: return "⚠️ VIX 抓取失败: 未返回合约。\n", {}
-        
-        # ✅ 修复 1：僵尸过滤器。严格剔除已经过期（或今天早晨刚刚交割）的合约
-        today_str = datetime.now(NY_TZ).strftime('%Y%m%d')
-        valid_futures = [cd.contract for cd in cds if cd.contract.lastTradeDateOrContractMonth > today_str]
-        futures = sorted(valid_futures, key=lambda x: x.lastTradeDateOrContractMonth)
-        
-        if len(futures) < 2: return "⚠️ VIX 抓取失败: 近期可用合约不足。\n", {}
+        # NYSE and CFE monthly expiration holiday adjustments share the US
+        # options holiday calendar. Cover next-month SPX expirations as well.
+        calendar = mcal.get_calendar('NYSE')
+        sessions = set(calendar.valid_days(
+            start_date=pd.Timestamp(as_of) - pd.Timedelta(days=60),
+            end_date=pd.Timestamp(as_of) + pd.Timedelta(days=800),
+        ).date)
+        details = ib.reqContractDetails(Future('VIX', exchange='CFE'))
+        contracts = select_monthly_contracts(details, as_of, sessions)
+        if len(contracts) != 2:
+            payload = unavailable_curve('INSUFFICIENT_STANDARD_MONTHLY_CONTRACTS')
+        else:
+            bars = [ib.reqHistoricalData(
+                contract,
+                endDateTime=f'{as_of:%Y%m%d} 16:00:00 America/New_York',
+                durationStr='1 D', barSizeSetting='5 mins',
+                whatToShow='TRADES', useRTH=False, formatDate=2,
+                timeout=30,
+            ) for contract in contracts]
+            payload = aligned_curve(contracts, bars, as_of)
+    except Exception as exc:
+        logger.warning('VX标准月曲线获取失败: %s', exc)
+        payload = unavailable_curve('FETCH_FAILED', {'error': str(exc)[:300]})
 
-        m1_fut, m2_fut = futures[0], futures[1]
-        ib.qualifyContracts(m1_fut, m2_fut)
-
-        m1_px, m2_px = None, None
-        
-        # ✅ 修复 2：引入"重武器"（历史 K 线）作为首选获取方式，避开流式延迟数据的盲区
-        for fut in [m1_fut, m2_fut]:
-            try:
-                bars = ib.reqHistoricalData(
-                    fut,
-                    endDateTime='',
-                    durationStr='2 D',
-                    barSizeSetting='1 day',
-                    whatToShow='TRADES',
-                    useRTH=False
-                )
-                if bars:
-                    px = float(bars[-1].close)
-                    if fut == m1_fut: m1_px = px
-                    else: m2_px = px
-            except: pass
-
-        # 兜底机制：如果重武器因为权限问题失败，再回退到原来的流式订阅
-        if m1_px is None or m2_px is None:
-            with market_data_subscription(ib, [m1_fut, m2_fut], SLEEP_LONG, tick_list='') as tickers:
-                if m1_px is None and len(tickers) > 0: m1_px = _safe_market_price(tickers[0])
-                if m2_px is None and len(tickers) > 1: m2_px = _safe_market_price(tickers[1])
-
-        if m1_px is None or m2_px is None or m1_px <= 0 or m2_px <= 0:
-            return "⚠️ VIX 延迟快照价格异常或不可用。\n", {}
-
-        curve_state, contango_pct = classify_vix_curve(m1_px, m2_px)
-        structure_type = {
-            "CONTANGO": "Contango (升水)",
-            "BACKWARDATION": "Backwardation (贴水倒挂)",
-            "FLAT": "Flat (平坦)",
-        }[curve_state]
-
-        report += f"近月 (M1 - {m1_fut.lastTradeDateOrContractMonth}): {m1_px:.2f}\n"
-        report += f"次月 (M2 - {m2_fut.lastTradeDateOrContractMonth}): {m2_px:.2f}\n"
-        report += f"价差结构: {structure_type}\n"
-        report += f"价差比例: {contango_pct:+.2f}%\n"
-
-        return report, {
-            "vix_m1": round(m1_px, 2), "vix_m2": round(m2_px, 2),
-            "vix_contango_pct": round(contango_pct, 2),
-            "vix_curve_state": curve_state,
-            "vix_curve_flat_abs_threshold": 0.10,
-            "vix_curve_flat_pct_threshold": 0.50,
-        }
-    except Exception as e: 
-        return f"⚠️ VIX 异常报错: {e}\n", {}
+    metadata = payload['vix_curve_metadata']
+    for index, contract in enumerate(metadata.get('contracts', []), start=1):
+        price = payload.get(f'vix_m{index}')
+        display = f'{price:.4f}' if price is not None else 'NA'
+        report += (
+            f"标准月 M{index}: {contract['local_symbol']} | "
+            f"到期={contract['expiry']} | DTE={contract['dte']} | "
+            f"conId={contract['con_id']} | 价格={display}\n")
+    if payload['vix_curve_quality'] == 'OK':
+        labels = {'CONTANGO': '升水', 'BACKWARDATION': '倒挂', 'FLAT': '平坦'}
+        report += (
+            f"价差结构: {labels[payload['vix_curve_state']]} | "
+            f"(M2/M1−1)={payload['vix_contango_pct']:+.2f}%\n"
+            f"报价口径: {metadata['price_type']} | "
+            f"共同截面={metadata['price_as_of']}\n")
+    else:
+        report += f"⚠️ 曲线不可用: {payload['vix_curve_quality']}，不参与告警。\n"
+    report += f"质量={payload['vix_curve_quality']} | 版本={metadata['version']}\n"
+    return report, payload
 
 def get_ivr_only(ib, symbol):
     report = f"\n--- ⚡ {symbol} 波动率情绪 (IV Rank / IV Percentile) ---\n"
@@ -1246,8 +1262,13 @@ def get_report():
 
         stage = '宏观落库'
         attach_metadata(macro_data_db, source_date=today_str)
-        safe_upsert(supabase, 'macro_spot_daily', macro_data_db, conflict_cols='date')
-        logger.info("☁️ ✅ 现货大势与VIX宏观数据已完美推送到 Supabase (macro_spot_daily)！")
+        vix_schema_ready = persist_macro_snapshot(supabase, macro_data_db)
+        if not vix_schema_ready:
+            report += '\n⚠️ VIX数据库迁移未完成：曲线仅归档展示，数据库及下游告警不可用。\n'
+        logger.info(
+            'macro_spot_daily写入成功: VX质量=%s',
+            macro_data_db.get('vix_curve_quality', 'UNAVAILABLE')
+            if vix_schema_ready else 'MIGRATION_REQUIRED')
 
         # 数据质量审计
         try:

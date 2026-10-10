@@ -497,6 +497,9 @@ ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS qqq_close_vs_vwap_pct nume
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_state text;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_flat_abs_threshold numeric;
 ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_flat_pct_threshold numeric;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_quality text;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_metadata jsonb;
+ALTER TABLE macro_spot_daily ADD COLUMN IF NOT EXISTS vix_curve_source_date date;
 
 -- Vol/OI异动必须等待次日OI确认；概率字段只表示启发式证据等级。
 CREATE TABLE IF NOT EXISTS option_volume_anomalies (

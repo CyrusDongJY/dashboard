@@ -32,6 +32,7 @@ from data_contracts import (
 )
 from market_utils import lag_trading_days
 from tactical_stress import StressInput, nullable_int, score_eod_stress
+from vix_index_ratio import compute_vix_index_ratio, format_vix_index_ratio
 
 class UltimateDashboard:
     def __init__(self):
@@ -60,6 +61,7 @@ class UltimateDashboard:
         self.liquidity_source_names = {}
         self.market_source_dates = {}
         self.stress_details = {}
+        self.vix_index_ratio_details = {}
 
     def log(self, msg):
         print(msg)
@@ -534,24 +536,23 @@ class UltimateDashboard:
         except: pass
 
         self.vol_metrics = {'vix': '-', 'move': '-', 'vix_term': '-', 'vrp': '-', 'vvix': '-', 'skew': '-'}
+        self.vix_index_ratio_details = compute_vix_index_ratio(raw_df)
+        self.num['vix_term_ratio'] = self.vix_index_ratio_details['ratio']
+        self.vol_metrics['vix_term'] = format_vix_index_ratio(
+            self.vix_index_ratio_details)
         if '^VVIX' in df.columns: self.vol_metrics['vvix'] = round(df['^VVIX'].iloc[-1], 2)
         if '^SKEW' in df.columns: self.vol_metrics['skew'] = round(df['^SKEW'].iloc[-1], 2)
         if '^MOVE' in df.columns: 
             self.vol_metrics['move'] = round(df['^MOVE'].iloc[-1], 2)
             self.score_details['move'] = self.vol_metrics['move']
         
-        if '^VIX' in df.columns:
-            vix_cur = df['^VIX'].replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
+        vix_values = df.get('^VIX', pd.Series(dtype=float)).replace(
+            [np.inf, -np.inf], np.nan).dropna()
+        if not vix_values.empty:
+            vix_cur = vix_values.iloc[-1]
             self.vol_metrics['vix'] = round(vix_cur, 2)
             self.score_details['vix'] = self.vol_metrics['vix']
             
-            if '^VIX3M' in df.columns:
-                vix3m_cur = df['^VIX3M'].replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
-                ratio = vix_cur / vix3m_cur
-                state = "🔴倒挂极限(Backwardation)" if ratio >= 1.0 else "🟢正常升水(Contango)"
-                self.vol_metrics['vix_term'] = f"{ratio:.2f} [{state}]"
-                self.num['vix_term_ratio'] = round(float(ratio), 4)
-                
             if 'SPY' in df.columns:
                 spy_s = self.clean_trading_days(df['SPY'])
                 if len(spy_s) >= 21:
@@ -980,7 +981,7 @@ class UltimateDashboard:
 [波率之波VVIX]: {self.vol_metrics.get('vvix', '-')}
 [黑天鹅SKEW]: {self.vol_metrics.get('skew', '-')}
 [期权看跌比PCR]: {self.score_details.get('pcr', '-')}
-[VIX倒挂比]: {self.vol_metrics.get('vix_term', '-')}
+[VIX 30D/3M期限比]: {self.vol_metrics.get('vix_term', '-')}
 [VRP波动率风险溢价]: {self.vol_metrics.get('vrp', '-')}
 [VIX COT]: {cot_vix_detail}
 
@@ -1111,9 +1112,12 @@ class UltimateDashboard:
                     'source_name': source_name,
                 }
 
-        add_derived_lineage(
-            'vix_ratio_contango_pct', ('^VIX', '^VIX3M'),
-            'yfinance:^VIX/^VIX3M')
+        ratio_details = self.vix_index_ratio_details
+        if ratio_details.get('status') == 'OK':
+            market_metric_lineage['vix_ratio_contango_pct'] = {
+                'source_date': ratio_details['source_date'],
+                'source_name': ratio_details['source_name'],
+            }
         add_derived_lineage(
             'vrp_num', ('^VIX', 'SPY'), 'yfinance:^VIX+SPY_HV20')
         add_derived_lineage(
@@ -1224,6 +1228,7 @@ class UltimateDashboard:
             **{k: v for k, v in payload.items() if k != 'full_metrics'},
             "vrp_num": num.get('vrp'), "hv20": num.get('hv20'),
             "vix_term_ratio": num.get('vix_term_ratio'),
+            "vix_term_ratio_quality": self.vix_index_ratio_details,
             "hyg_tlt_roc21": num.get('hyg_tlt_roc21'),
             "macro_score_coverage": num.get('macro_score_coverage'),
             "macro_score_status": num.get('macro_score_status'),
@@ -1254,7 +1259,7 @@ class UltimateDashboard:
             '[价格]SPY': self.current_prices.get('S&P 500 (SPY)', '-'),
             '[总评]大盘骨架': payload['skeleton'], '[广度]净新高-新低': payload['net_nh_nl'],
             '[信号]广度推力': payload['breadth_thrust'], '[信号]暗池背离': payload['dix_div'],
-            '[波动]VRP风险溢价': payload['vrp'], '[波动]VIX期限结构': payload['vix_term'],
+            '[波动]VRP风险溢价': payload['vrp'], '[波动]VIX 30D/3M期限比': payload['vix_term'],
             '[避险]垃圾债/长债比': payload['hyg_tlt_ratio'], '[避险]21天动能': payload['hyg_tlt_trend'],
             '[引擎]10Y急升度Z': payload['tnx_z'], '[引擎]原油20日ROC': payload['oil_roc'],
             '[引擎]10Y-2Y变动': payload['yc_chg'], '[引擎]净流动性ROC': payload['liq_roc'],
