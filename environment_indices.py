@@ -12,13 +12,26 @@ import pandas as pd
 from anomaly_engine import BASELINE, METRIC_REGISTRY, RESONANCE_THEMES
 
 SHADOW_MODE = True
-ENV_CALC_VERSION = "env_v2.3"
+ENV_CALC_VERSION = "env_v2.4"
 MIN_EFFECTIVE_OBS = 60
 MIN_INDEX_COVERAGE = 0.50
 MIN_STATE_COVERAGE = 0.65
 MIN_INDEX_MATURITY = round(MIN_EFFECTIVE_OBS / BASELINE, 3)
 MIN_STATE_MATURITY = 0.50
 HISTORY_CALENDAR_DAYS = 1200
+OPTION_COMPONENTS = {"ivr_pct", "expected_move_pct", "short_gamma_m"}
+MAX_OPTION_LAG_DAYS = 1
+
+
+def _stale_option(row):
+    if row.get("metric") not in OPTION_COMPONENTS:
+        return False
+    source_date = pd.to_datetime(row.get("source_date"), errors="coerce", utc=True)
+    report_date = pd.to_datetime(row.get("report_date"), errors="coerce", utc=True)
+    if pd.isna(source_date) or pd.isna(report_date) or source_date > report_date:
+        return True
+    lag = pd.to_numeric(row.get("lag_days"), errors="coerce")
+    return pd.isna(lag) or not np.isfinite(lag) or lag < 0 or lag > MAX_OPTION_LAG_DAYS
 
 # 非平稳水平值和方向依赖情境的 Greeks 暂不进入评分，只保留原始曲线。
 # components: (metric, scope, weight); STOCK_ANY 表示对股票横截面质量加权汇总。
@@ -81,6 +94,8 @@ def _danger_pctile(metric, percentile):
 
 def _quality_weight(row):
     """有效样本与新鲜度共同决定分量质量，返回 0-1。"""
+    if _stale_option(row):
+        return 0.0
     n = row.get("effective_obs_count")
     if n is None or pd.isna(n):
         n = row.get("sample_len")
@@ -279,6 +294,7 @@ def _component_observations(df, metric, scope):
                 "quality": quality,
                 "effective_obs_count": _sample_count(row),
                 "lag_days": row.get("lag_days"),
+                "stale": _stale_option(row),
             })
     return observations
 
@@ -299,7 +315,10 @@ def score_frame_details(df):
                 component_diagnostics.append({
                     "metric": metric,
                     "scope": scope or "MACRO",
-                    "status": "MISSING_COMPONENT" if rows.empty else "MISSING_PERCENTILE",
+                    "status": ("MISSING_COMPONENT" if rows.empty else
+                               "STALE_COMPONENT" if all(
+                                   _stale_option(row) for _, row in rows.iterrows())
+                               else "MISSING_PERCENTILE"),
                     "effective_obs_count": max(
                         [_sample_count(row) for _, row in rows.iterrows()], default=0),
                     "required_obs_count": MIN_EFFECTIVE_OBS,
@@ -311,7 +330,9 @@ def score_frame_details(df):
                 component_diagnostics.append({
                     "metric": metric,
                     "scope": scope or "MACRO",
-                    "status": "INSUFFICIENT_SAMPLE",
+                    "status": ("STALE_COMPONENT" if all(
+                        item["stale"] for item in observations)
+                        else "INSUFFICIENT_SAMPLE"),
                     "effective_obs_count": max(
                         item["effective_obs_count"] for item in observations),
                     "required_obs_count": MIN_EFFECTIVE_OBS,
@@ -479,6 +500,7 @@ def format_env_summary(idx):
         "MISSING_COMPONENT": "缺少当日分量",
         "MISSING_PERCENTILE": "历史分位不可用",
         "INSUFFICIENT_SAMPLE": "有效样本不足",
+        "STALE_COMPONENT": "期权来源过期或日期不可验证",
     }
     blockers = []
     core_keys = ("idx_risk_pressure", "idx_liquidity_stress", "idx_breadth_decay")
@@ -517,7 +539,7 @@ def format_env_summary(idx):
 
     optional_notes = []
     for key in ("idx_options_fragility", "idx_flow_behavior"):
-        if idx.get(key) is not None:
+        if idx.get(key) is not None and coverage.get(key, 0) >= MIN_INDEX_COVERAGE:
             continue
         missing = []
         for item in diagnostics.get(key, []):
@@ -534,7 +556,7 @@ def format_env_summary(idx):
                 missing.append(
                     f"{metric_label}：{diagnostic_labels.get(status, status or '不可用')}")
         detail = "、".join(missing[:4]) if missing else "尚无可评分分量"
-        optional_notes.append(f"{labels[key]}（{detail}）")
+        optional_notes.append(f"{labels[key]}（{detail}；仅可用分量参考）")
     if optional_notes:
         lines.append("观察面板缺数：" + "；".join(optional_notes))
 

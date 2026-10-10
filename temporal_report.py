@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from temporal_monitor import PANEL_SPECS
+from report_style import configure_chinese_font
 
 
 LINE_COLORS = {
@@ -17,12 +18,12 @@ LINE_COLORS = {
     "risk_capital": "#b54708",
 }
 
-PANEL_LABELS_EN = {
-    "environment": "Environment",
-    "liquidity": "Liquidity pressure",
-    "tactical_stress": "Tactical stress",
-    "risk_capital": "Risk-capital contraction",
-    "event_pulse": "Event pulse",
+PANEL_LABELS_CN = {
+    "environment": "环境压力",
+    "liquidity": "流动性压力（100减水位分）",
+    "tactical_stress": "盘后战术压力",
+    "risk_capital": "风险资本收缩（100减扩散分）",
+    "event_pulse": "动态异动脉冲",
 }
 
 
@@ -61,6 +62,7 @@ def generate_temporal_chart(history_rows, report_date, lookback_days=63,
 
     import matplotlib
     matplotlib.use("Agg")
+    configure_chinese_font()
     import matplotlib.pyplot as plt
     from matplotlib.colors import BoundaryNorm, ListedColormap
     from matplotlib.patches import Patch
@@ -72,19 +74,21 @@ def generate_temporal_chart(history_rows, report_date, lookback_days=63,
         series = frame[frame["panel"] == panel].sort_values("report_date")
         if series.empty or series["risk_value"].notna().sum() == 0:
             continue
+        series = (series.drop_duplicates("report_date", keep="last")
+                  .set_index("report_date").reindex(dates))
         ax_curve.plot(
-            series["report_date"], series["risk_value"], linewidth=1.9,
+            series.index, series["risk_value"], linewidth=1.9,
             marker=".", markersize=3.0, color=LINE_COLORS[panel],
-            label=PANEL_LABELS_EN[panel],
+            label=PANEL_LABELS_CN[panel],
         )
     ax_curve.axhspan(65, 100, color="#d92d20", alpha=0.06)
     ax_curve.axhline(65, color="#d92d20", linewidth=0.9, linestyle="--")
     ax_curve.axhline(35, color="#039855", linewidth=0.8, linestyle=":")
     ax_curve.set_ylim(0, 100)
-    ax_curve.set_ylabel("Normalized risk pressure")
+    ax_curve.set_ylabel("统一压力分（越高压力越大）")
     ax_curve.set_title(
-        f"Cross-panel temporal shadow | {report_date}\n"
-        "Higher = more pressure; replay history is not prospective validation",
+        f"核心板块时间状态 | {report_date}\n"
+        "65为高压观察线，35为低压参考线；历史回放不计入前瞻验证",
         loc="left", fontsize=13, fontweight="bold")
     ax_curve.grid(alpha=0.15)
     ax_curve.legend(frameon=False, ncol=2, fontsize=9, loc="upper left")
@@ -101,11 +105,12 @@ def generate_temporal_chart(history_rows, report_date, lookback_days=63,
         if panel in panels and date in date_index:
             heat[panels.index(panel), date_index[date]] = _state_heat_value(row)
     cmap = ListedColormap(["#12b76a", "#eaecf0", "#f79009", "#d92d20"])
+    cmap.set_bad("white")
     norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5, 2.5], cmap.N)
     ax_state.imshow(heat, aspect="auto", interpolation="nearest",
                     cmap=cmap, norm=norm)
     ax_state.set_yticks(
-        range(len(panels)), [PANEL_LABELS_EN[panel] for panel in panels],
+        range(len(panels)), [PANEL_LABELS_CN[panel] for panel in panels],
         fontsize=9)
     tick_count = min(7, len(dates))
     tick_positions = np.linspace(0, len(dates) - 1, tick_count, dtype=int)
@@ -113,21 +118,22 @@ def generate_temporal_chart(history_rows, report_date, lookback_days=63,
         tick_positions,
         [pd.Timestamp(dates[index]).strftime("%m-%d") for index in tick_positions],
         fontsize=8)
-    ax_state.set_title("Temporal state persistence", loc="left",
+    ax_state.set_title("每日状态与持续性（按有记录的交易日排列）", loc="left",
                        fontsize=11, fontweight="bold")
     ax_state.legend(handles=[
-        Patch(facecolor="#d92d20", label="Pressure"),
-        Patch(facecolor="#f79009", label="Watch / mixed"),
-        Patch(facecolor="#eaecf0", label="Stable"),
-        Patch(facecolor="#12b76a", label="Relief / risk-on"),
-    ], frameon=False, ncol=4, fontsize=8, loc="upper center",
+        Patch(facecolor="#d92d20", label="压力 / 投机升温"),
+        Patch(facecolor="#f79009", label="观察 / 分化"),
+        Patch(facecolor="#eaecf0", label="平稳"),
+        Patch(facecolor="#12b76a", label="缓解 / 风险偏好扩散"),
+        Patch(facecolor="white", edgecolor="#98a2b3", label="数据不足"),
+    ], frameon=False, ncol=5, fontsize=8, loc="upper center",
         bbox_to_anchor=(0.5, -0.20))
     for spine in ax_state.spines.values():
         spine.set_visible(False)
 
     fig.text(
         0.01, 0.01,
-        "Shadow research only. State thresholds are versioned and excluded from alert gates.",
+        "影子观察，不触发预警。颜色表示状态，红色也可能是双向高波投机；空白不代表低风险。",
         fontsize=8, color="#667085")
     fig.autofmt_xdate(rotation=0)
     path = output_path or os.path.join(

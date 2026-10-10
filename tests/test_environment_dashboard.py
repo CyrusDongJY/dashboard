@@ -49,12 +49,13 @@ from environment_indices import (  # noqa: E402
     score_frame,
     score_frame_details,
 )
-from environment_report import build_history, generate_environment_chart  # noqa: E402
+from environment_report import build_history, generate_environment_chart, _plot_history  # noqa: E402
 
 
 def metric_row(metric, percentile, sample=252, lag=0, scope="MACRO"):
     return {
         "report_date": "2026-07-14",
+        "source_date": "2026-07-14",
         "metric": metric,
         "scope": scope,
         "percentile": percentile,
@@ -65,6 +66,34 @@ def metric_row(metric, percentile, sample=252, lag=0, scope="MACRO"):
 
 
 class EnvironmentIndexTests(unittest.TestCase):
+    def test_stale_options_cannot_count_as_eligible_coverage(self):
+        rows = [metric_row("ivr_pct", 45, scope="SPY"),
+                metric_row("short_gamma_m", 10, lag=47, scope="SPY")]
+        scores, coverage, _, diagnostics = score_frame_details(pd.DataFrame(rows))
+        self.assertEqual(scores["idx_options_fragility"], 55.0)
+        self.assertAlmostEqual(coverage["idx_options_fragility"], 0.417)
+        gamma = diagnostics["idx_options_fragility"][2]
+        self.assertEqual(gamma["status"], "STALE_COMPONENT")
+        rows[0]["lag_days"] = 2
+        scores, coverage, _, _ = score_frame_details(pd.DataFrame(rows))
+        self.assertIsNone(scores["idx_options_fragility"])
+        self.assertEqual(coverage["idx_options_fragility"], 0.0)
+
+    def test_unknown_option_lag_fails_closed_but_weekly_macro_is_preserved(self):
+        option = metric_row("ivr_pct", 20, scope="SPY")
+        option["lag_days"] = None
+        scores, _, _, _ = score_frame_details(pd.DataFrame([
+            option, metric_row("nfci", 80, lag=5)]))
+        self.assertIsNone(scores["idx_options_fragility"])
+        self.assertEqual(scores["idx_liquidity_stress"], 80)
+
+    def test_missing_or_future_option_source_date_fails_closed(self):
+        for source_date in (None, "invalid", "2026-07-15"):
+            option = metric_row("ivr_pct", 20, scope="SPY")
+            option["source_date"] = source_date
+            scores, _, _, _ = score_frame_details(pd.DataFrame([option]))
+            self.assertIsNone(scores["idx_options_fragility"])
+
     def test_gamma_mask_fails_closed_for_low_coverage_derived_metrics(self):
         frame = pd.DataFrame({
             "gamma_quality": [
@@ -449,6 +478,27 @@ class _Supabase:
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib not installed")
 class ChartTests(unittest.TestCase):
+    def test_missing_dates_and_constituent_changes_are_not_connected(self):
+        import matplotlib.pyplot as plt
+        key = "idx_options_fragility"
+        frame = pd.DataFrame({
+            "report_date": pd.to_datetime(["2026-07-14", "2026-07-15",
+                                           "2026-09-28", "2026-09-29"]),
+            key: [13.7, np.nan, 49.7, 48.0],
+            f"{key}_components": ["old", "old", "old", "new"],
+            f"{key}_coverage": [0.6, 0.6, 0.6, 0.417],
+            f"{key}_maturity": [0.6, 0.6, 0.6, 0.27],
+        })
+        fig, ax = plt.subplots()
+        try:
+            _plot_history(ax, frame, key)
+            self.assertTrue(np.isnan(ax.lines[0].get_ydata()[1]))
+            self.assertEqual(len(ax.lines), 2)
+            self.assertEqual(len(ax.lines[1].get_ydata()), 1)
+            self.assertEqual(ax.lines[1].get_linestyle(), "--")
+        finally:
+            plt.close(fig)
+
     def test_png_report_is_nonempty(self):
         rows = [
             metric_row("vix", 95), metric_row("vvix", 90),
