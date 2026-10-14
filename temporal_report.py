@@ -15,7 +15,7 @@ LINE_COLORS = {
     "environment": "#b42318",
     "liquidity": "#175cd3",
     "tactical_stress": "#7a5af8",
-    "risk_capital": "#b54708",
+    "risk_capital": "#00857d",
 }
 
 PANEL_LABELS_CN = {
@@ -79,6 +79,7 @@ def generate_temporal_chart(history_rows, report_date, lookback_days=63,
         ax_curve.plot(
             series.index, series["risk_value"], linewidth=1.9,
             marker=".", markersize=3.0, color=LINE_COLORS[panel],
+            linestyle="--" if panel == "risk_capital" else "-",
             label=PANEL_LABELS_CN[panel],
         )
     ax_curve.axhspan(65, 100, color="#d92d20", alpha=0.06)

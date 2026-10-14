@@ -14,7 +14,7 @@ from temporal_monitor import (
     format_temporal_summary,
     summarize_evaluations,
 )
-from temporal_report import generate_temporal_chart
+from temporal_report import generate_temporal_chart, PANEL_LABELS_CN
 
 
 def dates(count=30):
@@ -244,6 +244,7 @@ class TemporalEvaluationTests(unittest.TestCase):
     def test_compact_chart_contains_real_pixels(self):
         try:
             import matplotlib  # noqa: F401
+            import matplotlib.pyplot as plt
         except ImportError:
             self.skipTest("matplotlib not installed")
         history = build_temporal_history({
@@ -251,11 +252,30 @@ class TemporalEvaluationTests(unittest.TestCase):
                 "environment", np.linspace(20.0, 80.0, 30)),
             "liquidity": continuous_rows(
                 "liquidity", np.linspace(80.0, 40.0, 30)),
+            "risk_capital": continuous_rows(
+                "risk_capital", np.linspace(75.0, 25.0, 30)),
         })
         with tempfile.TemporaryDirectory() as tmp:
-            path = generate_temporal_chart(
-                history, dates(30)[-1].strftime("%Y-%m-%d"),
-                output_path=os.path.join(tmp, "temporal.png"))
+            with patch("matplotlib.pyplot.close"):
+                path = generate_temporal_chart(
+                    history, dates(30)[-1].strftime("%Y-%m-%d"),
+                    output_path=os.path.join(tmp, "temporal.png"))
+                fig = plt.gcf()
+            try:
+                ax = fig.axes[0]
+                lines = {line.get_label(): line for line in ax.get_lines()}
+                capital = lines[PANEL_LABELS_CN["risk_capital"]]
+                environment = lines[PANEL_LABELS_CN["environment"]]
+                self.assertEqual(capital.get_color(), "#00857d")
+                self.assertEqual(capital.get_linestyle(), "--")
+                self.assertNotEqual(capital.get_color(), environment.get_color())
+                self.assertNotEqual(capital.get_linestyle(), environment.get_linestyle())
+                legend = ax.get_legend()
+                for text, line in zip(legend.get_texts(), legend.get_lines()):
+                    self.assertEqual(line.get_color(), lines[text.get_text()].get_color())
+                    self.assertEqual(line.get_linestyle(), lines[text.get_text()].get_linestyle())
+            finally:
+                plt.close(fig)
             self.assertTrue(os.path.isfile(path))
             self.assertGreater(os.path.getsize(path), 20_000)
 
