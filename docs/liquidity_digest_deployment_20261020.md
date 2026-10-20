@@ -110,3 +110,29 @@ sudo systemctl disable --now liquidity-digest-collect.timer liquidity-digest-bui
 ```
 
 保留状态库、当日报告、回执和发布备份，避免丢失审计记录或误触发重复邮件。
+
+## 后续升级：v1.3完整HTML附件
+
+2026-10-20 09:54 ET完成第二次验收，主机仍为`34.146.104.219`。
+本节是上述v1.2发布之后的增量升级记录：
+
+- 运行版本：`liquidity_digest_v1.3-shadow`。
+- 功能提交：`9d2e71af6491790609f5b536c66759e1c7aa2eea`。
+- 已推送GitHub：`CyrusDongJY/dashboard`的`feature/temporal-state-shadow`分支。
+- 当前发布：`/home/winters_dong426/liquidity_digest_app/releases/20261020T135043Z-v1_3`。
+- 备份目录：`/home/winters_dong426/deploy_backups/liquidity_digest_20261020T135043Z-v1_3`。
+- 发布包SHA256：`54c3849336b8369c74eb8776b51b36d5575b986fcc771c0c3020e2e8ca29084c`。
+- 发布包直接从上述Git提交的白名单文件构建，26个文件哈希全部匹配。
+- 本地195项相关测试通过；云端118项日报测试通过。
+- 云端模拟构建生成五文件归档，HTML为312333字节，含3组内嵌PNG，
+  无脚本、无外部资源；PDF仍为两页。该样例仅用于验收，未发送。
+- 真实历史快照的网页版已在本地完成桌面/手机离线检查。
+- 今日v1.2正式报告全部文件哈希与原`SENT`回执完全不变，旧归档仍可读取。
+- 原cron哈希不变，三个timer均`enabled / active`。
+- 下次计划发送：2026-10-21 09:20 ET，届时正文之外增加HTML附件，保留PDF。
+- 本次没有绕过时点补发或删除旧回执；新版双附件自然投递尚待下一交易日验证。
+
+详细云端验收保存为备份目录下的`html_acceptance.json`。
+GitHub仅提交日报代码、示例配置、测试、部署模板及文档；
+真实配置、私有输入、日报归档和与本任务无关的本地改动未提交。
+此前记录的源数据滞后及融资业务日历限制不在这次展示层改动中修复。
