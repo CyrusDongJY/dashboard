@@ -1,0 +1,12 @@
+[Unit]
+Description=Send liquidity digest at 09:20 New York time
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:20:00 America/New_York
+Unit=liquidity-digest@send.service
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target

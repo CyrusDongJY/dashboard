@@ -1,0 +1,25 @@
+[Unit]
+Description=Independent pre-market liquidity digest (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=winters_dong426
+WorkingDirectory=/home/winters_dong426/liquidity_digest_app/current
+Environment=MPLBACKEND=Agg
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+ExecStart=/home/winters_dong426/liquidity_digest_venv/bin/python -m liquidity_digest.job %i --config /home/winters_dong426/.config/liquidity_digest/config.json --state-dir /home/winters_dong426/liquidity_digest_state
+TimeoutStartSec=240
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/winters_dong426/liquidity_digest_state
+Environment=MPLCONFIGDIR=/home/winters_dong426/liquidity_digest_state/matplotlib
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+{
+  "FRED_API_KEY": "REPLACE_WITH_FRED_KEY",
+  "SUPABASE_URL": "https://REPLACE.supabase.co",
+  "SUPABASE_KEY": "REPLACE_WITH_READ_ACCESS_KEY",
+  "SMTP_HOST": "smtp.gmail.com",
+  "SMTP_PORT": 465,
+  "SENDER_EMAIL": "sender@example.com",
+  "RECEIVER_EMAIL": "recipient@example.com",
+  "APP_PASSWORD": "REPLACE_WITH_APP_PASSWORD"
+}

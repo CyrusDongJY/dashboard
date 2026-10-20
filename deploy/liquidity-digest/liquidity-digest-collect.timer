@@ -1,0 +1,13 @@
+[Unit]
+Description=Collect liquidity digest before the information cutoff
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:05:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 09:10:00 America/New_York
+Unit=liquidity-digest@collect.service
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target
