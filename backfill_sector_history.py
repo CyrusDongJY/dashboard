@@ -6,14 +6,16 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import time
 from zoneinfo import ZoneInfo
 
 from market_internals import (RECONSTRUCTION_VERSION, SECTORS, capture_sectors,
-                              eod_time, reconstruct_sectors, schedule)
+                              eod_time, reconstruct_sectors, schedule, verified_previous_close)
 
 
-def reconstruction_payload(raw, day, captured_at):
+def reconstruction_payload(raw, day, captured_at, price_recovery=None):
     sector = capture_sectors(raw, day, captured_at)
+    sector["price_recovery"] = price_recovery or []
     rebuilt = reconstruct_sectors(sector, captured_at)
     complete = [d for d, item in rebuilt.items() if len(item["sectors"]) == 11
                 and all(r["excess"]["5d"] is not None for r in item["sectors"])]
@@ -21,6 +23,32 @@ def reconstruction_payload(raw, day, captured_at):
         raise ValueError("Fewer than six complete sector windows; no database update")
     return {"version": RECONSTRUCTION_VERSION, "computed_at": str(captured_at),
             "point_in_time_eligible": False, "complete_dates": complete, "sectors": sector}
+
+
+def recover_quote_gaps(raw, day, provider):
+    import pandas as pd
+    previous = schedule(day).index[-2]
+    repaired, evidence = raw.copy(), []
+    deadline = time.monotonic() + 180
+    for symbol in ("SPY", "RSP", "QQQ", "QQQE", *SECTORS):
+        if time.monotonic() >= deadline:
+            break
+        if symbol not in raw or pd.notna(raw[symbol].get(previous)):
+            continue
+        try:
+            ticker = provider.Ticker(symbol)
+            quote = ticker.get_info()
+            terminal = ticker.history(start=day, end=str((datetime.fromisoformat(day) + timedelta(days=1)).date()),
+                                      auto_adjust=False, actions=True, timeout=15)
+            recovered = verified_previous_close(raw, symbol, day, quote, terminal,
+                                                 datetime.now(ZoneInfo("America/New_York")).isoformat())
+            if recovered:
+                repaired.loc[previous, symbol] = recovered["close"]
+                evidence.append(recovered)
+        except Exception:
+            # A failed independent check leaves the hole intact; the six-window gate still applies.
+            continue
+    return repaired.sort_index(), evidence
 
 
 def merged_full_metrics(row, payload):
@@ -51,10 +79,12 @@ def main():
     end = (datetime.fromisoformat(day) + timedelta(days=1)).date()
     downloaded = yf.download(["SPY", "RSP", "QQQ", "QQQE", *SECTORS], start=str(start),
                              end=str(end), auto_adjust=True, progress=False, timeout=25)
+    raw, evidence = recover_quote_gaps(downloaded["Close"], day, yf)
     captured = datetime.now(ZoneInfo("America/New_York")).isoformat()
-    payload = reconstruction_payload(downloaded["Close"], day, captured)
+    payload = reconstruction_payload(raw, day, captured, evidence)
     summary = {"date": day, "captured_at": captured, "complete_dates": payload["complete_dates"],
-               "kind": "RECONSTRUCTED", "point_in_time_eligible": False, "written": False}
+               "kind": "RECONSTRUCTED", "point_in_time_eligible": False, "written": False,
+               "verified_previous_close_count": len(evidence)}
     if args.apply:
         import market_config as cfg
         from supabase import create_client

@@ -1,5 +1,6 @@
 """Auditable EOD participation snapshots, independent of scores and alerts."""
 from datetime import date, timedelta
+from copy import deepcopy
 from functools import lru_cache
 import math
 from statistics import median
@@ -170,8 +171,83 @@ def reconstruct_sectors(observation, cutoff):
             rebuilt = capture_sectors(raw, target, captured.isoformat())
             rebuilt.update(history_kind="RECONSTRUCTED", point_in_time_eligible=False,
                            reconstruction_version=RECONSTRUCTION_VERSION,
-                           price_vintage_at=captured.isoformat())
+                           price_vintage_at=captured.isoformat(),
+                           price_recovery=observation.get("price_recovery", []))
             result[target] = rebuilt
         return result
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
         return {}
+
+
+def verified_previous_close(raw, symbol, day, quote, terminal, captured_at):
+    """Use an explicit previous close only after checking its date and adjustment basis."""
+    grid = schedule(day)
+    dates = grid.index.strftime("%Y-%m-%d").tolist()
+    previous = dates[-2]
+    try:
+        if not eod_time(captured_at, day)[1] or dates[-1] != day:
+            return None
+        if symbol in raw and pd.notna(raw[symbol].get(pd.Timestamp(previous))):
+            return None
+        quoted = pd.Timestamp(quote["regularMarketTime"], unit="s", tz="UTC")
+        if (quote.get("symbol") != symbol or quote.get("quoteType") != "ETF"
+                or str(quoted.tz_convert("America/New_York").date()) != day
+                or quoted < grid.loc[day, "market_close"] or quoted > pd.Timestamp(captured_at)
+                or quote.get("exchangeTimezoneName") != "America/New_York"):
+            return None
+        bars = terminal.loc[[str(pd.Timestamp(i).date()) == day for i in terminal.index]]
+        if len(bars) != 1:
+            return None
+        bar = bars.iloc[0]
+        for key in ("Dividends", "Stock Splits"):
+            if finite(bar.get(key)) != 0:
+                return None
+        if "Capital Gains" in bar and finite(bar["Capital Gains"]) != 0:
+            return None
+        # An unchanged adjustment factor avoids mixing an unadjusted quote with a
+        # revised total-return series. Never infer a missing price from a return.
+        same_close = [finite(bar.get("Close")), finite(bar.get("Adj Close")),
+                      finite(quote.get("regularMarketPrice")),
+                      finite(raw[symbol].get(pd.Timestamp(day)))]
+        prev = finite(quote.get("regularMarketPreviousClose"))
+        if (any(v is None or v <= 0 for v in same_close) or max(same_close) - min(same_close) > .0001
+                or prev is None or prev <= 0 or finite(quote.get("previousClose")) is None
+                or abs(prev - float(quote["previousClose"])) > .0001):
+            return None
+        return {"symbol": symbol, "source_date": previous, "close": prev,
+                "source": "yfinance:regularMarketPreviousClose", "quote_source_date": day,
+                "quoted_at": quoted.isoformat(), "captured_at": str(captured_at),
+                "adjustment_check": "NO_CURRENT_SESSION_ACTION; RAW_EQUALS_ADJUSTED",
+                "point_in_time_eligible": False}
+    except (KeyError, TypeError, ValueError, OverflowError, IndexError):
+        return None
+
+
+def reuse_verified_prices(observation, earlier):
+    """Reuse verified quote gaps only when overlapping adjusted prices still agree."""
+    output = deepcopy(observation)
+    if not isinstance(output, dict) or not isinstance(output.get("prices"), dict):
+        return output
+    for old in earlier:
+        try:
+            if (old.get("source") != "yfinance:adjusted_close"
+                    or pd.Timestamp(old["captured_at"]) > pd.Timestamp(output["captured_at"])):
+                continue
+            for item in old.get("price_recovery", []):
+                symbol, day = item["symbol"], item["source_date"]
+                current = {r["date"]: r["close"] for r in output["prices"].get(symbol, [])}
+                previous = {r["date"]: r["close"] for r in old["prices"].get(symbol, [])}
+                common = set(current) & set(previous)
+                price = finite(item.get("close"))
+                if (day in current or day > output["source_date"] or len(common) < 2
+                        or price is None or price <= 0 or previous.get(day) != price
+                        or item.get("source") != "yfinance:regularMarketPreviousClose"
+                        or item.get("point_in_time_eligible") is not False
+                        or any(not math.isclose(float(current[d]), float(previous[d]), rel_tol=1e-7, abs_tol=.0001)
+                               for d in common)):
+                    continue
+                output["prices"].setdefault(symbol, []).append({"date": day, "close": price})
+                output.setdefault("price_recovery", []).append(deepcopy(item))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return output

@@ -2,7 +2,7 @@
 from datetime import date, timedelta
 
 from market_internals import (OBSERVATION_VERSION, RECONSTRUCTION_VERSION, PERIODS,
-                              SECTORS, eod_time, reconstruct_sectors)
+                              SECTORS, eod_time, reconstruct_sectors, reuse_verified_prices)
 from .model import NY, finite, sessions, stamp
 
 
@@ -92,6 +92,7 @@ def _sectors(observation, day, cutoff):
             "flat_count": sum(v == 0 for v in daily), "source_date": day if eligible else None,
             "captured_at": observation.get("captured_at") if eligible else None,
             "history_kind": observation.get("history_kind", "RECORDED") if eligible else None,
+            "price_recovery": observation.get("price_recovery", []) if eligible else [],
             "quality": "OK" if len(daily) == 11 else "PARTIAL" if daily else "UNAVAILABLE"}
 
 
@@ -135,6 +136,13 @@ def _rotation(sector_history, grid):
     result.update(available_dates=available, reconstructed_dates=rebuilt,
                   history_note=f"完整行业窗口 {len(available)}/6；其中历史价格重建 {len(rebuilt)} 日。"
                   + ("重建仅用于本期观察，不代表当时可得信号。" if rebuilt else ""))
+    recovered = {(r["symbol"], r["source_date"]) for d in rebuilt
+                 for r in sector_history[d].get("price_recovery", [])
+                 if isinstance(r, dict) and r.get("symbol") in SECTORS
+                 and r.get("source_date")
+                 and r.get("source") == "yfinance:regularMarketPreviousClose"}
+    if recovered:
+        result["history_note"] += f"其中{len(recovered)}条行业价格取自已核验的明确前收盘报价，非前值填充。"
     if len(wanted) < 6 or any(d not in sector_history for d in wanted):
         return result
     ordered = []
@@ -221,7 +229,7 @@ def build_internals(report_plan, capture, metrics):
                 if (stamp(row["ingested_at"]) <= stamp(cutoff)
                         and stamp(recovery["computed_at"]) <= stamp(cutoff)
                         and recovery.get("point_in_time_eligible") is False
-                        and recovery["sectors"]["source_date"] == day):
+                        and _observed(recovery.get("sectors"), day, cutoff)):
                     price_vintages.append(recovery["sectors"])
             except (KeyError, TypeError, ValueError):
                 rejections += 1
@@ -243,14 +251,20 @@ def build_internals(report_plan, capture, metrics):
         if _observed(raw_sector, day, cutoff):
             price_vintages.append(raw_sector)
     # Current-report reconstruction never changes archived observations or breadth.
-    for vintage in sorted(price_vintages, key=lambda v: str(v.get("captured_at", ""))):
+    earlier = []
+    for vintage in sorted(price_vintages, key=lambda v: stamp(v["captured_at"])):
+        vintage = reuse_verified_prices(vintage, earlier)
         for day, rebuilt in reconstruct_sectors(vintage, cutoff).items():
             if day not in grid:
                 continue
             current = sector_history.get(day)
             if current and current.get("history_kind") == "RECORDED":
-                continue
+                if (not rebuilt.get("price_recovery")
+                        or all(r["excess"]["5d"] is not None for r in current["rows"])):
+                    continue
             sector_history[day] = _sectors(rebuilt, day, cutoff)
+        if _observed(vintage, vintage.get("source_date"), cutoff):
+            earlier.append(vintage)
     breadth = breadth_history.get(end) or _breadth(None, end, cutoff)
     sectors = sector_history.get(end) or _sectors(None, end, cutoff)
     leadership = _leadership(breadth, sectors)

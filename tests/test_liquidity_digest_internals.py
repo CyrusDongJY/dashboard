@@ -209,6 +209,47 @@ def test_reconstruction_does_not_replace_recorded_returns_or_invalid_windows(p):
     assert build_internals(p, capture([row]), {})["rotation"]["state"] == "UNKNOWN"
 
 
+def test_missing_or_late_price_capture_does_not_break_assembly(p):
+    from backfill_sector_history import reconstruction_payload
+    payload = reconstruction_payload(prices(p["market_date"]), p["market_date"], "2026-10-20T09:10:00-04:00")
+    row = {"record_date": p["market_date"], "ingested_at": "2026-10-19T16:35:00-04:00",
+           "full_metrics": {"sector_history_reconstruction": payload}}
+    for bad in (None, "invalid", "2026-10-20T09:16:00-04:00"):
+        payload["sectors"]["captured_at"] = bad
+        assert build_internals(p, capture([row]), {})["rotation"]["state"] == "UNKNOWN"
+
+
+def test_next_report_can_reuse_verified_price_without_inventing_old_breadth():
+    from backfill_sector_history import reconstruction_payload
+    from market_internals import verified_previous_close
+    import pandas as pd
+    p = plan("2026-10-21")
+    raw = prices("2026-10-20")
+    old = raw.loc[:"2026-10-19"].copy()
+    previous = float(old.loc["2026-10-16", "XLV"])
+    last = float(old.loc["2026-10-19", "XLV"])
+    old.loc["2026-10-16", "XLV"] = float("nan")
+    quote = {"symbol": "XLV", "quoteType": "ETF", "exchangeTimezoneName": "America/New_York",
+             "regularMarketTime": pd.Timestamp("2026-10-19T16:00:00-04:00").timestamp(),
+             "regularMarketPrice": last, "regularMarketPreviousClose": previous, "previousClose": previous}
+    terminal = pd.DataFrame({"Close": [last], "Adj Close": [last], "Dividends": [0], "Stock Splits": [0]},
+                            index=[pd.Timestamp("2026-10-19")])
+    item = verified_previous_close(old, "XLV", "2026-10-19", quote, terminal, "2026-10-19T16:35:00-04:00")
+    old.loc["2026-10-16", "XLV"] = item["close"]
+    recovery = reconstruction_payload(old, "2026-10-19", "2026-10-19T16:35:00-04:00", [item])
+    previous_row = {"record_date": "2026-10-19", "ingested_at": "2026-10-19T16:40:00-04:00",
+                    "full_metrics": {"sector_history_reconstruction": recovery}}
+    latest = record("2026-10-20")
+    raw.loc["2026-10-16", "XLV"] = float("nan")
+    observations(latest)["sectors"] = capture_sectors(raw, "2026-10-20", "2026-10-20T16:35:00-04:00")
+    inputs = capture([previous_row, latest], captured_at="2026-10-21T09:10:00-04:00")
+    panel = build_internals(p, inputs, {})
+    assert len(panel["rotation"]["available_dates"]) == 6
+    assert panel["sectors"]["rows"][2]["returns"]["5d"] is not None
+    assert sum(r["advancing_pct"] is not None for r in panel["history"]) == 1
+    assert "前收盘报价" in panel["rotation"]["history_note"]
+
+
 def test_rank_ties_do_not_create_rotation(p):
     rows = rotation_records(p)
     for row in rows:
