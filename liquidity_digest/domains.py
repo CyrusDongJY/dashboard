@@ -3,10 +3,10 @@ from datetime import date, timedelta
 import math
 
 from liquidity_monitor import CREDIT_STRESS_GUARDS, FUNDING_STRESS_GUARDS
-from .model import finite, sessions
+from .model import finite, native_sessions, prior_publication_date, expected_daily_date
 from .states import IMPULSE_THRESHOLD, STATE_COLORS
 
-DOMAIN_VERSION = "macro_micro_direction_v1.0-shadow"
+DOMAIN_VERSION = "macro_micro_direction_v1.1-shadow"
 # Presentation noise floors in native units, not calibrated risk/trading thresholds.
 # key: adverse sign, short-window floor, medium-window floor, valid value range
 METRICS = {
@@ -77,12 +77,16 @@ def _combine(directions, domain=False):
     return "FLAT"
 
 
-def _window(metric, market_date, count, spec):
+def _window(metric, report, count, spec):
     adverse, _, _, low, high = spec
     result = {"delta": None, "pressure_delta": None, "direction": "UNKNOWN",
               "start": None, "end": metric.get("source_date"),
               "reason": "当前数据不合格"}
-    if metric.get("status") != "OK" or metric.get("acquisition") != "OK":
+    key = metric.get("key")
+    dated_credit = (key in ("ig", "hy") and metric.get("status") == "AS_OF"
+                    and metric.get("source_date") == prior_publication_date(key, report))
+    if (metric.get("status") != "OK" and not dated_credit) or metric.get("acquisition") != "OK":
+        result["reason"] = "当前数据未更新或抓取不合格；截至 " + str(metric.get("source_date") or "未知")
         return result
     end = metric.get("source_date")
     current = finite(metric.get("value"))
@@ -92,20 +96,24 @@ def _window(metric, market_date, count, spec):
         grid = [str(date.fromisoformat(end) - timedelta(days=7 * i))
                 for i in range(count, -1, -1)]
     else:
-        if end != market_date:
+        if end != expected_daily_date(key, report) and not dated_credit:
             return result
-        grid = sessions(date.fromisoformat(end) - timedelta(days=70), end)[-count - 1:]
+        grid = native_sessions(key, date.fromisoformat(end) - timedelta(days=70), end)[-count - 1:]
     points = {p["date"]: finite(p["value"]) for p in metric.get("history", [])}
     values = [points.get(d) for d in grid]
     valid = lambda v: (v is not None and (low is None or v >= low)
                        and (high is None or v <= high))
     if (len(grid) != count + 1 or not all(valid(v) for v in values)
             or not math.isclose(current, values[-1], rel_tol=0, abs_tol=1e-9)):
-        result["reason"] = "连续窗口缺失、数值越界或当前值与历史不一致"
+        missing = [d for d, v in zip(grid, values) if not valid(v)]
+        result["missing_dates"] = missing
+        result["reason"] = (f"窗口有效 {sum(valid(v) for v in values)}/{count + 1}；缺失 " + ", ".join(missing)
+                            if missing else "当前值与历史不一致或窗口长度不足")
         return result
     delta = round(values[-1] - values[0], 8)
     result.update(delta=delta, pressure_delta=delta * adverse,
-                  start=grid[0], reason="完整原生频率窗口；非独立资金流量")
+                  start=grid[0], reason="完整原生频率窗口；非独立资金流量",
+                  as_of_only=dated_credit)
     return result
 
 
@@ -118,7 +126,7 @@ def metric_evidence(report, key):
               "value": metric.get("value"), "source": metric.get("source"),
               "acquisition": metric.get("acquisition")}
     for period, count, threshold in zip(("short", "medium"), windows, spec[1:3]):
-        entry = _window(metric, report["market_date"], count, spec)
+        entry = _window(metric, report, count, spec)
         entry.update(threshold=threshold,
                      direction=_direction(entry["pressure_delta"], threshold))
         result[period] = entry
@@ -186,6 +194,9 @@ def build_domains(report):
         domain = {"key": name, "label": "宏观资金与融资" if name == "macro" else "微观市场承接",
                   "groups": groups, "flags": _level_flags(report, name),
                   "level_note": "不设置新的总水位；无分项提示不等于环境宽松"}
+        dated = sorted({e["source_date"] for g in groups for e in g["evidence"]
+                        if e["short"].get("as_of_only") or e["medium"].get("as_of_only")})
+        domain["timing_note"] = ("信用截至 " + " / ".join(dated) + "；错期参考，非昨日同步确认。") if dated else ""
         for period in ("short", "medium"):
             directions = [g[period]["direction"] for g in groups]
             direction = _combine(directions, domain=True)
@@ -193,6 +204,9 @@ def build_domains(report):
                               "color": COLORS[direction],
                               "ready_groups": sum(d != "UNKNOWN" for d in directions),
                               "total_groups": len(groups)}
+            if dated and direction != "UNKNOWN":
+                domain[period]["label"] += "（错期）"
+        domain["missing_groups"] = [g["label"] for g in groups if g["short"]["direction"] == "UNKNOWN"]
         domain["disagreement"] = (
             domain["short"]["direction"] in ("UP", "DOWN")
             and domain["medium"]["direction"] in ("UP", "DOWN")
@@ -209,9 +223,13 @@ def build_domains(report):
         relation = "宏微观证据尚未齐备，暂停两层联判；缺失不代表平稳。"
     else:
         relation = "宏微观尚未形成完整同向变化；分别观察分项，不以多数掩盖分歧。"
+    timing_notes = [d["timing_note"] for d in domains.values() if d["timing_note"]]
+    missing_notes = [d["label"] + "待补：" + "、".join(d["missing_groups"])
+                     for d in domains.values() if d["missing_groups"]]
     return {
         "version": DOMAIN_VERSION, **domains, "relation": relation,
         "headline": f'宏观：{domains["macro"]["short"]["label"]}｜微观：{domains["micro"]["short"]["label"]}',
+        "evidence_note": " ".join(timing_notes + missing_notes),
         "scope_note": "宏观是资金与金融条件，非经济增长预测；微观是市场内部，非订单簿流动性。"
                       "分组方向为影子规则，不是经回测的交易信号，不生成新总评分。",
     }

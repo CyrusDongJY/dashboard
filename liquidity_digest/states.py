@@ -5,7 +5,7 @@ from temporal_monitor import HIGH_PRESSURE, LOW_PRESSURE, IMPULSE_THRESHOLD, SHO
 from liquidity_monitor import FUNDING_STRESS_GUARDS
 from .model import finite, sessions
 
-STATE_VERSION = "digest_state_v1.1-shadow"
+STATE_VERSION = "digest_state_v1.2-shadow"
 PANEL_NAMES = {
     "liquidity": "综合流动性支持", "environment": "综合环境压力",
     "tactical_stress": "战术压力", "risk_capital": "风险资本",
@@ -65,6 +65,7 @@ def panel_state(report, key):
         "level_cn": "水位未知", "source_date": None, "coverage": None,
         "confidence": None, "source_version": None, "temporal_version": None,
         "changes": {"1d": None, "5d": None, "21d": None},
+        "windows": {},
         "high_zone_days": None, "color": STATE_COLORS["UNKNOWN"],
         "reason": "当日合格状态记录不足", "timeline": [],
     }
@@ -83,11 +84,15 @@ def panel_state(report, key):
     days = sessions(date.fromisoformat(report["market_date"]) - timedelta(days=100), report["market_date"])
     value = float(current["risk_value"])
     changes = {}
+    windows = {}
     for count in (1, 5, 21):
         window = days[-count - 1:]
         # A direction label requires a complete real-session window of the same source version.
         ready = len(window) == count + 1 and all(d in records for d in window)
         changes[str(count) + "d"] = round(value - float(records[window[0]]["risk_value"]), 6) if ready else None
+        windows[str(count) + "d"] = {"required": count + 1,
+            "available": sum(d in records for d in window),
+            "missing_dates": [d for d in window if d not in records]}
     high_days = 0
     for day in reversed(days):
         row = records.get(day)
@@ -101,9 +106,11 @@ def panel_state(report, key):
         direction_cn=DIRECTION_NAMES[key][state_direction], level_cn=LEVEL_NAMES[key][state_zone],
         source_date=current["source_date"], coverage=float(current["coverage"]),
         confidence=float(current["confidence"]), source_version=version,
-        temporal_version=current["calc_version"], changes=changes, high_zone_days=high_days,
+        temporal_version=current["calc_version"], changes=changes, windows=windows, high_zone_days=high_days,
         color=STATE_COLORS[state_direction],
-        reason="5日变化尚不足完整窗口" if state_direction == "UNKNOWN" else "沿用既有影子规则，不是交易信号",
+        reason=(f'同版5日窗口 {windows["5d"]["available"]}/6 点；缺失 '
+                + ", ".join(windows["5d"]["missing_dates"])) if state_direction == "UNKNOWN"
+                else "沿用既有影子规则，不是交易信号",
         timeline=[{"date": day, "risk_value": float(records[day]["risk_value"]) if day in records else None}
                   for day in days[-22:]],
     )
@@ -124,6 +131,16 @@ def describe_pressure(state):
     if state["direction"] == "FLAT":
         return "近5日未越变化观察线，不表示没有风险，也不表示每天持平。"
     return "方向与当前水位分开观察，尚不能据此确认市场反转。"
+
+
+def matrix_note(state):
+    if state["zone"] == "UNKNOWN":
+        return "当前无法定位：水位数据不足，不按平稳处理。"
+    known = f'{state["level_cn"]} {state["risk_value"]:.1f}/100'
+    if state["direction"] == "UNKNOWN":
+        count = state.get("windows", {}).get("5d", {}).get("available", 0)
+        return known + f'；方向待确认（同版 {count}/6 点）'
+    return known + "；缓解不等于低压"
 
 
 def build_states(report):

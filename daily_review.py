@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import json
 import math
 
-RULE_VERSION = "daily_review_v1.0-shadow"
+RULE_VERSION = "daily_review_v1.1-shadow"
 
 DISPLAY_LABELS = {
     "quality": {
@@ -24,7 +24,8 @@ DISPLAY_LABELS = {
     "breadth": {
         "Broad": "广泛扩散",
         "Deterioration": "广度恶化",
-        "Rotation": "轮动",
+        "Rotation": "轮动（旧版标签，未验证）",
+        "Mixed": "涨跌分化",
         "Concentrated": "集中",
         "UNAVAILABLE": "数据不可用",
     },
@@ -305,7 +306,7 @@ def _breadth_module(market, fresh):
     elif pct_adv >= 60 and (max_spread is None or max_spread < 0.75) and (trin is None or trin <= 1.2):
         state = "Broad"
     else:
-        state = "Rotation"
+        state = "Mixed"
     evidence = [
         f"上涨家数={_fmt(pct_adv)}% | Top500 TRIN={_fmt(trin, 2)}",
         "集中度 " + " | ".join(f"{key}={_fmt(value, 2)}%" for key, value in spreads.items()),
@@ -532,8 +533,8 @@ def build_daily_review(report_date, *, market_row, spot_row,
     elif cash["state"] == "Rejected" and (
             breadth["state"] == "Deterioration" or (qqq_return is not None and qqq_return < 0)):
         tactical = "下跌扩散"
-    elif breadth_eligible and breadth["state"] in {"Rotation", "Concentrated"}:
-        tactical = "资金轮动"
+    elif breadth_eligible and breadth["state"] in {"Mixed", "Concentrated"}:
+        tactical = "权重集中" if breadth["state"] == "Concentrated" else "内部结构分化"
     elif cash_eligible:
         tactical = "高位消化"
     else:

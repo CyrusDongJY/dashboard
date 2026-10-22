@@ -17,7 +17,8 @@ FRED = {
 TABLES = {
     "metric_daily": ("report_date", "*"),
     "market_history": ("record_date", "record_date,eod_stress_score,stress_components,"
-                       "stress_coverage,stress_confidence,stress_calc_version,stress_computed_at"),
+                       "stress_coverage,stress_confidence,stress_calc_version,stress_computed_at,"
+                       "vix,dxy,full_metrics,ingested_at,as_of_time"),
     "temporal_state_daily": ("report_date", "*"),
     "risk_capital_daily": ("report_date", "*"),
     "risk_event_pulse_daily": ("report_date", "*"),
@@ -45,7 +46,10 @@ def points(series, multiplier=1):
 
 def fetch_table(session, config, table, start, end):
     field, select = TABLES[table]
-    if table not in ("metric_daily", "temporal_state_daily"):
+    if table == "market_history":
+        # Enough complete sessions for 21-day context; do not transfer years of stock snapshots.
+        start = max(start, str(date.fromisoformat(end) - timedelta(days=70)))
+    elif table not in ("metric_daily", "temporal_state_daily"):
         start = end
     base = config.get("SUPABASE_URL", "").rstrip("/")
     if not base.startswith("https://"):
@@ -82,6 +86,7 @@ def collect(config, store, report_plan, budget=180):
     official = OfficialLiquiditySources(config.get("FRED_API_KEY", ""), session=session)
     start = str(date.fromisoformat(report_plan["market_date"]) - timedelta(days=430))
     end = report_plan["market_date"]
+    native_end = str(date.fromisoformat(report_plan["report_date"]) - timedelta(days=1))
     outcomes = {}
 
     def attempt(key, source, fn, configured=True):
@@ -108,9 +113,9 @@ def collect(config, store, report_plan, budget=180):
                 lambda r=rate, m=market, c=column: points(official.fetch_nyfed_rate(r, m)[c]))
     for key, (series, multiplier) in FRED.items():
         attempt(key, "FRED / " + series,
-                lambda s=series, k=multiplier: points(official.fetch_fred(s, start, end), k),
+                lambda s=series, k=multiplier: points(official.fetch_fred(s, start, native_end), k),
                 bool(config.get("FRED_API_KEY")))
-    attempt("tga_daily", "US Treasury / DTS", lambda: points(official.fetch_tga(start, end)))
+    attempt("tga_daily", "US Treasury / DTS", lambda: points(official.fetch_tga(start, native_end)))
     for table in TABLES:
         attempt("db_" + table, "Supabase / " + table,
                 lambda t=table: fetch_table(session, config, t, start, end),

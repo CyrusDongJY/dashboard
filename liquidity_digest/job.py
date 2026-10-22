@@ -59,9 +59,9 @@ def verify_bundle(folder):
         if file_hash(folder / name) != expected:
             raise ValueError("Frozen report integrity check failed")
     report = json.loads((folder / "report.json").read_text())
-    if report["version"] not in (VERSION, "liquidity_digest_v1.2-shadow"):
+    if report["version"] not in (VERSION, "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.3-shadow", "liquidity_digest_v1.2-shadow"):
         raise ValueError("Report version mismatch")
-    expected = legacy_files | ({"report.html"} if report["version"] == VERSION else set())
+    expected = legacy_files | ({"report.html"} if report["version"] != "liquidity_digest_v1.2-shadow" else set())
     if files != expected:
         raise ValueError("Report attachment set does not match its version")
     return report
@@ -162,7 +162,7 @@ def send(store, config, report_plan, now=None, connector=smtp_connection):
         message.add_alternative((folder / "email.html").read_text(), subtype="html")
         message.add_attachment((folder / "report.pdf").read_bytes(), maintype="application",
                                subtype="pdf", filename="liquidity_digest_" + report_plan["report_date"] + ".pdf")
-        if report["version"] == VERSION:
+        if report["version"] != "liquidity_digest_v1.2-shadow":
             message.add_attachment((folder / "report.html").read_bytes(), maintype="text",
                                    subtype="html", params={"charset": "utf-8"},
                                    filename="liquidity_digest_" + report_plan["report_date"] + ".html")

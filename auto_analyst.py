@@ -66,6 +66,10 @@ def format_raw_appendix(macro_raw, vol_raw, micro_raw_list):
     full_metrics = macro_raw.get('full_metrics', {})
     if full_metrics:
         for k, v in full_metrics.items():
+            if k in {"market_internals", "sector_history_reconstruction"}:
+                version = v.get("version", "UNAVAILABLE") if isinstance(v, dict) else "UNAVAILABLE"
+                appendix += f"{k}: {version}（原始样本留库，结构解读见盘前汇总日报）\n"
+                continue
             appendix += f"{k}: {v}\n"
     else:
         for k, v in macro_raw.items():

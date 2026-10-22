@@ -1,9 +1,12 @@
 """Point-in-time report assembly. Missing observations never imply low risk."""
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
+from copy import deepcopy
 import math
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+from pandas.tseries.holiday import AbstractHolidayCalendar, USFederalHolidayCalendar, nearest_workday, sunday_to_monday
 import pandas_market_calendars as mcal
 
 from . import VERSION
@@ -47,7 +50,7 @@ DB_METRICS = (
     "spy_rsp_spread_pct", "spy_vwap_time_acceptance_pct", "qqq_vwap_time_acceptance_pct",
 )
 STATUS_CN = {
-    "OK": "已取得", "LAGGED": "观测滞后", "STALE": "已过期",
+    "OK": "已取得", "AS_OF": "错期参考，非昨日同步", "LAGGED": "观测滞后", "STALE": "已过期",
     "MISSING": "尚无可用数据", "FETCH_ERROR": "本次抓取失败",
     "NOT_CONFIGURED": "数据源未配置", "CACHED": "旧抓取缓存",
     "CACHED_AFTER_ERROR": "今晨缓存／刷新失败",
@@ -67,6 +70,46 @@ def sessions(start, end):
     # Calendar failure must stop the job; never replace NYSE with weekdays.
     schedule = mcal.get_calendar("NYSE").schedule(start_date=start, end_date=end)
     return [str(index.date()) for index in schedule.index]
+
+
+class FederalReserveCalendar(AbstractHolidayCalendar):
+    rules = deepcopy(USFederalHolidayCalendar.rules)
+    # Reserve Banks remain open on Friday when a fixed holiday falls on Saturday.
+    for rule in rules:
+        if rule.observance is nearest_workday:
+            rule.observance = sunday_to_monday
+
+
+@lru_cache(maxsize=512)
+def native_sessions(key, start, end):
+    if key in ("sofr", "sofr99", "sofr_iorb", "sofr_tail", "rrp", "ust2", "real10"):
+        return mcal.get_calendar("SIFMA_US").valid_days(start, end).strftime("%Y-%m-%d").tolist()
+    if key in ("effr", "effr_iorb", "iorb", "tga_daily"):
+        cal = USFederalHolidayCalendar() if key == "tga_daily" else FederalReserveCalendar()
+        return pd.date_range(start, end, freq=pd.offsets.CustomBusinessDay(calendar=cal)).strftime("%Y-%m-%d").tolist()
+    return sessions(start, end)
+
+
+def expected_daily_date(key, report_plan):
+    cutoff = stamp(report_plan["cutoff"]).astimezone(NY)
+    start = cutoff.date() - timedelta(days=40)
+    end = str(cutoff.date() - timedelta(days=1)) if key not in DB_METRICS else report_plan["market_date"]
+    days = native_sessions(key, start, end)
+    if key == "tga_daily":
+        # DTS is due at 16:00 on the next federal business day, not on trade date.
+        releases = native_sessions(key, start, cutoff.date())
+        due = [d for d in releases if datetime.combine(date.fromisoformat(d), time(16), NY) <= cutoff]
+        latest_release = due[-1]
+        return max(d for d in days if d < latest_release)
+    return days[-1]
+
+
+AS_OF_KEYS = {"ig", "hy", "ccc", "ust2", "real10"}
+
+
+def prior_publication_date(key, report_plan):
+    end = expected_daily_date(key, report_plan)
+    return native_sessions(key, date.fromisoformat(end) - timedelta(days=40), end)[-2]
 
 
 def plan(day):
@@ -111,11 +154,14 @@ def aligned(points_a, points_b, scale=1):
 
 def summarize(key, points, report_plan, acquisition="OK", source="", fetched_at=None):
     label, unit, frequency = SPECS[key]
-    points = clean_points(points, report_plan["market_date"])
+    end = (report_plan["market_date"] if key in DB_METRICS else
+           str(stamp(report_plan["cutoff"]).astimezone(NY).date() - timedelta(days=1)))
+    points = clean_points(points, end)
     result = {
         "key": key, "label": label, "unit": unit, "frequency": frequency,
         "value": None, "source_date": None, "status": "MISSING",
         "acquisition": acquisition, "source": source, "fetched_at": fetched_at,
+        "expected_date": None, "publication_note": "",
         "changes": {}, "history": points, "trend": "样本不足",
     }
     if not points:
@@ -131,7 +177,14 @@ def summarize(key, points, report_plan, acquisition="OK", source="", fetched_at=
             wednesday -= timedelta(days=7)
         result["status"] = "OK" if last["date"] >= str(wednesday) else "LAGGED" if age <= 17 else "STALE"
     else:
-        result["status"] = "OK" if age == 0 else "LAGGED" if age <= 5 else "STALE"
+        expected = expected_daily_date(key, report_plan)
+        result["expected_date"] = expected
+        result["status"] = "OK" if last["date"] >= expected else "LAGGED" if age <= 5 else "STALE"
+        if key == "tga_daily" and result["status"] == "OK" and last["date"] < report_plan["market_date"]:
+            result["publication_note"] = "按DTS发布节奏；次业务日16:00前更新"
+        elif key in AS_OF_KEYS and last["date"] == prior_publication_date(key, report_plan):
+            result["status"] = "AS_OF"
+            result["publication_note"] = "截止前所获已发布值；仅限落后1个原生业务日，不代表昨日收盘"
     values = {p["date"]: p["value"] for p in points}
     if frequency == "weekly":
         # Compare actual weekly dates, not padded daily copies or arbitrary row offsets.
@@ -141,7 +194,7 @@ def summarize(key, points, report_plan, acquisition="OK", source="", fetched_at=
         wanted = [str(date.fromisoformat(last["date"]) - timedelta(days=7 * i))
                   for i in (3, 2, 1, 0)]
     else:
-        calendar = sessions(date.fromisoformat(last["date"]) - timedelta(days=70), last["date"])
+        calendar = native_sessions(key, date.fromisoformat(last["date"]) - timedelta(days=70), last["date"])
         for name, count in (("1日", 1), ("5日", 5), ("21日", 21)):
             prior = calendar[-count - 1] if len(calendar) > count else None
             result["changes"][name] = last["value"] - values[prior] if prior in values else None
@@ -204,6 +257,37 @@ def assemble(report_plan, inputs, demo=False):
         metrics[key] = summarize(key, points, report_plan, capture.get("status", "MISSING"),
                                  "metric_daily / " + str(version or "无版本"), capture.get("captured_at"))
 
+    # Only unchanged raw price definitions may bridge a failed snapshot write.
+    # Recovered values are observed now, never backdated into an archived report.
+    raw_capture = inputs.get("db_market_history", {})
+    raw_rows = valid_rows(raw_capture.get("data", []), "record_date", report_plan["market_date"], report_plan["cutoff"])
+    for key in ("vix", "dxy"):
+        if metrics[key]["status"] == "OK" or raw_capture.get("status") != "OK":
+            continue
+        for row in raw_rows:
+            full = row.get("full_metrics")
+            lineages = full.get("market_metric_lineage", {}) if isinstance(full, dict) else {}
+            lineage = lineages.get(key, {}) if isinstance(lineages, dict) else {}
+            value = finite(row.get(key))
+            observed_at = row.get("ingested_at")
+            if (not isinstance(lineage, dict) or row["record_date"] != report_plan["market_date"]
+                    or value is None or value <= 0 or lineage.get("source_date") != row["record_date"]
+                    or not lineage.get("source_name") or not observed_at):
+                continue
+            times = [observed_at, lineage.get("reconstructed_at"), lineage.get("restored_at")]
+            try:
+                if any(stamp(t) > stamp(report_plan["cutoff"]) for t in times if t):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            history = metrics[key]["history"] + [{"date": row["record_date"], "value": value}]
+            source = metrics[key]["source"] + "；当日原始值：" + lineage["source_name"]
+            metrics[key] = summarize(key, history, report_plan, "OK", source, raw_capture.get("captured_at"))
+            metrics[key]["publication_note"] = "原始观测补缺；不恢复当时评分"
+            metrics[key]["raw_fallback"] = {"source_date": row["record_date"], "ingested_at": observed_at,
+                                           "lineage": lineage}
+            break
+
     for key, a, b, multiplier in (
         ("sofr_iorb", "sofr", "iorb", 100), ("effr_iorb", "effr", "iorb", 100),
         ("sofr_tail", "sofr99", "sofr", 100),
@@ -215,8 +299,10 @@ def assemble(report_plan, inputs, demo=False):
             points = aligned(points, metrics["rrp"]["history"])
         acquisitions = [metrics[p]["acquisition"] for p in parts]
         acquisition = next((v for v in acquisitions if v != "OK"), "OK")
+        times = [metrics[p]["fetched_at"] for p in parts if metrics[p]["fetched_at"]]
         metrics[key] = summarize(key, points, report_plan, acquisition,
-                                 "同观测日对齐：" + " / ".join(parts))
+                                 "同观测日对齐：" + " / ".join(parts),
+                                 max(times, key=stamp) if len(times) == len(parts) else None)
 
     panels = {}
     table_fields = {
@@ -257,11 +343,13 @@ def assemble(report_plan, inputs, demo=False):
                 metric["trend"] in ("连续上行", "连续下行", "方向转折待确认")):
             watch.append(f'{metric["label"]}：{metric["trend"]}，截至 {metric["source_date"]}。')
     gaps = [m["label"] for m in metrics.values()
-            if m["status"] != "OK" or m["acquisition"] != "OK"]
+            if m["status"] not in ("OK", "AS_OF") or m["acquisition"] != "OK"]
     report = {
         "version": VERSION, **report_plan, "demo": demo, "metrics": metrics,
         "panels": panels, "temporal": history, "focus": watch[:3],
         "gaps": gaps,
+        "publication_lags": [m["label"] + "截至" + m["source_date"]
+                             for m in metrics.values() if m["status"] == "AS_OF"],
         "source_audit": {k: {p: v.get(p) for p in ("status", "source", "captured_at", "attempt_at")}
                          for k, v in inputs.items()},
     }
@@ -269,4 +357,6 @@ def assemble(report_plan, inputs, demo=False):
     report["states"] = build_states(report)
     from .domains import build_domains
     report["domains"] = build_domains(report)
+    from .internals import build_internals
+    report["internals"] = build_internals(report_plan, inputs.get("db_market_history", {}), metrics)
     return report

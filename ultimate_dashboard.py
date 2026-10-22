@@ -25,6 +25,8 @@ import math
 import json
 
 from liquidity_sources import OfficialLiquiditySources
+from fred_client import FredClient, FredUnavailable
+from macro_score import score_macro
 from data_contracts import (
     ETF_FLOW_TICKERS,
     classify_hyg_tlt,
@@ -32,11 +34,15 @@ from data_contracts import (
 )
 from market_utils import lag_trading_days
 from tactical_stress import StressInput, nullable_int, score_eod_stress
+from vix_index_ratio import compute_vix_index_ratio, format_vix_index_ratio
+from market_internals import OBSERVATION_VERSION, capture_breadth, capture_sectors
 
 class UltimateDashboard:
     def __init__(self):
         # ✅ 从金库安全读取 FRED API 密钥
         self.fred_api_key = cfg.FRED_API_KEY
+        self.fred_client = FredClient(self.fred_api_key)
+        self.macro_result = {}
         self.lake_dir = os.path.expanduser('~/DataLake')
         os.makedirs(self.lake_dir, exist_ok=True)
 
@@ -60,6 +66,9 @@ class UltimateDashboard:
         self.liquidity_source_names = {}
         self.market_source_dates = {}
         self.stress_details = {}
+        self.vix_index_ratio_details = {}
+        self.breadth_observation = {}
+        self.market_data_captured_at = None
 
     def log(self, msg):
         print(msg)
@@ -81,6 +90,7 @@ class UltimateDashboard:
         return float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else None
 
     def fetch_market_data(self):
+        self.market_data_captured_at = None
         try:
             real_time_tickers = list(self.tickers_dict.keys()) + list(self.sector_dict.keys()) + [
                 '^VIX', '^MOVE', '^VIX3M', '^VVIX', '^SKEW', 
@@ -89,7 +99,8 @@ class UltimateDashboard:
                 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA'
             ]
             # 2y 数据窗口：保证 252D z-score 基准真正生效（6mo 只有约126个交易日，rolling(252) 全 NaN）
-            recent_df = yf.download(real_time_tickers, period="2y", interval="1d", progress=False)['Close']
+            recent_df = yf.download(real_time_tickers, period="2y", interval="1d", progress=False,
+                                    auto_adjust=True)['Close']
             if not recent_df.empty:
                 if isinstance(recent_df, pd.Series): recent_df = recent_df.to_frame(name=real_time_tickers[0])
                 recent_df.index = pd.to_datetime(recent_df.index).normalize().tz_localize(None)
@@ -99,6 +110,7 @@ class UltimateDashboard:
                 # US close. Never let that future label contaminate today's EOD.
                 recent_df = recent_df.loc[recent_df.index <= report_day]
                 self.data_cache['raw_close'] = recent_df
+                self.market_data_captured_at = pd.Timestamp.now(tz="America/New_York").isoformat()
                 self.data_cache['close'] = recent_df.ffill()
                 for symbol in recent_df.columns:
                     native = recent_df[symbol].dropna()
@@ -127,37 +139,21 @@ class UltimateDashboard:
             'JPNASSETS': 'BOJ_Assets', 'DEXUSEU': 'EUR_USD', 'DEXJPUS': 'USD_JPY'
         }
         
-        session = requests.Session()
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        retry_strategy = Retry(
-            total=5, 
-            backoff_factor=1, 
-            status_forcelist=[429, 500, 502, 503, 504]
-        )
-        session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
-        
+        report_date = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")
+        history_start = str((pd.Timestamp(report_date) - pd.Timedelta(days=800)).date())
         series_dict = {}
         for series_id, col_name in fred_map.items():
             try:
-                url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={self.fred_api_key}&file_type=json"
-                res = session.get(url, headers=self.headers, timeout=30)
-                if res.status_code == 200:
-                    data = res.json().get('observations', [])
-                    if data:
-                        s = pd.DataFrame(data)
-                        s['value'] = pd.to_numeric(s['value'], errors='coerce')
-                        s['date'] = pd.to_datetime(s['date'])
-                        native = s.dropna().set_index('date')['value']
-                        series_dict[col_name] = native
-                        if not native.empty:
-                            self.fred_source_dates[col_name] = native.index.max().strftime('%Y-%m-%d')
-                            self.liquidity_source_names[col_name] = f"FRED:{series_id}"
-            except: continue
+                native = self.fred_client.series(series_id, history_start, report_date)
+                series_dict[col_name] = native
+                self.fred_source_dates[col_name] = native.index.max().strftime('%Y-%m-%d')
+                self.liquidity_source_names[col_name] = f"FRED:{series_id}"
+            except FredUnavailable as exc:
+                self.log(f"FRED 数据缺失: {exc}")
                 
         if series_dict:
             df_fred = pd.DataFrame(series_dict).sort_index()
-            all_days = pd.date_range(start=df_fred.index.min(), end=pd.Timestamp.now().normalize(), freq='B')
+            all_days = pd.date_range(start=df_fred.index.min(), end=report_date, freq='B')
             df_fred = df_fred.reindex(df_fred.index.union(all_days)).ffill().reindex(all_days)
             self.data_cache['fred_historical'] = df_fred
             latest = df_fred.iloc[-1]
@@ -182,10 +178,14 @@ class UltimateDashboard:
             self.regime['spread'] = int(latest.get('Spread_10Y2Y', 0) * 100) if pd.notna(latest.get('Spread_10Y2Y')) else '-'
             
             try:
-                fed = latest.get('Fed_Assets', 0) / 1000
-                ecb_usd = (latest.get('ECB_Assets', 0) * latest.get('EUR_USD', 1)) / 1000
-                boj_usd = (latest.get('BOJ_Assets', 0) / 10) / latest.get('USD_JPY', 150)
-                if fed > 0: self.liquidity['g3_liq'] = round(fed + ecb_usd + boj_usd, 2)
+                keys = ('Fed_Assets', 'ECB_Assets', 'EUR_USD', 'BOJ_Assets', 'USD_JPY')
+                if all(pd.notna(latest.get(key)) for key in keys) and latest['USD_JPY'] > 0:
+                    fed = latest['Fed_Assets'] / 1000
+                    ecb_usd = latest['ECB_Assets'] * latest['EUR_USD'] / 1000
+                    boj_usd = latest['BOJ_Assets'] / 10 / latest['USD_JPY']
+                    self.liquidity['g3_liq'] = round(fed + ecb_usd + boj_usd, 2)
+                else:
+                    self.liquidity['g3_liq'] = '-'
             except: self.liquidity['g3_liq'] = '-'
 
     def refresh_daily_tga_official(self):
@@ -216,6 +216,7 @@ class UltimateDashboard:
             self.log(f"⚠️ Treasury日度TGA获取失败，保留FRED周度口径: {exc}")
 
     def fetch_liquidity_and_smf(self):
+        self.breadth_observation = {}
         self.smf = {
             'dix': '-', 'gex': '-', 'dix_gex_source_date': None,
             'sp500_net': '-', 'nasdaq_net': '-', 'cot_vix': '-',
@@ -333,6 +334,11 @@ class UltimateDashboard:
                 "range": [0, 500] 
             }
             stocks = requests.post(url_scan, json=payload, headers=self.headers, timeout=15).json().get("data", [])
+            try:
+                self.breadth_observation = capture_breadth(
+                    stocks, pd.Timestamp.now(tz="America/New_York").isoformat())
+            except Exception as exc:
+                self.breadth_observation = {"status": "UNAVAILABLE", "reason": type(exc).__name__}
             if stocks and len(stocks) >= 450:
                 total = len(stocks)
                 adv_i = dec_i = adv_v = dec_v = a20 = a50 = a200 = nh = nl = 0
@@ -534,24 +540,23 @@ class UltimateDashboard:
         except: pass
 
         self.vol_metrics = {'vix': '-', 'move': '-', 'vix_term': '-', 'vrp': '-', 'vvix': '-', 'skew': '-'}
+        self.vix_index_ratio_details = compute_vix_index_ratio(raw_df)
+        self.num['vix_term_ratio'] = self.vix_index_ratio_details['ratio']
+        self.vol_metrics['vix_term'] = format_vix_index_ratio(
+            self.vix_index_ratio_details)
         if '^VVIX' in df.columns: self.vol_metrics['vvix'] = round(df['^VVIX'].iloc[-1], 2)
         if '^SKEW' in df.columns: self.vol_metrics['skew'] = round(df['^SKEW'].iloc[-1], 2)
         if '^MOVE' in df.columns: 
             self.vol_metrics['move'] = round(df['^MOVE'].iloc[-1], 2)
             self.score_details['move'] = self.vol_metrics['move']
         
-        if '^VIX' in df.columns:
-            vix_cur = df['^VIX'].replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
+        vix_values = df.get('^VIX', pd.Series(dtype=float)).replace(
+            [np.inf, -np.inf], np.nan).dropna()
+        if not vix_values.empty:
+            vix_cur = vix_values.iloc[-1]
             self.vol_metrics['vix'] = round(vix_cur, 2)
             self.score_details['vix'] = self.vol_metrics['vix']
             
-            if '^VIX3M' in df.columns:
-                vix3m_cur = df['^VIX3M'].replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
-                ratio = vix_cur / vix3m_cur
-                state = "🔴倒挂极限(Backwardation)" if ratio >= 1.0 else "🟢正常升水(Contango)"
-                self.vol_metrics['vix_term'] = f"{ratio:.2f} [{state}]"
-                self.num['vix_term_ratio'] = round(float(ratio), 4)
-                
             if 'SPY' in df.columns:
                 spy_s = self.clean_trading_days(df['SPY'])
                 if len(spy_s) >= 21:
@@ -616,143 +621,11 @@ class UltimateDashboard:
                     else:
                         self.sector_rs[name] = "数据不足"
 
-        # ==================== 修复的宏观打分引擎 (Macro Score) ====================
-        m_score = 0
-        m_available_weight = 0
-        
-        # 1. 10Y美债急升度 (TNX)
-        if '^TNX' in df.columns:
-            z = self.calc_zscore(df['^TNX'], 63)
-            if z is not None:
-                self.macro_engines['tnx'] = f"Z: {z:+.2f}"
-                self.num['tnx_z'] = round(z, 2)
-                m_available_weight += 15
-                m_score += 15 if z > 2.0 else (5 if z > 1.0 else 0)
-            else:
-                self.macro_engines['tnx'] = "数据不足"
-                self.num['tnx_z'] = None
-        else:
-            self.macro_engines['tnx'] = "数据缺失"
-            self.num['tnx_z'] = None
-        
-        # 2. 原油暴涨率 (OIL)
-        if 'CL=F' in df.columns:
-            oil = self.clean_trading_days(df['CL=F'])
-            if len(oil) >= 21:
-                oil_roc = (oil.iloc[-1] / oil.iloc[-21] - 1) * 100
-                self.macro_engines['oil'] = f"ROC: {oil_roc:+.2f}%"
-                self.num['oil_roc'] = round(float(oil_roc), 2)
-                m_available_weight += 15
-                m_score += 15 if oil_roc > 15.0 else (10 if oil_roc > 10.0 else 0)
-            else:
-                self.macro_engines['oil'] = "数据不足"
-                self.num['oil_roc'] = None
-        else:
-            self.macro_engines['oil'] = "数据缺失"
-            self.num['oil_roc'] = None
-
-        if not fh.empty:
-            # 3. 10Y-2Y利差变动 (Yield Curve)
-            if 'Spread_10Y2Y' in fh.columns and len(fh['Spread_10Y2Y']) >= 21:
-                yc_series = pd.to_numeric(
-                    fh['Spread_10Y2Y'], errors='coerce').dropna()
-                if len(yc_series) >= 21:
-                    yc_cur = yc_series.iloc[-1]
-                    yc_1m = yc_series.iloc[-21]
-                    yc_chg = yc_cur - yc_1m
-                    self.macro_engines['yc'] = f"{yc_chg:+.2f}%"
-                    self.num['yc_chg'] = round(float(yc_chg), 3)
-                    m_available_weight += 15
-                    # 只有在倒挂期恶化时才计算宏观压力
-                    if yc_cur < 0:
-                        m_score += 15 if yc_chg > 0.2 else (5 if yc_chg > 0.0 else 0)
-                else:
-                    self.macro_engines['yc'] = "数据不足"
-                    self.num['yc_chg'] = None
-            else:
-                self.macro_engines['yc'] = "数据缺失"
-                self.num['yc_chg'] = None
-
-            # 4. 短期净流动性抽水 (Liquidity)
-            if {'Fed_Assets', 'TGA', 'RRP'}.issubset(fh.columns):
-                nl = ((fh['Fed_Assets'] / 1000)
-                      - (fh['TGA'] / 1000) - fh['RRP']).dropna()
-                if len(nl) >= 63 and nl.iloc[-63] != 0:
-                    l_roc = (nl.iloc[-1] / nl.iloc[-63] - 1) * 100
-                    self.macro_engines['liq'] = f"63业务日ROC: {l_roc:+.2f}%"
-                    self.num['liq_roc'] = round(float(l_roc), 2)
-                    self.num['liq_roc_window'] = 63
-                    m_available_weight += 15
-                    m_score += 15 if l_roc < -5.0 else (8 if l_roc < -2.0 else 0)
-                else:
-                    self.macro_engines['liq'] = "数据不足"
-                    self.num['liq_roc'] = None
-            else:
-                self.macro_engines['liq'] = "数据缺失"
-                self.num['liq_roc'] = None
-            
-            # 5. M2 货币供应 (M2)
-            if 'M2_Money_Supply' in fh.columns:
-                m2 = pd.to_numeric(fh['M2_Money_Supply'], errors='coerce').dropna()
-                if len(m2) >= 252 and m2.iloc[-252] != 0:
-                    m2_yoy = (m2.iloc[-1] / m2.iloc[-252] - 1) * 100
-                    self.macro_engines['m2'] = f"YoY: {m2_yoy:+.2f}%"
-                    self.num['m2_yoy'] = round(float(m2_yoy), 2)
-                    m_available_weight += 10
-                    m_score += 10 if m2_yoy < 0 else (5 if m2_yoy < 2.0 else 0)
-                else:
-                    self.macro_engines['m2'] = "数据不足"
-                    self.num['m2_yoy'] = None
-            else:
-                self.macro_engines['m2'] = "数据缺失"
-                self.num['m2_yoy'] = None
-            
-            # 6. 金融摩擦压力 (NFCI)
-            if 'NFCI' in fh.columns:
-                nfci = pd.to_numeric(fh['NFCI'], errors='coerce').dropna()
-                if not nfci.empty:
-                    nfci_val = nfci.iloc[-1]
-                    self.macro_engines['stress'] = f"{nfci_val:.2f} (NFCI)"
-                    self.num['nfci'] = round(float(nfci_val), 3)
-                    m_available_weight += 10
-                    m_score += 10 if nfci_val > 1.0 else (5 if nfci_val > 0.5 else 0)
-                else:
-                    self.macro_engines['stress'] = "数据不足"
-                    self.num['nfci'] = None
-            else:
-                self.macro_engines['stress'] = "数据缺失"
-                self.num['nfci'] = None
-                
-            # 7. 信用利差 (Credit Spread)
-            cs_z = (self.calc_zscore(fh['Credit_Spread'])
-                    if 'Credit_Spread' in fh.columns else None)
-            if cs_z is not None:
-                self.macro_engines['credit'] = f"Z: {cs_z:+.2f}"
-                self.num['credit_z'] = round(cs_z, 2)
-                m_available_weight += 10
-                m_score += 10 if cs_z > 2.0 else (5 if cs_z > 1.0 else 0)
-            else:
-                self.macro_engines['credit'] = "数据不足"
-                self.num['credit_z'] = None
-            
-        # 8. 铜金比避险偏离 (Copper/Gold)
-        self.macro_engines['cg'] = (
-            f"Z: {cg_z:+.2f}" if cg_z is not None else "数据不足")
-        if cg_z is not None:
-            self.num['cg_z'] = round(float(cg_z), 2)
-            m_available_weight += 10
-            m_score += 10 if float(cg_z) < -2.0 else (5 if float(cg_z) < -1.0 else 0)
-        else:
-            self.num['cg_z'] = None
-
-        macro_coverage = m_available_weight / 100.0
-        self.num['macro_score_coverage'] = round(macro_coverage, 3)
-        self.num['macro_score_status'] = (
-            'OK' if macro_coverage == 1.0
-            else ('PARTIAL' if macro_coverage >= 0.70 else 'UNAVAILABLE'))
-        self.score_details['macro_score'] = (
-            min(100, m_score) if macro_coverage >= 0.70 else None)
-        # ==================== 修复的宏观打分引擎结束 ====================
+        macro = score_macro(df, fh)
+        self.macro_result = macro
+        self.macro_engines.update(macro["labels"])
+        self.num.update(macro["num"])
+        self.score_details["macro_score"] = macro["score"]
 
         # ==================== EOD跨资产战术压力（V8.6公式可靠性加固） ====================
         try:
@@ -980,7 +853,7 @@ class UltimateDashboard:
 [波率之波VVIX]: {self.vol_metrics.get('vvix', '-')}
 [黑天鹅SKEW]: {self.vol_metrics.get('skew', '-')}
 [期权看跌比PCR]: {self.score_details.get('pcr', '-')}
-[VIX倒挂比]: {self.vol_metrics.get('vix_term', '-')}
+[VIX 30D/3M期限比]: {self.vol_metrics.get('vix_term', '-')}
 [VRP波动率风险溢价]: {self.vol_metrics.get('vrp', '-')}
 [VIX COT]: {cot_vix_detail}
 
@@ -1111,9 +984,12 @@ class UltimateDashboard:
                     'source_name': source_name,
                 }
 
-        add_derived_lineage(
-            'vix_ratio_contango_pct', ('^VIX', '^VIX3M'),
-            'yfinance:^VIX/^VIX3M')
+        ratio_details = self.vix_index_ratio_details
+        if ratio_details.get('status') == 'OK':
+            market_metric_lineage['vix_ratio_contango_pct'] = {
+                'source_date': ratio_details['source_date'],
+                'source_name': ratio_details['source_name'],
+            }
         add_derived_lineage(
             'vrp_num', ('^VIX', 'SPY'), 'yfinance:^VIX+SPY_HV20')
         add_derived_lineage(
@@ -1219,15 +1095,32 @@ class UltimateDashboard:
             "cot_category": sm.get('cot_category'),
             "cot_metadata": sm.get('cot_metadata', {}),
         }
+        captured_at = pd.Timestamp.now(tz="America/New_York").isoformat()
+        try:
+            sector_observation = (capture_sectors(
+                self.data_cache.get('raw_close'), date_str, self.market_data_captured_at)
+                if self.market_data_captured_at else {"status": "MISSING", "reason": "NO_CAPTURE_TIMESTAMP"})
+        except Exception as exc:
+            sector_observation = {"status": "UNAVAILABLE", "reason": type(exc).__name__}
+        # 独立观察契约保留原始样本；不修改旧评分或重建不存在的历史广度。
+        internal_observation = {
+            "version": OBSERVATION_VERSION, "computed_at": captured_at,
+            "breadth": self.breadth_observation, "sectors": sector_observation,
+        }
         # 结构化数值附录（含 vrp 数值、vix_term 比值），供异常引擎读取
         payload["full_metrics"] = {
             **{k: v for k, v in payload.items() if k != 'full_metrics'},
             "vrp_num": num.get('vrp'), "hv20": num.get('hv20'),
             "vix_term_ratio": num.get('vix_term_ratio'),
+            "vix_term_ratio_quality": self.vix_index_ratio_details,
             "hyg_tlt_roc21": num.get('hyg_tlt_roc21'),
             "macro_score_coverage": num.get('macro_score_coverage'),
             "macro_score_status": num.get('macro_score_status'),
+            "macro_components": self.macro_result.get("components", {}),
+            "macro_formula_version": self.macro_result.get("version"),
+            "source_errors": list(self.fred_client.failures.values()),
             "breadth_sample": "top500_by_mktcap",
+            "market_internals": internal_observation,
             "fred_source_dates": self.fred_source_dates,
             "liquidity_source_names": self.liquidity_source_names,
             "market_metric_lineage": market_metric_lineage,
@@ -1254,7 +1147,7 @@ class UltimateDashboard:
             '[价格]SPY': self.current_prices.get('S&P 500 (SPY)', '-'),
             '[总评]大盘骨架': payload['skeleton'], '[广度]净新高-新低': payload['net_nh_nl'],
             '[信号]广度推力': payload['breadth_thrust'], '[信号]暗池背离': payload['dix_div'],
-            '[波动]VRP风险溢价': payload['vrp'], '[波动]VIX期限结构': payload['vix_term'],
+            '[波动]VRP风险溢价': payload['vrp'], '[波动]VIX 30D/3M期限比': payload['vix_term'],
             '[避险]垃圾债/长债比': payload['hyg_tlt_ratio'], '[避险]21天动能': payload['hyg_tlt_trend'],
             '[引擎]10Y急升度Z': payload['tnx_z'], '[引擎]原油20日ROC': payload['oil_roc'],
             '[引擎]10Y-2Y变动': payload['yc_chg'], '[引擎]净流动性ROC': payload['liq_roc'],

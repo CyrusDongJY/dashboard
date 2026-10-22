@@ -116,7 +116,7 @@ class DailyReviewTests(unittest.TestCase):
             spy_rsp_spread_pct=0.9, mag7_rsp_spread_pct=1.2)
         review = self.build(market_row=concentrated)
         self.assertEqual(review["modules"]["breadth"]["state"], "Concentrated")
-        self.assertEqual(review["tactical_state"], "资金轮动")
+        self.assertEqual(review["tactical_state"], "权重集中")
         self.assertEqual(review["risk_state"], "脆弱低波")
 
     def test_anomalies_are_ranked_and_limited_to_three(self):
@@ -185,20 +185,20 @@ class DailyReviewTests(unittest.TestCase):
         email = format_daily_review_email(review)
 
         self.assertEqual(review["modules"]["cash"]["state"], "Rejected")
-        self.assertEqual(review["modules"]["breadth"]["state"], "Rotation")
+        self.assertEqual(review["modules"]["breadth"]["state"], "Mixed")
         self.assertEqual(review["modules"]["volatility"]["state"], "Normal")
         self.assertEqual(review["modules"]["credit"]["state"], "Stable")
         self.assertEqual(review["modules"]["rates"]["state"], "Neutral")
         self.assertEqual(review["modules"]["liquidity"]["state"], "Drain")
         self.assertIn("数据质量：高", email)
-        self.assertIn("现金市场：价格未获接受 | 广度：轮动", email)
+        self.assertIn("现金市场：价格未获接受 | 广度：涨跌分化", email)
         self.assertIn("波动率：常态 | 信用：稳定", email)
         self.assertIn("利率：中性 | 流动性：收缩", email)
         self.assertIn("乐观:", email)
         self.assertIn("基准:", email)
         self.assertIn("悲观:", email)
         for raw_state in (
-                "Rejected", "Rotation", "Normal", "Stable", "Neutral", "Drain"):
+                "Rejected", "Rotation", "Mixed", "Normal", "Stable", "Neutral", "Drain"):
             self.assertNotIn(raw_state, email)
 
 

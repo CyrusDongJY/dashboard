@@ -65,7 +65,8 @@ def test_exact_daily_windows_and_stale_observation(p):
     assert metric["changes"]["5日"] is None  # October 12 exists, October 9 is not a substitute.
     assert metric["trend"] == "样本不足"
     old = summarize("hy", [{"date": "2026-10-16", "value": 300}], p)
-    assert old["status"] == "LAGGED"
+    assert old["status"] == "AS_OF"
+    assert old["source_date"] == "2026-10-16"
     assert old["value"] == 300
 
 
@@ -300,16 +301,18 @@ def test_build_does_not_request_network(tmp_path, p, monkeypatch):
 
 
 @pytest.mark.parametrize("empty", [False, True])
-def test_pdf_two_pages_chinese_and_no_overflow(tmp_path, p, empty):
+def test_pdf_three_pages_chinese_and_no_overflow(tmp_path, p, empty):
     from pypdf import PdfReader
     report = assemble(p, {}) if empty else sample_report(p)
     path = tmp_path / "report.pdf"
     render_pdf(report, path)
     reader = PdfReader(path)
-    assert len(reader.pages) == 2
+    assert len(reader.pages) == 3
     assert "盘后跨资产战术压力观察" in reader.pages[0].extract_text()
-    assert "信用" in reader.pages[1].extract_text()
-    assert len(reader.pages[1]["/Resources"]["/XObject"]) == 3
+    assert "市场内部结构" in reader.pages[1].extract_text()
+    assert "影子阈值" in reader.pages[1].extract_text()
+    assert "信用" in reader.pages[2].extract_text()
+    assert len(reader.pages[2]["/Resources"]["/XObject"]) == 3
     assert any("/FontFile2" in font.get_object()["/FontDescriptor"].get_object()
                for font in reader.pages[0]["/Resources"]["/Font"].values()
                if "/FontDescriptor" in font.get_object())

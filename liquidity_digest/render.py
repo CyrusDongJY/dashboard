@@ -1,4 +1,4 @@
-"""Chinese two-page PDF and short email, rendered from the same frozen JSON."""
+"""Chinese PDF and short email, rendered from the same frozen JSON."""
 from datetime import date, timedelta
 from functools import lru_cache
 from html import escape
@@ -6,8 +6,9 @@ from io import BytesIO
 import os
 from pathlib import Path
 
-from .model import SPECS, STATUS_CN, finite, sessions
-from .states import MATRIX_TEXT, STATE_COLORS
+from .model import SPECS, STATUS_CN, finite, sessions, native_sessions, stamp, NY
+from .states import MATRIX_TEXT, STATE_COLORS, matrix_note
+from .internals_view import internals_html, internals_image, internals_lines
 
 LAYERS = (
     ("宏观 / 资金数量", ("net_liquidity", "reserves", "tga_daily", "rrp")),
@@ -57,12 +58,18 @@ def number(value, signed=False):
     return ("{:+.2f}" if signed else "{:.2f}").format(v) if v is not None else "待更新"
 
 
+def cutoff_label(report):
+    return stamp(report["cutoff"]).astimezone(NY).strftime("%H:%M")
+
+
 def quality(metric):
     parts = []
     if metric["status"] != "OK":
         parts.append(STATUS_CN[metric["status"]])
     if metric["acquisition"] != "OK":
         parts.append(STATUS_CN.get(metric["acquisition"], "状态待核实"))
+    if metric.get("publication_note"):
+        parts.append(metric["publication_note"])
     return "；".join(parts) or "已取得"
 
 
@@ -100,7 +107,8 @@ def tactical_lines(report):
 def summary_lines(report):
     current = sum(m["status"] == "OK" and m["acquisition"] == "OK" for m in report["metrics"].values())
     total = len(report["metrics"])
-    text = [f'按各源频率可用 {current}/{total} 项；未更新不等于低风险。']
+    reference = sum(m["status"] == "AS_OF" and m["acquisition"] == "OK" for m in report["metrics"].values())
+    text = [f'同日或按发布频率可用 {current}/{total} 项；另有错期参考 {reference} 项。未更新不等于低风险。']
     if current == 0:
         text.append("当前证据不足，暂停环境判断；请核查采集任务和数据源配置。")
     elif report["gaps"]:
@@ -121,14 +129,16 @@ def disagreement(report):
 
 
 def email_text(report):
-    tag = "【模拟样例】" if report["demo"] else ""
+    tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
     lines = [tag + "美股流动性与风险传导日报｜盘前版",
-             f'发送日 {report["report_date"]}｜美东09:15截止｜收盘基准 {report["market_date"]}', ""]
+             f'报告日 {report["report_date"]}｜美东{cutoff_label(report)}截止｜收盘基准 {report["market_date"]}', ""]
     states = report["states"]
     domains = report["domains"]
     lines.extend([domains["headline"], domains["relation"],
                   "宏观使用截止前最新原生观测；微观及综合评分截至 " + report["market_date"] + " 收盘。"])
     lines.extend(domain_lines(report))
+    lines.append(domains.get("evidence_note", ""))
+    lines.extend(["", *internals_lines(report), ""])
     lines.append("跨资产综合确认（不作为宏观/微观的重复投票）：" + states["headline"])
     for state in (states["funding"], states["pressure"]):
         lines.append(f'{state["label"]}：{state["level_cn"]} / {state["direction_cn"]}；'
@@ -147,6 +157,8 @@ def domain_lines(report):
             lines.append(f'  {group["label"]}：{group["short"]["label"]} / {group["medium"]["label"]}'
                          f'（{group["windows"]}）')
         lines.append("当期分项提示：" + ("；".join(domain["flags"]) or "未检出所列分项提示；不代表宽松或低压"))
+        if domain.get("timing_note"):
+            lines.append(domain["timing_note"])
         if domain["disagreement"]:
             lines.append("近中期方向不同，暂不认定趋势反转。")
     lines.append("先按组观察，再看共同方向；全部3组有效、至少2组同向且无反向才给出整体方向。")
@@ -164,7 +176,7 @@ def data_text(report):
         lines.append(title + "：" + "；".join(values))
     lines.extend(["", "盘后跨资产战术压力观察", *tactical_lines(report),
                   "", "优先查阅", *(report["focus"] or ["尚无足够连续观测确认方向。"]),
-                  disagreement(report), "", "完整数据、趋势和缺口见附件HTML网页版或两页PDF；原报告保持独立。",
+                  disagreement(report), "", "完整数据、趋势和缺口见附件HTML网页版或PDF；原报告保持独立。",
                   "HTML附件可下载后用浏览器打开，图表已内嵌，无需联网或登录。",
                   "数据为截至抓取时可见的修订版本；历史图不是逐日已知信息回测。"])
     return "\n".join(lines)
@@ -190,14 +202,17 @@ def email_html(report):
             f'{arrows[state["direction"]]} {escape(state["label"])}</div>{rows}'
             f'<div style="font-size:12px;margin-top:6px">中期：{escape(domain["medium"]["label"])}；'
             f'近期有效 {state["ready_groups"]}/3 组</div>'
-            f'<div style="font-size:12px;color:#9c6812">{escape(flags)}</div></td>')
-    tag = "【模拟样例】" if report["demo"] else ""
+            f'<div style="font-size:12px;color:#9c6812">{escape(flags)}</div>'
+            f'<div style="font-size:12px">{escape(domain.get("timing_note", ""))}</div></td>')
+    tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
     table = f'<table width="100%" cellspacing="0" cellpadding="0"><tr>{"".join(cells)}</tr></table>'
     notes = "".join(f'<p style="margin:8px 0">{escape(a["text"])}</p>' for a in states["alerts"][:3])
     return ('<html><body style="font-family:sans-serif;color:#293b40;line-height:1.65;max-width:760px;margin:auto">'
             f'<h2>{tag}美股流动性与风险传导日报</h2>'
             f'<p>{escape(report["report_date"])} 盘前版 | 微观与评分截至 {escape(report["market_date"])} 收盘；宏观按原生观测日</p>'
             + table + f'<p>{escape(report["domains"]["relation"])}</p>'
+            + f'<p>{escape(report["domains"].get("evidence_note", ""))}</p>'
+            + internals_html(report, compact=True)
             + f'<p>跨资产综合确认：{escape(states["headline"])}。{escape(states["pressure_note"])}</p>' + notes
             + '<hr><pre style="white-space:pre-wrap;font-family:sans-serif;font-size:13px">'
             + escape(data_text(report)) + "</pre></body></html>")
@@ -219,13 +234,13 @@ def chart_images(report):
     day_grid = sessions(start, report["market_date"])
     metrics = report["metrics"]
 
-    def line(ax, points, label, color, frequency="daily"):
+    def line(ax, points, label, color, frequency="daily", key=None):
         values = {p["date"]: p["value"] for p in points if p["date"] >= str(start)}
         if frequency == "weekly" and values:
             first, last = date.fromisoformat(min(values)), date.fromisoformat(max(values))
             grid = [str(first + timedelta(days=7 * i)) for i in range((last - first).days // 7 + 1)]
         else:
-            grid = day_grid
+            grid = native_sessions(key, start, report["market_date"]) if key else day_grid
         if values:
             ax.plot([date.fromisoformat(d) for d in grid], [values.get(d, np.nan) for d in grid],
                     label=label, color=color, linewidth=1.4)
@@ -277,11 +292,11 @@ def chart_images(report):
     for key, label, color in (("sofr_iorb", "SOFR-IORB", "#176c8c"),
                                ("effr_iorb", "EFFR-IORB", "#008c83"),
                                ("sofr_tail", "SOFR尾部", "#bd5135")):
-        line(axes[0], metrics[key]["history"], label, color)
+        line(axes[0], metrics[key]["history"], label, color, key=key)
     axes[0].set_title("融资成本与尾部利差", fontsize=9)
     for key, label, color in (("ig", "投资级", "#176c8c"), ("hy", "高收益", "#bd5135"),
                                ("ccc", "CCC及以下", "#7255a5")):
-        line(axes[1], metrics[key]["history"], label, color)
+        line(axes[1], metrics[key]["history"], label, color, key=key)
     axes[1].set_title("信用风险分层", fontsize=9)
     for ax in axes:
         ax.set_ylabel("基点", fontsize=8)
@@ -312,6 +327,7 @@ def render_pdf(report, path, images=None):
     c.setTitle("美股流动性与风险传导日报")
     c.setAuthor("Market Dashboard")
     margin, width = 34, 527
+    total_pages = 3 if report.get("internals") else 2
 
     def text(value, x, y, size=9, color="#293b40"):
         c.setFont(font, size)
@@ -329,12 +345,14 @@ def render_pdf(report, path, images=None):
     def header(subtitle, page):
         text("美股流动性与风险传导日报", margin, 806, 18)
         text(subtitle, margin, 783, 10, "#176c8c")
-        text(f'{report["report_date"]} | 美东09:15截止 | 收盘基准 {report["market_date"]}', margin, 765, 8)
+        text(f'{report["report_date"]} | 美东{cutoff_label(report)}截止 | 收盘基准 {report["market_date"]}', margin, 765, 8)
         if report["demo"]:
             text("模拟样例 · 非真实行情", 410, 807, 10, "#b83e4b")
+        if report.get("diagnostic"):
+            text("核查更新版 · 非原定时报告", 390, 807, 9, "#b83e4b")
         c.setStrokeColor("#c4d0d3")
         c.line(margin, 752, 561, 752)
-        text(f'影子观察 | {report["version"]} | {page}/2', margin, 23, 7, "#63757a")
+        text(f'影子观察 | {report["version"]} | {page}/{total_pages}', margin, 23, 7, "#63757a")
 
     header("盘前版 / 宏观与微观分层", 1)
     states = report["states"]
@@ -361,6 +379,8 @@ def render_pdf(report, path, images=None):
                 text(result["label"], x + dx + 9, ygroup, 8, result["color"])
         text(f'近期有效 {state["ready_groups"]}/3 组；各组不重复计票，不生成新总分。',
              x, top - 110, 7, "#63757a")
+        if domain.get("timing_note"):
+            text(domain["timing_note"], x, top - 118, 6.5, "#916619")
 
     domain_panel(domains["macro"], 34, 682)
     domain_panel(domains["micro"], 307, 682)
@@ -382,11 +402,7 @@ def render_pdf(report, path, images=None):
                  "#ffffff" if chosen else "#67757b")
             if chosen:
                 text("当前", matrix_x + j * cell_w + 3, yrow + 22, 5.5, "#ffffff")
-    if pressure["direction"] == "UNKNOWN" or pressure["zone"] == "UNKNOWN":
-        text("当前无法定位：待补足数据，不按平稳处理", margin, 426, 8, "#7c858a")
-    else:
-        text(pressure["label"] + " " + number(pressure["risk_value"]) + " / 100；缓解不等于低压",
-             margin, 426, 8, "#63757a")
+    text(matrix_note(pressure), margin, 426, 7.5, "#63757a")
     alert_y = 540
     alerts = [{"kind": "divergence", "text": domains["relation"]}, *states["alerts"][:2]]
     for alert in alerts:
@@ -418,7 +434,9 @@ def render_pdf(report, path, images=None):
                 change = (m["changes"].get("1周") if m["frequency"] == "weekly" else m["changes"].get("5日"))
                 change_text = "已为5日幅度" if key == "usdjpy_return_5d_pct" else number(change, True)
                 c.setFont(font, 7)
-                c.setFillColor("#293b40" if quality(m) == "已取得" else "#a84552")
+                data_color = ("#a84552" if m["acquisition"] != "OK" or m["status"] not in ("OK", "AS_OF")
+                              else "#916619" if m["status"] == "AS_OF" else "#293b40")
+                c.setFillColor(data_color)
                 for dx, value in ((151, number(m["value"])), (199, change_text), (254, m["source_date"] or "无观测")):
                     c.drawRightString(x + dx, ydata, value)
                 ydata -= 13
@@ -430,7 +448,7 @@ def render_pdf(report, path, images=None):
     capital = states["panels"]["risk_capital"]
     paragraph(f'风险资本：{capital["level_cn"]} / {capital["direction_cn"]}。', yright - 4, 8,
               x=307, max_width=254)
-    text("红色数据：滞后或抓取需核查，不参与当前状态确认。", 307, yright - 37, 7, "#a84552")
+    text("棕色：错期参考；红色：缺测或过期，不参与确认。", 307, yright - 37, 7, "#63757a")
     y = min(yleft, yright) - 10
     text("盘后跨资产战术压力观察 / 综合确认层", margin, y, 11, "#7255a5")
     y -= 12
@@ -442,7 +460,40 @@ def render_pdf(report, path, images=None):
         raise ValueError("Page one content exceeds layout budget")
     c.showPage()
 
-    header("趋势与证据 / 近150个自然日", 2)
+    if report.get("internals"):
+        header("微观环境解读 / 市场内部结构", 2)
+        panel = report["internals"]
+        y = paragraph(panel["headline"], 737, 14)
+        y = paragraph(panel["scope_note"] + " 截至 " + panel["market_date"] + " 收盘。", y, 9)
+        p, r, b = panel["persistence"], panel["rotation"], panel["breadth"]
+        y = paragraph("20日均线广度：" + p["label"] + "；" + r["label"] + "。", y, 10)
+        y = paragraph(panel["interpretation"], y, 9)
+        image = internals_image(report)
+        c.drawImage(ImageReader(image), margin, y - 365, width=width, height=355, mask="auto")
+        y -= 380
+        if b["quality"] == "OK":
+            y = paragraph(f'价格有效样本 {b["valid_count"]}/500，上涨 {b["advancing"]} / 平盘 {b["unchanged"]} / '
+                          f'下跌 {b["declining"]} 家；分母包含平盘，不拼接旧pct_adv口径。', y, 9)
+        y = paragraph("20日均线广度5日 / 21日变化：" + number(p["changes"]["5d"], True)
+                      + " / " + number(p["changes"]["21d"], True) + " 个百分点。", y, 9)
+        for key, vals in panel["leadership"]["spreads"].items():
+            y = paragraph(key + "相对表现差（1 / 5 / 21日）：" + " / ".join(
+                number(vals[period], True) for period in ("1d", "5d", "21d")) + " 个百分点。", y, 8)
+        y = paragraph("轮动观察：" + r["reason"] + (" 从" + "、".join(r["from_sectors"]) + "到"
+                      + "、".join(r["to_sectors"]) + "。" if r["state"] == "CANDIDATE" else ""), y, 8)
+        y = paragraph(r.get("history_note", ""), y, 8)
+        y = paragraph("读图口径：涨跌是绝对收益，超额是相对SPY的收益差；相对抗跌不等于上涨。"
+                      "样本每天按市值筛选，历史不代表固定成分股队列。扫描器日期按采集日，逐股源时间与收盘竞价覆盖未验证。", y, 8)
+        y = paragraph("影子阈值：涨/跌占比≥65%称广泛；行业扩散需至少8/11同向；"
+                      "20日均线广度单日变化1个百分点为噪声线。描述性规则未经预测回测。", y, 8)
+        if panel["gaps"]:
+            y = paragraph("待确认：" + "；".join(panel["gaps"]), y, 8, "#916619")
+        y = paragraph(panel["shadow_note"], y, 8, "#63757a")
+        if y < 40:
+            raise ValueError("Market internals page exceeds layout budget")
+        c.showPage()
+
+    header("趋势与证据 / 近150个自然日", total_pages)
     images = chart_images(report) if images is None else images
     y = 740
     for title, image in zip(("01 资金数量与分解", "02 资金价格与信用", "03 市场传导与连续状态"), images):
@@ -468,13 +519,13 @@ def render_pdf(report, path, images=None):
                   "利率、美元、日元、CCC利差与集中度作背景；VIX、MOVE与战术压力作综合确认，不重复投票。", y, 8)
     y = paragraph("数量口径：净流动性代理 = 同日美联储总资产 - 同日财政账户 - 同日逆回购；"
                   "它不是进入股市的资金量。准备金为周平均，与周三时点单独展示。"
-                  "周频变化列依次为1周／4周；日频依次为1／5／21个NYSE交易日。"
+                  "周频变化列依次为1周／4周；日频为1／5／21个原生业务日（股票NYSE、SOFR债市、EFFR联储）。"
                   "变化为原单位差值，百分数的变化为百分点，不是收益率。", y, 8)
     gap_text = "、".join(report["gaps"]) or "无已识别缺口"
     y = paragraph("待更新或需核查：" + gap_text + "。", y, 8, "#8c3944")
     y = paragraph("数据来源：纽约联储参考利率、FRED各原始序列、美国财政部DTS及现有系统收盘表。"
                   "逐项抓取时间、源名称、原始序列、规则版本与缺口原因见随日报保存的JSON。"
-                  "09:15之后发布的信息不回填本期邮件，留待后续报告。", y, 8)
+                  "定时报告09:15之后发布的信息不回填原邮件；核查更新版以页首独立截止时间为准。", y, 8)
     if y < 40:
         raise ValueError("Page two content exceeds layout budget")
     c.save()

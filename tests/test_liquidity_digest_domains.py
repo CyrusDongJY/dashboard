@@ -1,9 +1,10 @@
 from copy import deepcopy
+from datetime import date, timedelta
 
 import pytest
 
 from liquidity_digest.domains import METRICS, GROUPS, build_domains, metric_evidence, _combine
-from liquidity_digest.model import assemble, plan, DB_METRICS
+from liquidity_digest.model import assemble, plan, DB_METRICS, native_sessions
 from liquidity_digest.sample import sample_report
 from liquidity_digest.render import email_html, email_text, render_pdf
 
@@ -16,7 +17,11 @@ def report():
 def shift_window(report, key, delta, count=5):
     item = report["metrics"][key]
     end = item["value"]
-    for i, point in enumerate(item["history"][-count - 1:]):
+    points = item["history"]
+    if item["frequency"] != "weekly":
+        grid = native_sessions(key, date.fromisoformat(item["source_date"]) - timedelta(days=70), item["source_date"])
+        points = [p for p in points if p["date"] in grid]
+    for i, point in enumerate(points[-count - 1:]):
         point["value"] = end - delta + delta * i / count
 
 
@@ -194,7 +199,7 @@ def test_pdf_retains_tactical_and_distinguishes_three_layers(report, tmp_path):
     path = tmp_path / "domains.pdf"
     render_pdf(report, path)
     pages = PdfReader(path).pages
-    assert len(pages) == 2
+    assert len(pages) == 3
     text = "\n".join(page.extract_text() for page in pages)
     for label in ("宏观资金与融资", "微观市场承接", "跨资产确认", "非纯微观",
                   "边际趋松", "内部压力增加", "综合流动性支持", "非纯宏观"):

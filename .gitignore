@@ -8,3 +8,6 @@ market_config.py
 sniper.log
 .claude/
 .probe_data/
+reports/
+output/
+backups/

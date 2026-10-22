@@ -3,9 +3,10 @@ from base64 import b64encode
 from html import escape
 
 from .render import (
-    LAYERS, chart_images, disagreement, number, quality, summary_lines, tactical_lines,
+    LAYERS, chart_images, disagreement, number, quality, summary_lines, tactical_lines, cutoff_label,
 )
-from .states import MATRIX_TEXT
+from .states import MATRIX_TEXT, matrix_note
+from .internals_view import internals_html
 
 
 def text(value):
@@ -39,22 +40,22 @@ def full_html(report, images=None):
             f'<p>中期：{text(domain["medium"]["label"])} · 近期有效 {state["ready_groups"]}/3 组</p>'
             + table(("观察组", "近期", "中期", "窗口"), rows)
             + f'<p class="notice">{text(flags)}</p>'
+            + f'<p class="muted">{text(domain.get("timing_note", ""))}</p>'
             + "".join(f'<p class="muted">待确认原因：{text(reason)}</p>' for reason in reasons)
             + "</section>")
 
     pressure = report["states"]["pressure"]
     matrix = ['<div class="matrix"><span></span><span>正在缓解</span><span>变化不明显</span><span>正在增加</span>']
     for zone, label in (("HIGH", "高压"), ("MID", "中间"), ("LOW", "低压")):
-        matrix.append(f'<strong>{label}</strong>')
+        known_row = pressure["zone"] == zone and pressure["direction"] == "UNKNOWN"
+        matrix.append(f'<strong class="{"known-level" if known_row else ""}">{label}</strong>')
         for direction in ("DOWN", "FLAT", "UP"):
             chosen = pressure["zone"] == zone and pressure["direction"] == direction
             cls = "matrix-cell current" if chosen else "matrix-cell"
             matrix.append(f'<span class="{cls}">{text(MATRIX_TEXT[(zone, direction)])}'
                           + ("<small>当前</small>" if chosen else "") + "</span>")
     matrix.append("</div>")
-    matrix_note = ("当前无法定位：待补足数据，不按平稳处理。"
-                   if "UNKNOWN" in (pressure["zone"], pressure["direction"])
-                   else f'{pressure["label"]} {number(pressure["risk_value"])}/100；缓解不等于低压。')
+    pressure_note = matrix_note(pressure)
     alerts = "".join(f'<li>{text(a["text"])}</li>' for a in report["states"]["alerts"])
 
     groups = list(LAYERS)
@@ -100,7 +101,7 @@ def full_html(report, images=None):
                 quality(m)) for m in report["metrics"].values()]
     captures = [(key, v.get("source"), v.get("status"), v.get("captured_at"), v.get("attempt_at"))
                 for key, v in report["source_audit"].items()]
-    tag = "【模拟样例】" if report["demo"] else ""
+    tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
     gaps = "、".join(report["gaps"]) or "无已识别缺口"
     focus = "".join(f'<li>{text(line)}</li>' for line in report["focus"])
     return f"""<!doctype html>
@@ -121,10 +122,12 @@ header{{border-bottom:2px solid #176c8c;padding-bottom:22px}}nav{{display:flex;g
 .table-wrap,.chart-wrap{{overflow-x:auto;max-width:100%}}table{{width:100%;border-collapse:collapse;font-size:14px;text-align:left}}
 th{{background:#edf3f5;font-weight:600}}th,td{{padding:10px 12px;border-bottom:1px solid #e1e7e9;vertical-align:top}}
 td,th{{overflow-wrap:anywhere}}td:first-child{{min-width:120px}}.table-wrap table{{min-width:590px}}.domain table{{min-width:440px}}
+#internals td,#internals th{{min-width:0}}#internals table[role="presentation"] td,#internals table[role="img"] td{{border:0}}
 .confirmation{{display:grid;grid-template-columns:1fr 1fr;gap:32px}}.confirmation>*{{min-width:0}}
 .matrix{{display:grid;grid-template-columns:42px repeat(3,minmax(0,1fr));gap:4px;font-size:13px;text-align:center}}
 .matrix>span,.matrix>strong{{display:flex;align-items:center;justify-content:center;min-height:44px;padding:7px 3px;overflow-wrap:anywhere}}
 .matrix-cell{{background:#edf2f4;flex-direction:column}}.matrix-cell.current{{background:#293b40;color:#fff;outline:2px solid #176c8c;outline-offset:-2px}}
+.known-level{{color:#a23646;border-left:3px solid #a23646}}
 .matrix small{{display:block;font-size:11px}}figure{{margin:0 0 28px}}figure img{{display:block;width:100%;min-width:680px;height:auto;aspect-ratio:1717/360}}
 figcaption{{margin-top:10px}}ul{{padding-left:22px}}li{{margin-bottom:8px}}details{{margin:18px 0}}summary{{cursor:pointer;font-weight:600;color:#176c8c}}
 footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:anywhere}}
@@ -133,17 +136,19 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 </style></head><body><main>
 <header><h1>{text(tag)}美股流动性与风险传导日报</h1>
 <p>盘前版 / 宏观与微观分层 · {text(report["report_date"])}</p>
-<p class="muted">美东09:15截止 · 收盘基准 {text(report["market_date"])} · 宏观按各源原生观测日</p>
-<nav aria-label="报告章节"><a href="#overview">环境总览</a><a href="#evidence">分类数据</a>
+<p class="muted">美东{text(cutoff_label(report))}截止 · 收盘基准 {text(report["market_date"])} · 宏观按各源原生观测日</p>
+<nav aria-label="报告章节"><a href="#overview">环境总览</a><a href="#internals">市场内部结构</a><a href="#evidence">分类数据</a>
 <a href="#tactical">跨资产压力</a><a href="#trends">趋势图表</a><a href="#audit">来源与口径</a></nav></header>
 <section id="overview" class="band"><h2>{text(report["domains"]["headline"])}</h2>
-<p>{text(report["domains"]["relation"])}</p><div class="domains">{"".join(panels)}</div></section>
+<p>{text(report["domains"]["relation"])}</p><p class="muted">{text(report["domains"].get("evidence_note", ""))}</p><div class="domains">{"".join(panels)}</div></section>
+{internals_html(report)}
 <section class="band confirmation"><div><h2>跨资产确认 / 压力水位与方向</h2>{"".join(matrix)}
-<p class="muted">{text(matrix_note)}</p></div><div><h2>提示与分歧</h2><ul>{alerts}</ul>
+<p class="muted">{text(pressure_note)}</p><p class="muted">{text(pressure["reason"])}</p></div><div><h2>提示与分歧</h2><ul>{alerts}</ul>
 <p>{text(disagreement(report))}</p></div></section>
 <section id="evidence" class="band"><h2>分类数据与观测日期</h2>
 {"".join(f"<p>{text(line)}</p>" for line in summary_lines(report))}
-{"".join(data)}<p class="warning">待更新或需核查：{text(gaps)}。滞后数据不参与当前状态确认。</p></section>
+{"".join(data)}<p class="warning">待更新或需核查：{text(gaps)}。缺失及过期数据不参与状态确认。</p>
+<p class="notice">错期参考：{text("；".join(report.get("publication_lags", [])) or "无")}。不冒充昨日同步数据。</p></section>
 <section id="tactical" class="band"><h2>盘后跨资产战术压力观察 / 综合确认层</h2>
 {"".join(f"<p>{text(line)}</p>" for line in tactical_lines(report))}
 <p class="muted">影子观察，不触发预警；跨资产确认并非纯微观，不作为宏观或微观的重复投票。</p></section>
@@ -156,9 +161,11 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 数量组用1周/4周，其他组用5日/21日，不能视为同日同步变化。边际改善不等于当前宽松。</p>
 <p>净流动性代理 = 同日美联储总资产 - 同日财政账户 - 同日逆回购，不是进入股市的资金量。
 准备金为周平均。变化为原单位差值，百分数的变化为百分点，不是收益率；日元5日收益率单独标注。</p>
-<p>本版本日频变化窗口按NYSE交易日检查；融资业务日历不同的日期可能使趋势暂缺，未进行前值填充。
+<p>股票按NYSE交易日；融资业务日历：SOFR按SIFMA，EFFR按联储银行；休市日不算缺口，真实缺测仍断窗。
+信用与利率最多允许落后1个原生业务日的错期参考，并保留原日期；TGA按次业务日16:00发布节奏判断。
 各时间状态只保留最新规则版本。历史图采用抓取时可见的修订值，不代表当日已经可知。</p>
-<p>09:15之后发布的信息不回填本期报告。网页版与PDF来自同一冻结快照，不会随打开时间自动更新。</p>
+<p>定时报告09:15之后发布的信息不回填原报告。核查更新版独立标识实际截止时间。
+网页版与PDF来自同一冻结快照，不会随打开时间自动更新。</p>
 <details><summary>逐项来源、观测日与抓取时间</summary>
 {table(("指标", "来源", "观测日", "抓取时间", "状态"), sources)}</details>
 <details><summary>采集审计</summary>{table(("输入项", "来源", "状态", "接收时间", "尝试时间"), captures)}</details>

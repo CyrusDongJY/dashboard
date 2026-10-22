@@ -1,8 +1,11 @@
 """Explicit synthetic inputs for layout and deployment smoke tests, never emailed."""
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 import math
 
-from .model import NY, SPECS, DB_METRICS, assemble, sessions, stamp
+import pandas as pd
+from market_internals import OBSERVATION_VERSION, SECTORS, capture_breadth, capture_sectors
+
+from .model import NY, SPECS, DB_METRICS, assemble, sessions, native_sessions, stamp
 from .sources import FRED
 
 
@@ -21,7 +24,8 @@ def sample_report(report_plan):
     inputs, metric_rows = {}, []
     for key, base in baseline.items():
         _, _, frequency = SPECS[key]
-        selected = [d for d in days if date.fromisoformat(d).weekday() == 2] if frequency == "weekly" else days
+        selected = ([d for d in days if date.fromisoformat(d).weekday() == 2] if frequency == "weekly"
+                    else native_sessions(key, end - timedelta(days=420), end))
         values = [{"date": d, "value": base + (math.sin(i / 8) + i / 100) * abs(base) * .025}
                   for i, d in enumerate(selected)]
         if key == "ccc":
@@ -74,9 +78,25 @@ def sample_report(report_plan):
                                                   ("pcr", 1.1, 10), ("cmf", .03, 0))}
     components["_meta"] = {"status": "OK"}
     components["_context"] = {"vix_5d_change": -3, "vix_percentile_252": 88, "vix_term_ratio": .97}
-    inputs["db_market_history"] = {"data": [{
+    market_rows = []
+    price_days = days[-60:]
+    rates = dict(zip(SECTORS, (-.0015, .002, .003, .0015, -.0008, -.0025, .0035, .001, -.0005, .0025, .004)))
+    rates.update(SPY=.001, RSP=.0015, QQQ=.0012, QQQE=.002)
+    prices = pd.DataFrame({s: [100 * (1 + r) ** i for i in range(len(price_days))]
+                           for s, r in rates.items()}, index=pd.to_datetime(price_days))
+    for i, day in enumerate(days[-8:]):
+        captured = datetime.combine(date.fromisoformat(day), time(16, 35), NY).isoformat()
+        stocks = [{"s": f"NASDAQ:DEMO{j}", "d": [f"DEMO{j}", 1 if j < 280 + i * 12 else 0 if j < 290 + i * 12 else -1,
+                   100, 90, 95, 98, 120, 50, 1000]} for j in range(500)]
+        market_rows.append({"record_date": day, "ingested_at": captured,
+                            "full_metrics": {"market_internals": {
+                                "version": OBSERVATION_VERSION, "computed_at": captured,
+                                "breadth": capture_breadth(stocks, captured),
+                                "sectors": capture_sectors(prices, day, captured)}}})
+    market_rows[-1].update({
         "record_date": str(end), "eod_stress_score": 71, "stress_coverage": .95,
-        "stress_components": components, "stress_calc_version": "SYNTHETIC"}], "status": "OK"}
+        "stress_components": components, "stress_calc_version": "SYNTHETIC"})
+    inputs["db_market_history"] = {"data": market_rows, "status": "OK", "captured_at": capture}
     for table, state in (("risk_capital_daily", "边缘收缩"), ("risk_event_pulse_daily", "事件驱动，待市场确认")):
         inputs["db_" + table] = {"data": [{"report_date": str(end), "state_cn": state}], "status": "OK"}
     return assemble(report_plan, inputs, demo=True)

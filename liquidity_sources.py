@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from fred_client import FredClient
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class OfficialLiquiditySources:
         self.fred_api_key = fred_api_key
         self.timeout = timeout
         self.session = session or requests.Session()
+        self.fred_client = FredClient(fred_api_key, session=session, timeout=timeout)
         if session is None:
             retry = Retry(
                 total=3,
@@ -75,25 +77,7 @@ class OfficialLiquiditySources:
 
     def fetch_fred(self, series_id: str, start_date: str,
                    end_date: Optional[str] = None) -> pd.Series:
-        params = {
-            "series_id": series_id,
-            "api_key": self.fred_api_key,
-            "file_type": "json",
-            "observation_start": start_date,
-        }
-        if end_date:
-            params["observation_end"] = end_date
-        response = self.session.get(FRED_URL, params=params, timeout=self.timeout)
-        response.raise_for_status()
-        rows = response.json().get("observations", [])
-        values = {
-            pd.Timestamp(row["date"]): _number(row.get("value"))
-            for row in rows
-            if row.get("date")
-        }
-        series = pd.Series(values, dtype=float).dropna().sort_index()
-        series.index = pd.to_datetime(series.index).tz_localize(None)
-        return series.loc[~series.index.duplicated(keep="last")]
+        return self.fred_client.series(series_id, start_date, end_date)
 
     def fetch_tga(self, start_date: str,
                   end_date: Optional[str] = None) -> pd.Series:

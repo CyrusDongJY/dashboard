@@ -40,6 +40,18 @@ from auto_analyst import format_raw_appendix  # noqa: E402
 
 
 class AutoAnalystFormattingTests(unittest.TestCase):
+    def test_raw_internals_samples_are_not_expanded_in_email(self):
+        text = format_raw_appendix({"full_metrics": {
+            "market_internals": {"version": "observation-v1", "breadth": {"constituents": ["RAW_STOCK"] * 500}},
+            "sector_history_reconstruction": {"version": "reconstruction-v1", "prices": ["RAW_PRICE"] * 500},
+            "vix": 20}}, {}, [])
+        self.assertIn("observation-v1", text)
+        self.assertIn("reconstruction-v1", text)
+        self.assertIn("vix: 20", text)
+        self.assertNotIn("RAW_STOCK", text)
+        self.assertNotIn("RAW_PRICE", text)
+        self.assertLess(len(text), 1000)
+
     def test_shared_dashboard_modules_take_import_precedence(self):
         source = ANALYST_PATH.read_text(encoding="utf-8")
         self.assertIn("sys.path.insert(0, CONFIG_DIR)", source)

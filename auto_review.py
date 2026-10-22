@@ -21,6 +21,9 @@ from email.mime.text import MIMEText
 from email.header import Header
 from google import genai
 import datetime
+import argparse
+import fcntl
+import json
 import pandas as pd
 from supabase import create_client, Client
 
@@ -32,8 +35,12 @@ NY_TZ = pytz.timezone('America/New_York')
 #    文案/emoji 变化不再造成字段静默变 None。
 from ultimate_dashboard import UltimateDashboard
 from market_utils import (
-    is_trading_day, attach_metadata, safe_upsert,
+    is_trading_day,
     log_data_quality, find_missing_fields,
+)
+from macro_recovery import (
+    RecoveryStore, HistoricalMacroProvider, sync_captures,
+    discover_missing_dates, repair_pending,
 )
 
 # 落库后用于数据质量审计的关键字段
@@ -63,8 +70,10 @@ def append_local_csv(cn_row, date_str):
     try:
         if os.path.exists(db_path):
             df_old = pd.read_csv(db_path, encoding='utf-8-sig')
-            df_combined = pd.concat([df_old, df_new], ignore_index=True)
-            df_combined = df_combined.drop_duplicates(subset=['日期'], keep='last')
+            # A failed source on a rerun must not erase a previously valid cell.
+            df_old = df_old.drop_duplicates(subset=['日期'], keep='last').set_index('日期')
+            df_new = df_new.replace('-', float('nan')).set_index('日期')
+            df_combined = df_new.combine_first(df_old).sort_index().reset_index()
             df_combined.to_csv(db_path, index=False, encoding='utf-8-sig')
         else:
             df_new.to_csv(db_path, index=False, encoding='utf-8-sig')
@@ -72,27 +81,31 @@ def append_local_csv(cn_row, date_str):
     except Exception as e:
         print(f"❌ 写入本地数据库失败: {e}")
 
-def push_to_supabase(payload, date_str):
-    print("🔗 准备同步结构化数据至 Supabase (market_history)...")
-    try:
-        supabase: Client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
-    except Exception as e:
-        print(f"❌ Supabase 连接失败: {e}")
-        return
+def push_to_supabase(client, store):
+    outcome = sync_captures(client, store)
+    if outcome["failed"]:
+        log_data_quality(
+            client, job_name='auto_review_persistence', table_name='market_history',
+            status='failed', rows_written=outcome['synced'],
+            notes='outbox保留原始采集结果，等待后续重试',
+        )
+    print(json.dumps({'capture_persistence': outcome}, ensure_ascii=False))
+    return outcome
 
-    attach_metadata(payload, source_date=date_str)
-    res = safe_upsert(supabase, 'market_history', payload, conflict_cols='record_date')
 
-    missing = find_missing_fields(payload, CRITICAL_FIELDS)
-    status = 'failed' if res is None else ('partial' if missing else 'ok')
-    log_data_quality(
-        supabase, job_name='auto_review', table_name='market_history',
-        status=status, rows_written=0 if res is None else 1,
-        missing_fields=missing,
-        notes='结构化直写 (V9.0)，正则链路已废弃',
-    )
-    if res is not None:
-        print(f"✅ market_history 结构化直写成功！关键字段缺失: {missing or '无'}")
+def repair_summary_zh(repairs):
+    if not repairs:
+        return "\n【历史补缺】本轮没有待处理的历史日期。"
+    lines = ["\n【历史补缺】"]
+    for item in repairs:
+        reasons = sorted({x.get("reason", "UNKNOWN") for x in item.get("errors", [])})
+        state = "已补齐可回溯宏观项" if item["status"] == "REPAIRED" else "仍待补齐"
+        lines.append(f"{item['date']}：{state}；已补 {len(item.get('filled_fields', []))} 项，"
+                     f"待补 {len(item.get('remaining_fields', []))} 项。"
+                     + (" 原因：" + ", ".join(reasons) if reasons else ""))
+    lines.append("历史评分仅作为事后重建保存，不改写当时的原始评分。")
+    return "\n".join(lines)
+
 
 def generate_ai_report(market_data):
     client = genai.Client(api_key=cfg.GEMINI_API_KEY)
@@ -103,6 +116,7 @@ def generate_ai_report(market_data):
     1. 绝不允许提及“巨头基本面”或“EPS”！
     2. 绝不允许提及“期权实操”、“做市商防线”、“Max Pain”、“期权策略(如宽跨式、Call/Put)”！
     如果你在输出中包含了上述任何词汇，报告将被视为不合格。
+    宏观评分覆盖率不足100%时必须注明“宏观数据部分缺失”及覆盖率，不得将缺失项解释成零压力。宏观评分不可用时不会调用本写稿步骤。
 
     严格要求：总字数控制在 400-500 字左右。必须且只能输出以下三个板块（禁止自己编造新板块）：
     一、核心定性：一句话定性当前宏观象限。结合【宏观压力得分】与【盘后跨资产战术压力观察值】；后者只反映EOD跨资产压力证据，不等同于底层流动性挤兑，也不单独确认行情方向或反转。若其为N/A或质量状态为UNAVAILABLE，必须明确写“压力评分数据不足”，不得按0分解释；若状态为PARTIAL，必须披露覆盖率并降低结论强度。
@@ -126,40 +140,114 @@ def send_email(subject, content, raw_data=""):
     except Exception as e:
         print(f"❌ 邮件异常: {e}")
 
-if __name__ == "__main__":
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Partial-safe EOD macro capture and bounded historical repair")
+    parser.add_argument("--no-email", action="store_true")
+    parser.add_argument("--repair-only", action="store_true")
+    parser.add_argument("--repair-date", action="append", default=[])
+    parser.add_argument("--max-repair-dates", type=int, default=2, choices=range(1, 6))
+    args = parser.parse_args(argv)
+    if args.repair_date and not args.repair_only:
+        parser.error("--repair-date requires --repair-only; it never relabels a live capture")
     current_time = datetime.datetime.now(NY_TZ)
-    today_str = current_time.strftime("%Y-%m-%d")
-
-    print(f"\n[{current_time.strftime('%H:%M:%S')}] 🚀 开始执行云端自动化投研流 (结构化直写 V9.0)...")
-
-    if not is_trading_day():
-        print("🛑 今天是美股休市日，云端战报机自动停止抓取与发稿。")
-        sys.exit(0)
-
+    today = current_time.strftime("%Y-%m-%d")
+    for day in args.repair_date:
+        try:
+            parsed = datetime.date.fromisoformat(day)
+        except ValueError:
+            parser.error("repair dates must be YYYY-MM-DD")
+        if parsed > current_time.date() or (day == today and current_time.hour < 17):
+            parser.error("only completed past sessions may be repaired")
+        if not is_trading_day(day):
+            parser.error("repair date is not an NYSE trading session")
+    state_dir = os.path.expanduser("~/market_dashboard/state")
+    os.makedirs(state_dir, exist_ok=True, mode=0o700)
+    lock = open(os.path.join(state_dir, "auto_review.lock"), "a")
     try:
-        data, payload, cn_row = run_dashboard()
-    except Exception as e:
-        print(f"❌ 引擎运行崩溃，触发熔断保护。不写库，直接发警报邮件。({e})")
-        send_email(f"⚠️ 美股监控器异常报告 (云端) - {today_str}",
-                   f"云端监控系统在抓取数据时发生崩溃：{e}\n请检查云服务器上的 ultimate_dashboard.py 是否正常运行。")
-        sys.exit(1)
-
-    # 熔断：核心分数缺失视为引擎异常
-    if payload.get('macro_score') is None:
-        print("❌ 检测到数据异常（宏观得分缺失），触发熔断保护。")
-        send_email(f"⚠️ 美股监控器异常报告 (云端) - {today_str}",
-                   "引擎运行完成但宏观得分缺失，疑似上游数据源故障。本次不写库。")
-        sys.exit(1)
-
-    append_local_csv(cn_row, today_str)
-    push_to_supabase(payload, today_str)
-
-    print("🧠 尝试连接 AI 生成战报...")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another auto_review capture/repair is running; skipped.")
+        return 0
+    store = RecoveryStore(os.path.join(state_dir, "macro_recovery.sqlite3"))
+    data, payload = "", {}
+    if not args.repair_only:
+        if not is_trading_day(today):
+            print("NYSE closed; no live collection.")
+            return 0
+        try:
+            data, payload, cn_row = run_dashboard()
+            if payload.get("record_date") != today:
+                raise RuntimeError("CAPTURE_CROSSED_MARKET_DATE")
+            store.stage(payload)
+            full = payload.get("full_metrics") or {}
+            cn_row['[质量]宏观评分状态'] = full.get("macro_score_status", "UNAVAILABLE")
+            cn_row['[质量]宏观覆盖率'] = full.get("macro_score_coverage")
+            append_local_csv(cn_row, today)
+        except Exception as exc:
+            message = "引擎异常，未生成可保存的完整采集对象：" + type(exc).__name__
+            print(message)
+            if not args.no_email:
+                send_email("宏观采集异常 - " + today, message)
+            return 1
     try:
-        report = generate_ai_report(data)
-    except Exception as e:
-        print(f"⚠️ 无法连接至 Google AI: {e}")
-        report = "【系统提示】\n由于当前云端网络受到 Google API 访问限制，本次自动写稿失败。\n但底层的宏观数据已成功入库，请直接查阅下方的【数据明细】。"
+        client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
+        persisted = push_to_supabase(client, store)
+        if persisted["failed"]:
+            raise RuntimeError("PERSISTENCE_PENDING")
+        if args.repair_date:
+            for day in args.repair_date:
+                store.enqueue(day)
+        else:
+            # Pending dates remain in SQLite even after leaving this discovery window.
+            discover_missing_dates(client, store, today, is_trading_day)
+        provider = HistoricalMacroProvider(cfg.FRED_API_KEY)
+        for error in (payload.get("full_metrics") or {}).get("source_errors", []):
+            if error.get("reason") in ("UPSTREAM_MAINTENANCE", "NON_JSON_RESPONSE", "NETWORK_ERROR"):
+                provider.fred.unavailable_reason = error["reason"]
+                break
+        before = str(current_time.date() + datetime.timedelta(days=1)) if args.repair_date else today
+        repairs = repair_pending(client, store, provider, before, args.max_repair_dates)
+        print(json.dumps({"historical_repair": repairs}, ensure_ascii=False))
+    except Exception as exc:
+        message = ("数据库同步或补缺流程异常；本次已采集数据保存在本地 outbox，"
+                   "下次自动重试：" + type(exc).__name__)
+        print(message)
+        if not args.no_email:
+            send_email("宏观数据待同步 - " + today, message, data)
+        return 1
+    if args.repair_only:
+        return 0
+    full = payload.get("full_metrics") or {}
+    missing_fields = find_missing_fields(payload, CRITICAL_FIELDS)
+    partial = full.get("macro_score_status") != "OK" or bool(full.get("source_errors")) or bool(missing_fields)
+    log_data_quality(
+        client, job_name='auto_review_capture', table_name='market_history',
+        status='partial' if partial else 'ok', rows_written=1,
+        missing_fields=missing_fields,
+        notes=f"record_date={today}; macro_status={full.get('macro_score_status')}; coverage={full.get('macro_score_coverage')}",
+    )
+    repair_text = repair_summary_zh(repairs)
+    if payload.get("macro_score") is None:
+        report = (
+            "【部分数据已保存】有效字段已落库并读回核验；缺失字段为 NULL，等待下次自动补缺。\n"
+            f"宏观评分不可用，覆盖率 {float(full.get('macro_score_coverage') or 0):.0%}，"
+            "仍执行原有 70% 门槛。本次不生成宏观交易结论。\n"
+            "历史补算会单独标记为事后重建，不替换当时的宏观评分。"
+        )
+    elif args.no_email:
+        report = "数据已保存；--no-email 同时跳过 AI 写稿。"
+    else:
+        try:
+            report = generate_ai_report(data)
+        except Exception as exc:
+            print("AI report unavailable: " + type(exc).__name__)
+            report = "数据已保存，自动写稿不可用；请查看带质量标记的数据明细。"
+    subject = ("部分数据 / " if partial else "") + "美股宏观战报 - " + today
+    if not args.no_email:
+        send_email(subject, report + repair_text, data)
+    print(report + repair_text)
+    return 0
 
-    send_email(f"美股宏观战报 (机构级雷达V9.0) - {today_str}", report, data)
-    print("🎉 收工！云端定时任务圆满完成。")
+
+if __name__ == "__main__":
+    sys.exit(main())
