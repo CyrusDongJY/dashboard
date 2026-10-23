@@ -37,6 +37,7 @@ FRED_SERIES = {
     "nfci": ("NFCI", 1.0),
     "hy_spread": ("BAMLH0A0HYM2", 1.0),         # percentage points
     "ig_spread": ("BAMLC0A0CM", 1.0),
+    "bank_assets_b": ("TLAACBW027SBOG", 1.0),
 }
 
 
@@ -179,14 +180,14 @@ class OfficialLiquiditySources:
                     how="left",
                 )
             except Exception as exc:
-                logger.warning("FRED %s fetch failed: %s", series_id, exc)
+                logger.warning("FRED %s fetch failed (%s)", series_id, type(exc).__name__)
 
         try:
             tga = self.fetch_tga(start_date, str(end.date()))
             result = result.join(
                 self._asof_column(target, tga, "tga_b"), how="left")
         except Exception as exc:
-            logger.warning("Treasury daily TGA fetch failed: %s", exc)
+            logger.warning("Treasury daily TGA fetch failed (%s)", type(exc).__name__)
 
         for rate_type, market in (
             ("sofr", "secured"),
@@ -204,14 +205,22 @@ class OfficialLiquiditySources:
                         how="left",
                     )
             except Exception as exc:
-                logger.warning("NY Fed %s fetch failed: %s", rate_type, exc)
+                logger.warning("NY Fed %s fetch failed (%s)", rate_type, type(exc).__name__)
 
         if "m2_b" in fred_native:
-            m2_yoy = fred_native["m2_b"].pct_change(12) * 100
+            m2 = fred_native["m2_b"]
+            previous = m2.reindex(m2.index - pd.DateOffset(months=12))
+            previous.index = m2.index
+            m2_yoy = (m2 / previous.where(previous > 0) - 1) * 100
             result = result.join(
                 self._asof_column(target, m2_yoy.dropna(), "m2_yoy"),
                 how="left",
             )
+
+        if {"reserves_t", "bank_assets_b"}.issubset(fred_native):
+            pair = pd.concat([fred_native["reserves_t"], fred_native["bank_assets_b"]], axis=1).dropna()
+            ratio = 100 * pair.iloc[:, 0] * 1000 / pair.iloc[:, 1].where(pair.iloc[:, 1] > 0)
+            result = result.join(self._asof_column(target, ratio, "reserve_ratio_pct"))
 
         required = {"fed_assets_b", "tga_b", "rrp_b"}
         if required.issubset(result.columns):

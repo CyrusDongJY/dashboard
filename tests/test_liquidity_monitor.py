@@ -41,6 +41,7 @@ def synthetic_frame(supportive=True, periods=420):
 
     frame["net_liq_b"] = 5_500 + direction * ramp * 700
     frame["reserves_t"] = 3.12 if supportive else 2.70
+    frame["reserve_ratio_pct"] = 12 + direction * ramp * 2
     frame["m2_yoy"] = 2.0 + direction * ramp * 3.0
     frame["tga_b"] = 850 - direction * ramp * 250
     frame["fed_assets_b"] = 6_500 + direction * ramp * 350
@@ -67,11 +68,14 @@ def synthetic_frame(supportive=True, periods=420):
     frame["pct_20ma"] = 45 + direction * ramp * 30
     frame["pct_50ma"] = 48 + direction * ramp * 28
     frame["pct_200ma"] = 50 + direction * ramp * 25
+    frame["pct_adv"] = 50 + direction * ramp * 10
     frame["vix_futures_contango_pct"] = 3 + direction * ramp * 6
     frame["vix_ratio_contango_pct"] = 5 + direction * ramp * 7
 
     for column in list(frame.columns):
         frame[f"{column}_source_date"] = index
+    frame["m2_yoy_source_date"] = (index - pd.Timedelta(days=45)).to_period("M").to_timestamp()
+    frame["reserve_ratio_pct_source_date"] = index - pd.to_timedelta((index.weekday - 2) % 7, unit="D")
     frame["rrp_b"] = 10.0
     frame["rrp_b_source_date"] = index
     frame["sofr_rate"] = 3.6
@@ -129,8 +133,8 @@ class LiquidityScoreTests(unittest.TestCase):
             tightening.pillars["flow_pulse"].score,
         )
 
-    def test_calc_version_is_v2_3(self):
-        self.assertEqual(CALC_VERSION, "liquidity_v2.3")
+    def test_calc_version_is_fixed_native(self):
+        self.assertEqual(CALC_VERSION, "liquidity_v3.0_fixed_native")
 
     def test_missing_data_never_defaults_to_healthy(self):
         index = pd.bdate_range("2026-01-02", periods=5)
@@ -150,7 +154,8 @@ class LiquidityScoreTests(unittest.TestCase):
     def test_missing_pillar_summary_explains_observation_gap(self):
         index = pd.bdate_range("2026-01-02", periods=5)
         result = score_liquidity_frame(
-            pd.DataFrame({"pct_20ma": [50.0] * 5}, index=index))
+            pd.DataFrame({"pct_20ma": [50.0] * 5,
+                          "pct_20ma_source_date": index}, index=index))
         summary = format_liquidity_summary(result)
         self.assertIn("有效观测", summary)
         self.assertIn("5/60", summary)
@@ -166,7 +171,8 @@ class LiquidityScoreTests(unittest.TestCase):
             frame[f"{column}_source_date"] = index
         result = score_liquidity_frame(frame)
         pillar = result.pillars["market_distribution"]
-        self.assertIsNotNone(pillar.score)
+        self.assertIsNone(pillar.score)
+        self.assertIsNotNone(pillar.observation_score)
         self.assertGreater(pillar.coverage, 0.60)
         self.assertLess(pillar.maturity, 0.40)
         self.assertIn("样本成熟度", format_liquidity_summary(result))
@@ -351,7 +357,7 @@ class LiquiditySourceTests(unittest.TestCase):
         self.assertEqual(list(frame.index), [first, second])
         self.assertAlmostEqual(frame.loc[first, "vix_ratio_contango_pct"], 12.0)
         self.assertTrue(pd.isna(frame.loc[first, "vix_futures_contango_pct"]))
-        self.assertAlmostEqual(frame.loc[second, "vix_futures_contango_pct"], 4.85)
+        self.assertTrue(pd.isna(frame.loc[second, "vix_futures_contango_pct"]))
         self.assertTrue(pd.isna(frame.loc[second, "vix_ratio_contango_pct"]))
         self.assertEqual(frame.loc[second, "pct_20ma"], 61.0)
 
@@ -375,7 +381,7 @@ class LiquiditySourceTests(unittest.TestCase):
             {
                 "report_date": "2026-01-08", "metric": "vix_contango_pct",
                 "value": 4.5, "source_date": "2026-01-08",
-                "source_name": "macro_spot_daily",
+                "source_name": "macro_spot_daily:standard_monthly",
             },
             {
                 "report_date": "2026-01-09", "metric": "vix_contango_pct",

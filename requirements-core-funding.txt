@@ -1,0 +1,8 @@
+# Independent shadow module. Prefer a staging venv before changing production.
+pandas>=2.2,<3
+numpy>=1.26,<3
+requests>=2.31,<3
+matplotlib>=3.9,<4
+pandas_market_calendars>=4.4,<6
+yfinance>=0.2.54,<2
+supabase>=2,<3

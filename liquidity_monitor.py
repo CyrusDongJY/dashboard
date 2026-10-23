@@ -16,11 +16,12 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from vix_futures import validated_curve
 
 
 logger = logging.getLogger(__name__)
 
-CALC_VERSION = "liquidity_v2.3"
+CALC_VERSION = "liquidity_v3.0_fixed_native"
 SHADOW_MODE = True
 MIN_PILLAR_COVERAGE = 0.35
 MIN_COMPOSITE_COVERAGE = 0.50
@@ -39,8 +40,6 @@ FUNDING_STRESS_GUARDS = {
     "effr_iorb_bps": 5.0,
     "sofr_75_iorb_bps": 10.0,
     "sofr_dispersion_bps": 25.0,
-    "nfci": 0.25,
-    "move": 130.0,
 }
 CREDIT_STRESS_GUARDS = {"hy_spread": 5.0, "ig_spread": 1.5}
 
@@ -67,6 +66,7 @@ class ComponentSpec:
     min_obs: int = 30
     baseline_obs: int = 252
     freshness_tolerance: int = 3
+    frequency: str = "daily"
 
 
 COMPONENTS = [
@@ -74,23 +74,19 @@ COMPONENTS = [
     ComponentSpec("net_liq_level", "water_stock", "Net liquidity level",
                   "net_liq_b", 1.25, +1, min_obs=52, baseline_obs=156,
                   freshness_tolerance=8),
-    ComponentSpec("reserves_buffer", "water_stock", "Reserve buffer",
-                  "reserves_t", 1.10, +1, mode="reserves_buffer",
-                  min_obs=1, baseline_obs=1, freshness_tolerance=8),
+    ComponentSpec("reserves_buffer", "water_stock", "Reserves / bank assets",
+                  "reserve_ratio_pct", 1.10, +1,
+                  min_obs=52, baseline_obs=156, freshness_tolerance=15,
+                  frequency="weekly"),
     ComponentSpec("m2_growth", "water_stock", "M2 YoY growth",
                   "m2_yoy", 0.65, +1, min_obs=12, baseline_obs=36,
-                  freshness_tolerance=40),
+                  freshness_tolerance=45, frequency="monthly"),
 
     # Pulse: marginal additions/drains.
     ComponentSpec("net_liq_20d", "flow_pulse", "Net liquidity 20D change",
                   "net_liq_b", 1.25, +1, mode="change", window=20,
                   min_obs=40, baseline_obs=156, freshness_tolerance=8),
-    ComponentSpec("tga_5d", "flow_pulse", "TGA 5D change",
-                  "tga_b", 1.00, -1, mode="change", window=5,
-                  min_obs=40, baseline_obs=252, freshness_tolerance=3),
-    ComponentSpec("fed_assets_20d", "flow_pulse", "Fed assets 20D change",
-                  "fed_assets_b", 0.75, +1, mode="change", window=20,
-                  min_obs=40, baseline_obs=156, freshness_tolerance=8),
+    # TGA/Fed changes explain net liquidity; they do not receive another vote.
 
     # Pipes: raw SOFR is deliberately excluded. Only spreads/distribution count.
     ComponentSpec("sofr_iorb", "funding_health", "SOFR - IORB",
@@ -108,20 +104,14 @@ COMPONENTS = [
     ComponentSpec("sofr_dispersion", "funding_health", "SOFR 99th - median",
                   "sofr_dispersion_bps", 0.65, -1, min_obs=40,
                   freshness_tolerance=3),
-    ComponentSpec("nfci", "funding_health", "Chicago Fed NFCI",
-                  "nfci", 1.10, -1, min_obs=26, baseline_obs=104,
-                  freshness_tolerance=8),
-    ComponentSpec("move", "funding_health", "MOVE",
-                  "move", 0.55, -1, min_obs=60),
+    # NFCI and MOVE are external cross-checks, not additional funding weights.
 
     # Credit willingness and risk-asset transmission.
     ComponentSpec("hy_spread", "credit_transmission", "HY OAS",
                   "hy_spread", 1.20, -1, min_obs=60),
     ComponentSpec("ig_spread", "credit_transmission", "IG OAS",
                   "ig_spread", 0.80, -1, min_obs=60),
-    ComponentSpec("hyg_tlt_21d", "credit_transmission", "HYG/TLT 21D",
-                  "hyg_tlt_ratio", 0.85, +1, mode="pct_change", window=21,
-                  min_obs=60),
+    # HYG/TLT also embeds duration exposure; retain it only as context.
     # ETF shares from yfinance are retained as context only. They are not scored
     # until an issuer-grade daily shares source with a trustworthy as-of date is used.
 
@@ -139,7 +129,7 @@ COMPONENTS = [
 
     # Dealer/tail context. DIX and GEX remain context-only until direction is validated.
     ComponentSpec("vix_futures_curve", "tail_resilience",
-                  "VIX futures contango", "vix_futures_contango_pct",
+                  "VX standard monthly M1/M2", "vix_futures_contango_pct",
                   0.80, +1, min_obs=60),
     ComponentSpec("vix_spot_curve", "tail_resilience",
                   "VIX/VIX3M contango", "vix_ratio_contango_pct",
@@ -175,6 +165,7 @@ class PillarScore:
     score: Optional[float]
     coverage: float
     maturity: float = 0.0
+    observation_score: Optional[float] = None
 
 
 @dataclass
@@ -194,6 +185,8 @@ class LiquidityResult:
     shadow_mode: bool = SHADOW_MODE
     calc_version: str = CALC_VERSION
     persistence_status: str = "not_attempted"
+    observation_composite: Optional[float] = None
+    confidence: float = 0.0
 
     def to_row(self):
         pillar = lambda key: (
@@ -206,6 +199,13 @@ class LiquidityResult:
             "warnings": self.warnings,
             "context": self.context,
             "change_attribution": self.change_attribution,
+            "observation_composite": self.observation_composite,
+            "observation_comparable": False,
+            "confidence": self.confidence,
+            "weight_policy": "FIXED_BASKET_FULL_COVERAGE",
+            "pillar_weights": {k: v[2] / sum(p[2] for p in PILLARS.values())
+                               for k, v in PILLARS.items()},
+            "history_basis": "LATEST_VINTAGE_RECONSTRUCTION_NOT_ISSUED_PIT",
         }
         return {
             "report_date": self.report_date,
@@ -288,7 +288,7 @@ def _metric_daily_fallback_frame(rows: pd.DataFrame) -> pd.DataFrame:
         legacy_ratio_basis = False
         if metric == "vix_contango_pct":
             source = str(row.get("source_name") or "").strip().lower()
-            if source == "macro_spot_daily":
+            if source == "macro_spot_daily:standard_monthly":
                 target = "vix_futures_contango_pct"
             elif source.startswith("yfinance"):
                 target = "vix_ratio_contango_pct"
@@ -481,9 +481,10 @@ def build_database_frame(supabase, start_date: str,
             continue
         if extra.empty:
             continue
-        if table == "macro_spot_daily" and "vix_contango_pct" in extra:
-            extra = extra.rename(columns={
-                "vix_contango_pct": "vix_futures_contango_pct"})
+        if table == "macro_spot_daily":
+            extra["vix_futures_contango_pct"] = extra.apply(
+                lambda row: validated_curve(row)[1], axis=1)
+            extra = extra.drop(columns=["vix_contango_pct"], errors="ignore")
         union_index = frame.index.union(extra.index).sort_values()
         frame = frame.reindex(union_index)
         extra_source = (
@@ -498,10 +499,14 @@ def build_database_frame(supabase, start_date: str,
             else:
                 frame[column] = extra[column]
             source_col = f"{column}_source_date"
+            column_source = extra_source
+            if (column == "vix_futures_contango_pct"
+                    and "vix_curve_source_date" in extra):
+                column_source = pd.to_datetime(extra["vix_curve_source_date"], errors="coerce")
             if source_col in frame:
-                frame[source_col] = extra_source.combine_first(frame[source_col])
+                frame[source_col] = column_source.combine_first(frame[source_col])
             else:
-                frame[source_col] = extra_source
+                frame[source_col] = column_source
 
     try:
         metric_fallback = _metric_daily_fallback_frame(
@@ -536,8 +541,6 @@ def _lag_business_days(source_date, report_date) -> Optional[int]:
         return None
     start = pd.Timestamp(source_date).date()
     end = pd.Timestamp(report_date).date()
-    if start >= end:
-        return 0
     return int(np.busday_count(start, end))
 
 
@@ -548,18 +551,10 @@ def _percentile_rank(series: pd.Series) -> Optional[float]:
     if clean.nunique() <= 1:
         return 50.0
     current = clean.iloc[-1]
-    return float((clean <= current).mean() * 100)
-
-
-def _reserve_buffer_score(value: float) -> float:
-    # Monitoring bands, not calibrated policy thresholds.
-    if value >= 3.0:
-        return min(100.0, 80.0 + (value - 3.0) * 40.0)
-    if value >= 2.85:
-        return 55.0 + (value - 2.85) / 0.15 * 25.0
-    if value >= 2.65:
-        return 25.0 + (value - 2.65) / 0.20 * 30.0
-    return max(0.0, 25.0 - (2.65 - value) * 50.0)
+    prior = clean.iloc[:-1]
+    if prior.empty:
+        return None
+    return float(((prior < current).sum() + .5 * (prior == current).sum()) / len(prior) * 100)
 
 
 def _score_component(frame: pd.DataFrame, spec: ComponentSpec,
@@ -584,15 +579,31 @@ def _score_component(frame: pd.DataFrame, spec: ComponentSpec,
             valid_obs_count=0, required_obs_count=spec.min_obs,
         )
 
+    source_col = f"{spec.column}_source_date"
+    if source_col not in frame:
+        empty.note = "missing source date"
+        return empty
+    if spec.frequency in {"weekly", "monthly"}:
+        sources = pd.to_datetime(frame.loc[raw.index, source_col], errors="coerce")
+        samples = pd.DataFrame({"value": raw, "source": sources}).dropna()
+        samples = samples.loc[samples["source"] <= samples.index]
+        # One vote per native observation, independent of the number of held days.
+        raw = samples.drop_duplicates("source", keep="first")["value"]
+    if raw.empty:
+        empty.note = "no valid native observations"
+        return empty
     transformed = raw
     if spec.mode == "change":
-        transformed = raw.diff(spec.window)
+        prior = raw.reindex(raw.index - pd.offsets.BDay(spec.window))
+        prior.index = raw.index
+        transformed = raw - prior
     elif spec.mode == "pct_change":
-        transformed = raw.pct_change(spec.window, fill_method=None) * 100
+        prior = raw.reindex(raw.index - pd.offsets.BDay(spec.window))
+        prior.index = raw.index
+        transformed = (raw / prior.where(prior > 0) - 1) * 100
 
     transformed = transformed.replace([np.inf, -np.inf], np.nan).dropna()
-    source_col = f"{spec.column}_source_date"
-    if source_col in frame:
+    if spec.frequency in {"weekly", "monthly"}:
         aligned_sources = pd.to_datetime(
             frame.loc[transformed.index, source_col], errors="coerce")
         valid_count = int(aligned_sources.dropna().nunique())
@@ -612,23 +623,31 @@ def _score_component(frame: pd.DataFrame, spec: ComponentSpec,
             frame.loc[raw.index, source_col], errors="coerce").dropna()
         if not source_values.empty:
             source_date = source_values.iloc[-1]
-    lag = _lag_business_days(source_date, report_date)
+    freshness_date = source_date
+    if spec.frequency == "monthly" and source_date is not None:
+        freshness_date = pd.Timestamp(source_date).to_period("M").end_time.normalize()
+    lag = _lag_business_days(freshness_date, report_date)
     sample_factor = min(1.0, valid_count / max(1, spec.baseline_obs))
     freshness = 0.75 if lag is None else (
         0.85 ** max(0, lag - spec.freshness_tolerance))
     quality = float(np.clip(sample_factor * freshness, 0, 1))
 
+    if lag is None or lag < 0 or lag > spec.freshness_tolerance:
+        return ComponentScore(spec.key, spec.pillar, spec.label, None, 0.0,
+                              float(raw.iloc[-1]), None,
+                              str(pd.Timestamp(source_date).date()) if source_date is not None else None,
+                              lag, "stale or unknown source date", valid_count, spec.min_obs)
+    if transformed.empty or transformed.index[-1] != raw.index[-1]:
+        empty.note = "missing exact calendar window"
+        return empty
+
     raw_value = float(raw.iloc[-1])
-    if spec.mode == "reserves_buffer":
-        score = _reserve_buffer_score(raw_value)
-        signal_value = raw_value
-    else:
-        baseline = transformed.tail(max(252, spec.baseline_obs))
-        percentile = _percentile_rank(baseline)
-        if percentile is None:
-            return empty
-        score = percentile if spec.direction > 0 else 100.0 - percentile
-        signal_value = float(transformed.iloc[-1])
+    baseline = transformed.tail(spec.baseline_obs + 1)
+    percentile = _percentile_rank(baseline)
+    if percentile is None:
+        return empty
+    score = percentile if spec.direction > 0 else 100.0 - percentile
+    signal_value = float(transformed.iloc[-1])
 
     source_text = (
         pd.Timestamp(source_date).strftime("%Y-%m-%d")
@@ -785,40 +804,45 @@ def score_liquidity_frame(frame: pd.DataFrame,
             if component.score is None or component.quality <= 0:
                 continue
             nominal_available += spec.weight
-            effective = spec.weight * component.quality
-            available += effective
-            weighted += component.score * effective
+            available += spec.weight * component.quality
+            weighted += component.score * spec.weight
         coverage = nominal_available / total_weight if total_weight else 0.0
         maturity = available / nominal_available if nominal_available else 0.0
-        score = weighted / available if (
-            available and coverage >= MIN_PILLAR_COVERAGE) else None
+        observation = weighted / nominal_available if (
+            nominal_available and coverage >= MIN_PILLAR_COVERAGE) else None
+        score = weighted / total_weight if abs(coverage - 1.0) < 1e-9 else None
         pillars[key] = PillarScore(
             key, label, chart_label,
             round(score, 1) if score is not None else None,
             round(coverage, 3),
             round(maturity, 3),
+            round(observation, 1) if observation is not None else None,
         )
 
     total_pillar_weight = sum(value[2] for value in PILLARS.values())
     available_pillar_weight = 0.0
     composite_sum = 0.0
+    diagnostic_sum = diagnostic_weight = confidence = 0.0
     for key, (_label, _chart, weight) in PILLARS.items():
         pillar = pillars[key]
-        if pillar.score is None:
-            continue
-        effective = weight * pillar.coverage * pillar.maturity
-        available_pillar_weight += effective
-        composite_sum += pillar.score * effective
+        available_pillar_weight += weight * pillar.coverage
+        confidence += weight * pillar.coverage * pillar.maturity
+        if pillar.score is not None:
+            composite_sum += pillar.score * weight
+        if pillar.observation_score is not None:
+            diagnostic_sum += pillar.observation_score * weight * pillar.coverage
+            diagnostic_weight += weight * pillar.coverage
     coverage = available_pillar_weight / total_pillar_weight
-    composite = (composite_sum / available_pillar_weight
-                 if coverage >= MIN_COMPOSITE_COVERAGE and available_pillar_weight
+    composite = (composite_sum / total_pillar_weight
+                 if all(p.score is not None for p in pillars.values())
                  else None)
+    observation = diagnostic_sum / diagnostic_weight if diagnostic_weight and coverage >= MIN_COMPOSITE_COVERAGE else None
 
     context_columns = (
         "rrp_b", "tga_b", "reserves_t", "sofr_rate", "sofr_volume_b",
         "dix_pct", "gex_billions", "sofr_iorb_bps", "tgcr_iorb_bps",
         "effr_iorb_bps", "sofr_75_iorb_bps", "sofr_dispersion_bps",
-        "nfci", "move", "hy_spread", "ig_spread",
+        "nfci", "move", "hy_spread", "ig_spread", "reserve_ratio_pct", "hyg_tlt_ratio",
     )
     context = {
         key: _latest_value(frame, key, as_of) for key in context_columns
@@ -828,6 +852,8 @@ def score_liquidity_frame(frame: pd.DataFrame,
         "20d": _net_liquidity_attribution(frame, as_of, 20),
     }
     state, detail = _classify(pillars, coverage, context)
+    if composite is None:
+        state, detail = "数据不足", "固定篮子未齐备；降级观察值不具跨日可比性，不作正式状态判断"
     eligible = [
         component for component in components
         if component.score is not None and component.quality >= 0.35
@@ -848,8 +874,9 @@ def score_liquidity_frame(frame: pd.DataFrame,
     warnings = []
     if context["rrp_b"] is not None and context["rrp_b"] < 50:
         warnings.append("RRP缓冲接近耗尽，TGA与国债结算冲击将更直接")
-    if context["reserves_t"] is not None and context["reserves_t"] < 2.85:
-        warnings.append("准备金进入黄色敏感区，需联合观察回购利差")
+    reserve = next(item for item in components if item.key == "reserves_buffer")
+    if reserve.score is not None and reserve.score < 25:
+        warnings.append("准备金/银行资产处于历史低分位，需联合观察回购利差；不是绝对危机阈值")
     tga_change = _business_day_change(frame, "tga_b", as_of, 5)
     if tga_change is not None and tga_change >= 100:
         warnings.append("TGA五个工作日增加超过1000亿美元")
@@ -880,6 +907,8 @@ def score_liquidity_frame(frame: pd.DataFrame,
         warnings=warnings,
         context=context,
         change_attribution=change_attribution,
+        observation_composite=round(observation, 1) if observation is not None else None,
+        confidence=round(confidence / total_pillar_weight, 3),
     )
 
 
@@ -891,20 +920,30 @@ def compute_liquidity_monitor(supabase, report_date: str,
     frame = merge_official_frame(database, official_frame)
     result = score_liquidity_frame(frame, report_date)
     if persist:
-        from market_utils import log_data_quality, safe_upsert
-        result.persistence_status = "ok"
-        write_result = safe_upsert(
-            supabase, "liquidity_daily", result.to_row(),
-            conflict_cols="report_date",
-        )
-        if write_result is None:
+        from market_utils import log_data_quality
+        try:
+            row = result.to_row()
+            # Insert-once protects issued snapshots and older calculation versions,
+            # including concurrent retries. The legacy table key is report_date.
+            supabase.table("liquidity_daily").upsert(
+                row, on_conflict="report_date", ignore_duplicates=True).execute()
+            saved = (supabase.table("liquidity_daily").select("calc_version,details")
+                     .eq("report_date", report_date).limit(1).execute()).data
+            if not saved:
+                raise RuntimeError("Snapshot readback missing")
+            same = saved[0].get("calc_version") == CALC_VERSION and saved[0].get("details") == row["details"]
+            result.persistence_status = "ok" if same else "existing_snapshot_preserved"
+            if not same:
+                result.warnings.append("该日已有发布快照，保留原记录；本次重算未覆盖历史")
+        except Exception as exc:
+            logger.warning("Liquidity snapshot persistence failed (%s)", type(exc).__name__)
             result.persistence_status = "failed"
             result.warnings.append("流动性水位计算完成，但liquidity_daily写入失败")
         log_data_quality(
             supabase, job_name="liquidity_monitor",
             table_name="liquidity_daily",
-            status="ok" if write_result is not None else "failed",
-            rows_written=1 if write_result is not None else 0,
+            status="failed" if result.persistence_status == "failed" else "ok",
+            rows_written=1 if result.persistence_status == "ok" else 0,
             notes=f"state={result.state}; coverage={result.coverage:.1%}",
         )
     else:
@@ -921,8 +960,12 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
         "综合流动性水位："
         f"{result.composite if result.composite is not None else '数据不足'}",
         f"有效覆盖：{result.coverage:.0%}",
+        f"样本置信度：{result.confidence:.0%} | 权重：固定篮子，不随成熟度改变",
+        f"计算版本：{result.calc_version}（不可与旧版本直接拼接）",
         f"落库状态：{result.persistence_status}",
     ]
+    if result.composite is None and result.observation_composite is not None:
+        lines.append(f"降级观察值：{result.observation_composite:.1f}（仅供分项检查，不作跨日趋势比较）")
     for key in PILLARS:
         pillar = result.pillars.get(key)
         if not pillar or pillar.score is None:
@@ -931,7 +974,7 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
                 if component.pillar == key and component.score is None
             ]
             diagnostic = "；".join(
-                f"{item.label} {item.valid_obs_count}/{item.required_obs_count}"
+                f"{item.label} {item.valid_obs_count}/{item.required_obs_count} [{item.note}]"
                 for item in blockers[:4]
             )
             coverage = pillar.coverage if pillar else 0.0
@@ -964,5 +1007,5 @@ def format_liquidity_summary(result: LiquidityResult) -> str:
             lines.append(f"{label}净流动性变化归因：数据不足或分项与总量不一致")
     if result.warnings:
         lines.append("结构提示：" + "；".join(result.warnings))
-    lines.append("注：DIX/FINRA/GEX仅展示上下文，方向未经验证，不直接计分。")
+    lines.append("注：NFCI/MOVE/HYG-TLT与TGA、Fed分项只作外部核验或归因，不重复计分；DIX/FINRA/GEX不计分。")
     return "\n".join(lines)

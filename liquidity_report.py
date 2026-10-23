@@ -73,7 +73,7 @@ def _warning_en(warning):
 
 
 def build_liquidity_history(frame: pd.DataFrame, lookback_days: int = 126):
-    """Recompute trailing states without look-ahead for the trend panel."""
+    """Latest-vintage reconstruction, not historical point-in-time issued values."""
     if frame.empty:
         return pd.DataFrame()
     dates = pd.DatetimeIndex(frame.index).drop_duplicates().sort_values()
@@ -92,6 +92,7 @@ def build_liquidity_history(frame: pd.DataFrame, lookback_days: int = 126):
                 if result.pillars.get("flow_pulse") else None
             ),
             "coverage": result.coverage,
+            "calc_version": result.calc_version,
         })
     return pd.DataFrame(rows)
 
@@ -105,6 +106,9 @@ def generate_liquidity_chart(result: LiquidityResult,
     import matplotlib.pyplot as plt
 
     history = history if history is not None else pd.DataFrame()
+    if not history.empty:
+        history = (history.loc[history["calc_version"] == result.calc_version]
+                   if "calc_version" in history else pd.DataFrame())
     fig = plt.figure(figsize=(14, 9), facecolor="white")
     grid = fig.add_gridspec(
         3, 4, height_ratios=[0.92, 1.45, 1.05],
@@ -117,7 +121,7 @@ def generate_liquidity_chart(result: LiquidityResult,
     fig.text(
         0.055, 0.925,
         f"{result.report_date}  |  影子观察  |  {result.calc_version}  |  "
-        "分数越高，流动性支持越强（与压力图方向相反）",
+        "固定权重；最新版本数据重建，非当时可得历史；越高支持越强",
         fontsize=9.5, color=COLORS["muted"],
     )
 
@@ -282,7 +286,7 @@ def generate_liquidity_chart(result: LiquidityResult,
     ax_trend.axhspan(0, 35, color=COLORS["bad"], alpha=0.05)
     ax_trend.axhline(50, color=COLORS["line"], linewidth=0.9, linestyle="--")
     ax_trend.set_ylim(0, 100)
-    ax_trend.set_title("历史水位（按各日可用数据重算）", loc="left",
+    ax_trend.set_title("历史水位（最新数据回溯重算，非当时已发布值）", loc="left",
                        fontsize=11, fontweight="bold")
     ax_trend.grid(alpha=0.15)
     ax_trend.tick_params(labelsize=8, colors=COLORS["muted"])
