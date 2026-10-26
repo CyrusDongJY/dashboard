@@ -151,6 +151,26 @@ def test_manual_edition_does_not_claim_morning_cutoff():
     assert '&lt;真实补数&gt;' in html
 
 
+def test_single_temporal_observation_has_visible_marker_and_label(monkeypatch):
+    from matplotlib.axes import Axes
+    from liquidity_digest.render import chart_images
+    original = Axes.plot
+    calls = []
+
+    def record(self, *args, **kwargs):
+        calls.append(kwargs)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, 'plot', record)
+    report = sample_report(P)
+    for key in report['temporal']:
+        report['temporal'][key] = report['temporal'][key][-1:]
+    images = chart_images(report)
+    singles = [c for c in calls if '单点，趋势待积累' in c.get('label', '')]
+    assert len(images) == 3 and len(singles) == 4
+    assert all(c['marker'] == 'o' and c['markersize'] >= 4 and c['clip_on'] is False for c in singles)
+
+
 def test_vx_repair_is_narrow_idempotent_and_dst_aware():
     path = Path(__file__).parents[1] / 'deploy/liquidity-digest/repair_vx_request.py'
     spec = importlib.util.spec_from_file_location('vx_repair', path)

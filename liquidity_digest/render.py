@@ -239,8 +239,11 @@ def chart_images(report):
         else:
             grid = native_sessions(key, start, report["market_date"]) if key else day_grid
         if values:
+            single = sum(finite(values.get(d)) is not None for d in grid) == 1
             ax.plot([date.fromisoformat(d) for d in grid], [values.get(d, np.nan) for d in grid],
-                    label=label, color=color, linewidth=1.4)
+                    label=label + "（单点，趋势待积累）" if single and not label.startswith("_") else label,
+                    color=color, linewidth=1.4, marker="o" if single else ".",
+                    markersize=4 if single else 1.5, clip_on=not single)
 
     def finish(fig, axes):
         for ax in axes:
@@ -587,7 +590,7 @@ def render_pdf(report, path, images=None, front_images=None):
     gap_text = "、".join(report["gaps"]) or "无已识别缺口"
     if report.get("correction"):
         y = paragraph("本次核查更新：" + report["correction"]["note"] + "。原定时报告保留不动。", y, 8)
-    y = paragraph("待更新或需核查：" + gap_text + "。", y, 8, "#8c3944")
+    y = paragraph("原始指标日期/覆盖缺口：" + gap_text + "；不包含同版历史不足与补充来源不可用，详见首页及配置持仓页。", y, 8, "#8c3944")
     y = paragraph("数据来源：纽约联储参考利率、FRED各原始序列、美国财政部DTS及现有系统收盘表。"
                   "逐项抓取时间、源名称、原始序列、规则版本与缺口原因见随日报保存的JSON。"
                   "定时报告09:15之后发布的信息不回填原邮件；核查更新版以页首独立截止时间为准。", y, 8)

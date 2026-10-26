@@ -155,7 +155,7 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 <p>{text(disagreement(report))}</p></div></section>
 <section id="evidence" class="band"><h2>分类数据与观测日期</h2>
 {"".join(f"<p>{text(line)}</p>" for line in summary_lines(report))}
-{"".join(data)}<p class="warning">待更新或需核查：{text(gaps)}。缺失及过期数据不参与状态确认。</p>
+{"".join(data)}<p class="warning">原始指标日期/覆盖缺口：{text(gaps)}；不包含同版历史不足与补充来源不可用，详见首页及配置持仓板块。缺失及过期数据不参与状态确认。</p>
 <p class="notice">错期参考：{text("；".join(report.get("publication_lags", [])) or "无")}。不冒充昨日同步数据。</p></section>
 <section id="trends" class="band"><h2>趋势与证据 / 近150个自然日</h2>{"".join(charts)}
 <p>{text(funding_line)}</p>{"".join(market_states)}<h3>优先查阅</h3>
