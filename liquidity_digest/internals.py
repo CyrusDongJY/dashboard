@@ -1,12 +1,13 @@
 """Descriptive market internals, with no additional score or alert vote."""
 from datetime import date, timedelta
+from hashlib import sha256
 
 from market_internals import (OBSERVATION_VERSION, RECONSTRUCTION_VERSION, PERIODS,
                               SECTORS, eod_time, reconstruct_sectors, reuse_verified_prices)
 from .model import NY, finite, sessions, stamp
 
 
-VERSION = "market_internals_v1.1-shadow"
+VERSION = "market_internals_v1.2-cohort-shadow"
 # Display heuristics, not calibrated predictors. Keep them versioned and explicit.
 RULES = {"broad_share_pct": 65, "cross_sector_count": 8, "concentration_gap_pp": .5,
          "rotation_excess_pp": .5, "trend_noise_pp": 1.0, "minimum_coverage": .9}
@@ -32,6 +33,7 @@ def _breadth(observation, day, cutoff):
               "advancing": None, "declining": None, "unchanged": None,
               "advancing_pct": None, "declining_pct": None, "unchanged_pct": None,
               "source_date": None, "captured_at": None, "coverage": None}
+    result["ma20_sample_signature"] = None
     if not _observed(observation, day, cutoff):
         return result
     if (observation.get("date_basis") != "CAPTURE_SESSION"
@@ -59,6 +61,12 @@ def _breadth(observation, day, cutoff):
         state, label = "MIXED", "涨跌分化（样本）"
     result.update(state=state, label=label, quality="OK",
                   reason="涨跌占比以有效价格样本为分母，包含平盘；与旧pct_adv口径不拼接。")
+    members = sorted(r["symbol"] for r in observation.get("constituents", [])
+                     if isinstance(r, dict) and isinstance(r.get("symbol"), str)
+                     and finite(r.get("close")) is not None and r["close"] > 0
+                     and finite(r.get("sma20")) is not None and r["sma20"] > 0)
+    if len(members) >= 450 and len(set(members)) == len(members):
+        result["ma20_sample_signature"] = sha256("|".join(members).encode()).hexdigest()
     return result
 
 
@@ -268,7 +276,19 @@ def build_internals(report_plan, capture, metrics):
     breadth = breadth_history.get(end) or _breadth(None, end, cutoff)
     sectors = sector_history.get(end) or _sectors(None, end, cutoff)
     leadership = _leadership(breadth, sectors)
-    persistence, ma_history = _persistence(metrics.get("pct_20ma", {}), grid)
+    metric = dict(metrics.get("pct_20ma", {}))
+    signature = breadth.get("ma20_sample_signature")
+    comparable = set()
+    for day in reversed(grid):
+        if not signature or breadth_history.get(day, {}).get("ma20_sample_signature") != signature:
+            break
+        comparable.add(day)
+    metric["history"] = [r for r in metric.get("history", []) if r["date"] in comparable]
+    persistence, ma_history = _persistence(metric, grid)
+    persistence["comparable_sample_days"] = len(comparable)
+    persistence["sample_signature"] = signature
+    if persistence["state"] == "UNKNOWN":
+        persistence["reason"] += f" 同一有效股票样本连续快照 {len(comparable)} 日；样本变化或未知时不确认连续趋势。"
     rotation = _rotation(sector_history, grid)
     interpretation = "参与广度与行业方向需分开观察；行业相对强弱不能解释为净资金流。"
     if breadth["state"] == "UNKNOWN" or leadership["state"] == "UNKNOWN":

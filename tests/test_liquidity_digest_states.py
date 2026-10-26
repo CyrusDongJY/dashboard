@@ -184,7 +184,7 @@ def test_assembly_does_not_join_different_underlying_score_versions(report):
     assert full["states"]["pressure"]["direction"] == "UNKNOWN"
 
 
-def test_multiple_warning_pdf_preserves_three_page_layout(tmp_path):
+def test_multiple_warning_pdf_preserves_five_page_layout(tmp_path):
     from pypdf import PdfReader
     from liquidity_digest.render import render_pdf
     from liquidity_digest.sample import sample_report
@@ -195,10 +195,12 @@ def test_multiple_warning_pdf_preserves_three_page_layout(tmp_path):
     full["states"] = build_states(full)
     from liquidity_digest.domains import build_domains
     full["domains"] = build_domains(full)
+    from liquidity_digest.frontpage import build_frontpage
+    full["frontpage"] = build_frontpage(full, {})
     path = tmp_path / "warnings.pdf"
     render_pdf(full, path)
     reader = PdfReader(path)
-    assert len(reader.pages) == 3
+    assert len(reader.pages) == 5
     assert "单日突变" in reader.pages[0].extract_text()
     assert "证据不足" in reader.pages[0].extract_text()
-    assert "方向待确认" in reader.pages[2].extract_text()
+    assert "方向待确认" in reader.pages[4].extract_text()

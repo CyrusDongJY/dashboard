@@ -111,6 +111,8 @@ def main():
     run([python, "-m", "pytest", "-q", "tests/test_liquidity_digest.py",
          "tests/test_liquidity_digest_states.py", "tests/test_liquidity_digest_domains.py",
          "tests/test_liquidity_digest_html.py", "tests/test_liquidity_digest_availability.py",
+         "tests/test_liquidity_digest_frontpage.py",
+         "tests/test_capital_observations.py",
          "tests/test_market_internals.py", "tests/test_liquidity_digest_internals.py",
          "tests/test_sector_backfill.py"],
         cwd=release, env={**os.environ, "MPLCONFIGDIR": str(backup / "test_matplotlib"),

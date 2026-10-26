@@ -6,6 +6,7 @@ import pandas as pd
 
 from environment_indices import (
     HISTORY_CALENDAR_DAYS,
+    CORE_INDEX_KEYS,
     INDEX_DEFS,
     MIN_INDEX_COVERAGE,
     MIN_INDEX_MATURITY,
@@ -22,7 +23,7 @@ def _fetch_metric_rows(supabase, start_date, end_date, session="EOD", page_size=
     while True:
         result = (supabase.table("metric_daily")
                   .select("report_date,metric,scope,value,percentile,sample_len,"
-                          "effective_obs_count,source_date,source_name,lag_days")
+                          "effective_obs_count,source_date,source_name,lag_days,calc_version")
                   .eq("session", session)
                   .neq("scope", "COMPOSITE")
                   .gte("report_date", start_date)
@@ -52,9 +53,11 @@ def build_history(df, repair_latest=False):
             record[f"{key}_coverage"] = coverage[key]
             record[f"{key}_maturity"] = maturity[key]
             record[f"{key}_components"] = ",".join(
-                item["metric"] for item in diagnostics[key] if item["status"] == "OK")
+                item["metric"] + ":" + "/".join(item.get("members", [])) + ":" +
+                "/".join(item.get("source_identity", []))
+                for item in diagnostics[key] if item["status"] == "OK")
         record["composite_components"] = ",".join(
-            key for key in INDEX_DEFS
+            record[f"{key}_components"] for key in CORE_INDEX_KEYS
             if scores[key] is not None and coverage[key] >= MIN_INDEX_COVERAGE
             and maturity[key] >= MIN_INDEX_MATURITY)
         record["composite"] = composite_score(
@@ -107,7 +110,7 @@ def generate_environment_chart(supabase, report_date, lookback_days=252, output_
         "idx_breadth_decay": "市场广度衰退",
         "idx_options_fragility": "期权脆弱性代理（需结合分量覆盖）",
         "idx_flow_behavior": "资金行为代理（非直接资金流量）",
-        "composite": "综合压力（仅纳入覆盖及成熟度达标的面板）",
+        "composite": "综合压力（风险、信用、广度固定等权）",
     }
     if history.iloc[-1].get("idx_flow_behavior_components") == "tqqq_drag_pct":
         labels["idx_flow_behavior"] = "资金行为代理（当前仅TQQQ损耗）"

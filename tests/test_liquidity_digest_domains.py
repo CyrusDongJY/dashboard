@@ -199,8 +199,20 @@ def test_pdf_retains_tactical_and_distinguishes_three_layers(report, tmp_path):
     path = tmp_path / "domains.pdf"
     render_pdf(report, path)
     pages = PdfReader(path).pages
-    assert len(pages) == 3
+    assert len(pages) == 5
+    first = pages[0].extract_text()
+    assert first.index("宏观资金与融资") < first.index("盘后跨资产战术压力观察")
+    assert first.index("微观市场承接") < first.index("盘后跨资产战术压力观察")
     text = "\n".join(page.extract_text() for page in pages)
     for label in ("宏观资金与融资", "微观市场承接", "跨资产确认", "非纯微观",
                   "边际趋松", "内部压力增加", "综合流动性支持", "非纯宏观"):
         assert label in text
+
+
+def test_mail_overview_immediately_precedes_tactical_without_duplicate_panel(report):
+    from io import BytesIO
+    for content in (email_html(report, front_images=[BytesIO(b"png") for _ in range(2)]), email_text(report)):
+        assert content.index("宏观资金与融资") < content.index("盘后跨资产战术压力观察")
+        assert content.index("微观市场承接") < content.index("盘后跨资产战术压力观察")
+        assert content.count("宏观资金与融资") == 1
+        assert content.count("微观市场承接") == 1

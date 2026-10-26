@@ -301,18 +301,22 @@ def test_build_does_not_request_network(tmp_path, p, monkeypatch):
 
 
 @pytest.mark.parametrize("empty", [False, True])
-def test_pdf_three_pages_chinese_and_no_overflow(tmp_path, p, empty):
+def test_pdf_five_pages_chinese_and_no_overflow(tmp_path, p, empty):
     from pypdf import PdfReader
     report = assemble(p, {}) if empty else sample_report(p)
     path = tmp_path / "report.pdf"
     render_pdf(report, path)
     reader = PdfReader(path)
-    assert len(reader.pages) == 3
+    assert len(reader.pages) == 5
     assert "盘后跨资产战术压力观察" in reader.pages[0].extract_text()
-    assert "市场内部结构" in reader.pages[1].extract_text()
-    assert "影子阈值" in reader.pages[1].extract_text()
-    assert "信用" in reader.pages[2].extract_text()
-    assert len(reader.pages[2]["/Resources"]["/XObject"]) == 3
+    assert "核心资金指数" in reader.pages[0].extract_text()
+    # ReportLab deduplicates the identical two missing-data PNGs.
+    assert len(reader.pages[0]["/Resources"]["/XObject"]) == (1 if empty else 2)
+    assert "市场内部结构" in reader.pages[2].extract_text()
+    assert "影子阈值" in reader.pages[2].extract_text()
+    assert "资金配置、持仓与杠杆" in reader.pages[3].extract_text()
+    assert "信用" in reader.pages[4].extract_text()
+    assert len(reader.pages[4]["/Resources"]["/XObject"]) == 3
     assert any("/FontFile2" in font.get_object()["/FontDescriptor"].get_object()
                for font in reader.pages[0]["/Resources"]["/Font"].values()
                if "/FontDescriptor" in font.get_object())

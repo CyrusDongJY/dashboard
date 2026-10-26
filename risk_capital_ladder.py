@@ -23,7 +23,7 @@ LAYER_MEMBERS = {
     "extreme": ("COIN", "MSTR"),
 }
 LAYER_LABELS = {
-    "institutional": "第一层：机构/高Beta成长",
+    "institutional": "第一层：高Beta成长（非机构持仓）",
     "speculative": "第二层：投机扩散",
     "extreme": "第三层：加密/反身性极端风险",
 }
@@ -44,7 +44,7 @@ STATE_LABELS = {
     "SPECULATIVE_BLOWOFF": "末端投机升温",
     "MEGACAP_CONCENTRATION": "指数上涨但风险资本收缩",
     "EDGE_CONTRACTION": "风险从边缘资产撤退",
-    "ACTIVE_DELEVERAGING": "放量去杠杆",
+    "ACTIVE_DELEVERAGING": "放量收缩（去杠杆待确认）",
     "CONTRACTION": "风险偏好收缩",
     "MIXED": "扩散结构混合",
     "UNAVAILABLE": "数据不足",
@@ -285,6 +285,7 @@ def aggregate_risk_capital(member_rows, benchmark, report_date):
         layer_details[layer] = {
             "label": LAYER_LABELS[layer],
             "eligible_count": len(rows),
+            "eligible_members": sorted(row["ticker"] for row in rows),
             "member_count": len(members),
             "coverage": round(len(rows) / len(members), 4),
             "score": round(float(np.mean(scores)), 1) if scores else None,
@@ -300,6 +301,12 @@ def aggregate_risk_capital(member_rows, benchmark, report_date):
                                      if row.get("active_direction") == "DELEVERAGING"],
         }
 
+    layer_details["_meta"] = {
+        "comparison_signature": CALC_VERSION + ":" + ",".join(
+            sorted(row["ticker"] for row in eligible)),
+        "universe": list(ALL_MEMBERS),
+        "evidence_type": "PRICE_VOLUME_PROXY_NOT_FUND_FLOW",
+    }
     coverage = len(eligible) / len(ALL_MEMBERS)
     ready = (
         len(eligible) >= 7 and
@@ -308,7 +315,7 @@ def aggregate_risk_capital(member_rows, benchmark, report_date):
     )
     layer_scores = {
         layer: _finite(detail.get("score"))
-        for layer, detail in layer_details.items()
+        for layer, detail in layer_details.items() if layer in LAYER_MEMBERS
     }
     score = (round(float(np.mean(list(layer_scores.values()))), 1)
              if ready and all(value is not None for value in layer_scores.values())
@@ -351,14 +358,14 @@ def aggregate_risk_capital(member_rows, benchmark, report_date):
         elif (extreme >= 75 and institutional < 50 and
               len(layer_details["extreme"]["active_risk_on"]) >= 2):
             state = "SPECULATIVE_BLOWOFF"
-            state_detail = "极端风险层两只成分均放量走强，但机构成长层未同步确认"
+            state_detail = "极端风险层两只成分均放量走强，但高Beta成长层未同步确认"
         elif (all(value >= 60 for value in layer_scores.values()) and
               positive_5d is not None and positive_5d >= 0.625):
             state = "BROAD_EXPANSION"
             state_detail = "三层风险资本同时扩散，且多数成分5日绝对收益为正"
         elif extreme < 40 and speculative < 50 and institutional >= 50:
             state = "EDGE_CONTRACTION"
-            state_detail = "机构层尚可，但投机与极端风险层已先行撤退"
+            state_detail = "高Beta成长层尚可，但投机与极端风险层已先行撤退"
         elif (negative_layers >= 2 or
               (relative_5d is not None and relative_5d <= 0.375)):
             state = "CONTRACTION"

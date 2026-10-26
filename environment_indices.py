@@ -2,9 +2,10 @@
 """环境指数影子模型。
 
 指数仅用于观察和回测，不进入 ALERT_GATE，也不产生交易指令。每个分量按
-有效样本数与数据滞后加权；覆盖不足时明确返回“数据不足”，绝不默认健康。
+固定权重合成；质量仅决定资格，不改变权重。缺项时只保留分项诊断。
 """
 from datetime import datetime, timezone
+import math
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,8 @@ import pandas as pd
 from anomaly_engine import BASELINE, METRIC_REGISTRY, RESONANCE_THEMES
 
 SHADOW_MODE = True
-ENV_CALC_VERSION = "env_v2.4"
+ENV_CALC_VERSION = "env_v2.5-fixed"
+CORE_INDEX_KEYS = ("idx_risk_pressure", "idx_liquidity_stress", "idx_breadth_decay")
 MIN_EFFECTIVE_OBS = 60
 MIN_INDEX_COVERAGE = 0.50
 MIN_STATE_COVERAGE = 0.65
@@ -21,6 +23,7 @@ MIN_STATE_MATURITY = 0.50
 HISTORY_CALENDAR_DAYS = 1200
 OPTION_COMPONENTS = {"ivr_pct", "expected_move_pct", "short_gamma_m"}
 MAX_OPTION_LAG_DAYS = 1
+OPTION_UNIVERSE = ("SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "ORCL")
 
 
 def _stale_option(row):
@@ -105,10 +108,13 @@ def _quality_weight(row):
         return 0.0
     if n < MIN_EFFECTIVE_OBS:
         return 0.0
-    try:
-        lag = max(0, int(row.get("lag_days") or 0))
-    except (TypeError, ValueError):
-        lag = 0
+    source = pd.to_datetime(row.get("source_date"), errors="coerce", utc=True)
+    report = pd.to_datetime(row.get("report_date"), errors="coerce", utc=True)
+    lag = pd.to_numeric(row.get("lag_days"), errors="coerce")
+    max_lag = 8 if row.get("metric") == "nfci" else 3 if row.get("metric") == "credit_spread" else 1
+    if (pd.isna(source) or pd.isna(report) or source > report or pd.isna(lag)
+            or not np.isfinite(lag) or lag < 0 or lag > max_lag or lag != int(lag)):
+        return 0.0
     sample_factor = min(1.0, n / BASELINE)
     freshness_factor = 0.85 ** lag
     return float(sample_factor * freshness_factor)
@@ -134,7 +140,7 @@ def _fetch_history(supabase, report_date, session="EOD", page_size=1000):
     while True:
         result = (supabase.table("metric_daily")
                   .select("report_date,metric,scope,value,percentile,sample_len,"
-                          "effective_obs_count,source_date,source_name,lag_days")
+                          "effective_obs_count,source_date,source_name,lag_days,calc_version")
                   .eq("session", session)
                   .neq("scope", "COMPOSITE")
                   .in_("metric", metrics)
@@ -173,6 +179,9 @@ def rebuild_latest_statistics(history, report_date):
             (frame.get("scope") == row.get("scope")) &
             (report_dates <= report_ts)
         ].copy()
+        for field in ("source_name", "calc_version"):
+            if field in frame and pd.notna(row.get(field)):
+                same_series = same_series[same_series[field] == row.get(field)]
         if same_series.empty or "source_date" not in same_series:
             continue
         same_series["_native_date"] = pd.to_datetime(
@@ -232,7 +241,8 @@ def classify_state(idx, coverage, resonance_hits=0, fake_reversal_present=False,
     key_cov = [coverage.get(k, 0.0) for k in
                ("idx_risk_pressure", "idx_liquidity_stress", "idx_breadth_decay")]
     overall = float(np.mean(key_cov)) if key_cov else 0.0
-    if overall < MIN_STATE_COVERAGE or min(key_cov) < MIN_INDEX_COVERAGE:
+    if (any(idx.get(key) is None for key in CORE_INDEX_KEYS)
+            or overall < MIN_STATE_COVERAGE or min(key_cov) < MIN_INDEX_COVERAGE):
         return "数据不足", "核心维度覆盖不足，继续积累；本日不作环境分类"
     if maturity is not None:
         key_maturity = [maturity.get(k, 0.0) for k in
@@ -266,7 +276,7 @@ def classify_state(idx, coverage, resonance_hits=0, fake_reversal_present=False,
 def _component_rows(df, metric, scope):
     rows = df[df["metric"] == metric]
     if scope == "STOCK_ANY":
-        rows = rows[~rows["scope"].isin(["MACRO", "COMPOSITE"])]
+        rows = rows[rows["scope"].isin(OPTION_UNIVERSE)]
     else:
         rows = rows[rows["scope"] == (scope or "MACRO")]
     return rows
@@ -294,7 +304,9 @@ def _component_observations(df, metric, scope):
                 "quality": quality,
                 "effective_obs_count": _sample_count(row),
                 "lag_days": row.get("lag_days"),
-                "stale": _stale_option(row),
+                "stale": _stale_option(row) or (quality == 0 and _sample_count(row) >= MIN_EFFECTIVE_OBS),
+                "scope": str(row.get("scope")),
+                "source_name": row.get("source_name") or "UNKNOWN",
             })
     return observations
 
@@ -315,7 +327,8 @@ def score_frame_details(df):
                 component_diagnostics.append({
                     "metric": metric,
                     "scope": scope or "MACRO",
-                    "status": ("MISSING_COMPONENT" if rows.empty else
+                    "status": ("DIRECTION_UNDEFINED" if METRIC_REGISTRY.get(metric, {}).get("bad_dir") == 0 else
+                               "MISSING_COMPONENT" if rows.empty else
                                "STALE_COMPONENT" if all(
                                    _stale_option(row) for _, row in rows.iterrows())
                                else "MISSING_PERCENTILE"),
@@ -339,29 +352,36 @@ def score_frame_details(df):
                     "quality": 0.0,
                 })
                 continue
-            danger = float(np.average(
-                [item["danger"] for item in eligible],
-                weights=[item["quality"] for item in eligible]))
+            danger = float(np.mean([item["danger"] for item in eligible]))
             quality = float(np.mean([item["quality"] for item in eligible]))
             effective_weight = base_weight * quality
-            weighted_sum += danger * effective_weight
-            eligible_weight += base_weight
-            quality_weight += effective_weight
+            weighted_sum += danger * base_weight
+            members_complete = (scope != "STOCK_ANY" or
+                                {item["scope"] for item in eligible} == set(OPTION_UNIVERSE))
+            if members_complete:
+                eligible_weight += base_weight
+            if members_complete:
+                quality_weight += effective_weight
             component_diagnostics.append({
                 "metric": metric,
                 "scope": scope or "MACRO",
-                "status": "OK",
+                "status": "OK" if members_complete else "INCOMPLETE_UNIVERSE",
                 "effective_obs_count": max(
                     item["effective_obs_count"] for item in eligible),
                 "required_obs_count": MIN_EFFECTIVE_OBS,
                 "quality": round(quality, 3),
                 "observation_count": len(eligible),
+                "members": sorted(item["scope"] for item in eligible),
+                "diagnostic_value": round(danger, 1),
+                "fixed_weight": base_weight,
+                "source_identity": sorted(set(str(item["source_name"]) for item in eligible)),
+                "required_members": list(OPTION_UNIVERSE) if scope == "STOCK_ANY" else [scope or "MACRO"],
             })
         coverage[idx_key] = round(eligible_weight / total_weight, 3) if total_weight else 0.0
         maturity[idx_key] = (round(quality_weight / eligible_weight, 3)
                              if eligible_weight else 0.0)
-        result[idx_key] = (round(weighted_sum / quality_weight, 1)
-                           if quality_weight else None)
+        result[idx_key] = (round(weighted_sum / total_weight, 1)
+                           if math.isclose(eligible_weight, total_weight, abs_tol=1e-10) else None)
         diagnostics[idx_key] = component_diagnostics
     return result, coverage, maturity, diagnostics
 
@@ -373,17 +393,11 @@ def score_frame(df):
 
 
 def composite_score(scores, coverage, maturity=None):
-    eligible_keys = [key for key in INDEX_DEFS
-                     if scores.get(key) is not None and
-                     coverage.get(key, 0) >= MIN_INDEX_COVERAGE and
-                     (maturity is None or
-                      maturity.get(key, 0) >= MIN_INDEX_MATURITY)]
-    if not eligible_keys:
+    if any(scores.get(key) is None or coverage.get(key, 0) < 1
+           or (maturity is not None and maturity.get(key, 0) < MIN_INDEX_MATURITY)
+           for key in CORE_INDEX_KEYS):
         return None
-    return round(float(np.average(
-        [scores[key] for key in eligible_keys],
-        weights=[coverage[key] * (maturity.get(key, 1.0) if maturity else 1.0)
-                 for key in eligible_keys])), 1)
+    return round(float(np.mean([scores[key] for key in CORE_INDEX_KEYS])), 1)
 
 
 def compute_indices(supabase, report_date=None, persist=True, events=None, session="EOD"):
@@ -395,8 +409,8 @@ def compute_indices(supabase, report_date=None, persist=True, events=None, sessi
     rows_to_persist = []
     for idx_key, spec in INDEX_DEFS.items():
         score = result.get(idx_key)
-        if score is not None:
-            rows_to_persist.append({
+        # A missing recalculation must clear an earlier score for the same day.
+        rows_to_persist.append({
                 "report_date": report_date,
                 "metric": idx_key,
                 "scope": "COMPOSITE",
@@ -414,7 +428,7 @@ def compute_indices(supabase, report_date=None, persist=True, events=None, sessi
                 "lag_days": 0,
                 "calc_version": ENV_CALC_VERSION,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+        })
 
     res_hits, fake_present, resonance_themes = _resonance_hits(
         supabase, report_date, events=events)
@@ -422,8 +436,8 @@ def compute_indices(supabase, report_date=None, persist=True, events=None, sessi
         result, coverage, res_hits, fake_present, maturity=maturity)
 
     composite = composite_score(result, coverage, maturity=maturity)
-    overall_cov = round(float(np.mean(list(coverage.values()))), 3) if coverage else 0.0
-    overall_maturity = (round(float(np.mean(list(maturity.values()))), 3)
+    overall_cov = round(float(np.mean([coverage[k] for k in CORE_INDEX_KEYS])), 3)
+    overall_maturity = (round(float(np.mean([maturity[k] for k in CORE_INDEX_KEYS])), 3)
                         if maturity else 0.0)
     result.update({
         "resonance_count": res_hits,
@@ -438,6 +452,10 @@ def compute_indices(supabase, report_date=None, persist=True, events=None, sessi
         "overall_maturity": overall_maturity,
         "shadow_mode": SHADOW_MODE,
         "calc_version": ENV_CALC_VERSION,
+        "weight_policy": "FIXED_CORE_EQUAL_WEIGHT_FULL_COVERAGE",
+        "comparison_signature": ENV_CALC_VERSION + ":" + ";".join(
+            item["metric"] + "=" + ",".join(item.get("source_identity", []))
+            for key in CORE_INDEX_KEYS for item in diagnostics[key]),
     })
 
     if persist:
@@ -459,6 +477,9 @@ def compute_indices(supabase, report_date=None, persist=True, events=None, sessi
             "shadow_mode": True,
             "calc_version": ENV_CALC_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "details": {"diagnostics": diagnostics, "maturity": maturity,
+                        "coverage": coverage, "weight_policy": result["weight_policy"],
+                        "comparison_signature": result["comparison_signature"]},
         }
         safe_upsert(supabase, "environment_daily", env_row, conflict_cols="report_date")
     return result
@@ -500,7 +521,9 @@ def format_env_summary(idx):
         "MISSING_COMPONENT": "缺少当日分量",
         "MISSING_PERCENTILE": "历史分位不可用",
         "INSUFFICIENT_SAMPLE": "有效样本不足",
-        "STALE_COMPONENT": "期权来源过期或日期不可验证",
+        "STALE_COMPONENT": "来源过期或日期不可验证",
+        "DIRECTION_UNDEFINED": "方向未验证，仅作原始代理观察",
+        "INCOMPLETE_UNIVERSE": "固定股票样本未齐备，仅看分项",
     }
     blockers = []
     core_keys = ("idx_risk_pressure", "idx_liquidity_stress", "idx_breadth_decay")
@@ -536,6 +559,13 @@ def format_env_summary(idx):
             f"{MIN_STATE_MATURITY:.0%}")
     if blockers:
         lines.append("分类阻塞项：" + "；".join(blockers))
+    lines.append("综合口径：风险、信用、广度三项固定等权，均完整才发布；期权和资金代理不重复计入。")
+    for key, items in diagnostics.items():
+        if idx.get(key) is None:
+            available = [f"{item['metric']} {item['diagnostic_value']:.1f}" for item in items
+                         if item.get("diagnostic_value") is not None]
+            if available:
+                lines.append(labels[key] + "可查分项（非总分）：" + "；".join(available))
 
     optional_notes = []
     for key in ("idx_options_fragility", "idx_flow_behavior"):

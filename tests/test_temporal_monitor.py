@@ -120,8 +120,9 @@ class TemporalStateTests(unittest.TestCase):
                 "liquidity", [100.0 - value for value in reversal]),
         })
         latest = row_for(confirmed, "environment")
-        self.assertEqual(latest["temporal_state"], "SUDDEN_TURN")
-        self.assertEqual(latest["independent_confirmation_count"], 1)
+        self.assertEqual(latest["temporal_state"], "TURN_WATCH")
+        self.assertEqual(latest["independent_confirmation_count"], 0)
+        self.assertEqual(latest["details"]["confirmation_basis"], "NON_OVERLAPPING_SOURCE_FAMILIES_ONLY")
 
     def test_event_pulse_preserves_isolated_event_semantics(self):
         event_rows = []
@@ -151,7 +152,7 @@ class TemporalStateTests(unittest.TestCase):
         latest = row_for(history, "risk_capital")
         self.assertEqual(latest["temporal_state"], "PRESSURE_PERSISTENT")
         self.assertEqual(latest["persistence_days"], 2)
-        self.assertIn("主动去杠杆延续", latest["temporal_state_cn"])
+        self.assertIn("放量收缩延续（去杠杆待确认）", latest["temporal_state_cn"])
 
     def test_replay_backfill_never_overwrites_live_shadow_rows(self):
         source = {"environment": continuous_rows(

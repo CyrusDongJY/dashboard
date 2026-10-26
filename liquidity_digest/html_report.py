@@ -3,10 +3,12 @@ from base64 import b64encode
 from html import escape
 
 from .render import (
-    LAYERS, chart_images, disagreement, number, quality, summary_lines, tactical_lines, cutoff_label,
+    LAYERS, chart_images, disagreement, number, quality, summary_lines, cutoff_label,
 )
 from .states import MATRIX_TEXT, matrix_note
 from .internals_view import internals_html
+from .frontpage import front_html, build_frontpage
+from .evidence import evidence_html
 
 
 def text(value):
@@ -19,7 +21,7 @@ def table(headers, rows):
     return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def full_html(report, images=None):
+def full_html(report, images=None, front_images=None):
     images = chart_images(report) if images is None else images
     if len(images) != 3:
         raise ValueError("Full report requires all three chart panels")
@@ -56,7 +58,8 @@ def full_html(report, images=None):
                           + ("<small>当前</small>" if chosen else "") + "</span>")
     matrix.append("</div>")
     pressure_note = matrix_note(pressure)
-    alerts = "".join(f'<li>{text(a["text"])}</li>' for a in report["states"]["alerts"])
+    front = report.get("frontpage") or build_frontpage(report, {})
+    alerts = "".join(f'<li>{text(a["text"])}</li>' for a in front["alerts"])
 
     groups = list(LAYERS)
     grouped = {key for _, keys in groups for key in keys}
@@ -73,8 +76,8 @@ def full_html(report, images=None):
                 changes = "当前值已为5日收益率；" + changes
             rows.append((m["label"], m["unit"], number(m["value"]), changes,
                          m["source_date"] or "无观测", quality(m)))
-        data.append(f'<h3>{text(title)}</h3>' +
-                    table(("指标", "单位", "当前", "各窗口变化", "观测日", "数据状态"), rows))
+        data.append(f'<details><summary>{text(title)}</summary>' +
+                    table(("指标", "单位", "当前", "各窗口变化", "观测日", "数据状态"), rows) + '</details>')
 
     charts = []
     for title, caption, image in zip(
@@ -115,7 +118,8 @@ def full_html(report, images=None):
 body{{margin:0}}main{{max-width:1180px;margin:auto;background:#fff;padding:32px 40px}}
 h1{{font-size:28px;line-height:1.35;margin:0 0 12px}}h2{{font-size:21px;line-height:1.4;margin:0 0 16px}}
 h3{{font-size:17px;margin:24px 0 10px}}p{{margin:10px 0}}a{{color:#176c8c;text-underline-offset:3px}}
-header{{border-bottom:2px solid #176c8c;padding-bottom:22px}}nav{{display:flex;gap:12px 24px;flex-wrap:wrap;margin-top:20px;font-size:14px}}
+header{{border-bottom:2px solid #176c8c;padding-bottom:14px}}nav{{display:flex;gap:10px 20px;flex-wrap:wrap;margin-top:12px;font-size:13px}}
+.index-grid{{display:grid;grid-template-columns:1fr 1fr;gap:28px}}.index-panel p{{overflow-wrap:anywhere}}
 .band{{padding:28px 0;border-bottom:1px solid #dbe2e4}}.domains{{display:grid;grid-template-columns:1fr 1fr;gap:32px}}
 .domain{{min-width:0}}.state{{font-size:29px;font-weight:600;line-height:1.25;margin:12px 0}}.muted,figcaption{{color:#5c7078;font-size:13px}}
 .notice{{color:#8c5e12}}.warning{{color:#a23646;border-left:3px solid #a23646;padding-left:12px}}
@@ -131,27 +135,27 @@ td,th{{overflow-wrap:anywhere}}td:first-child{{min-width:120px}}.table-wrap tabl
 .matrix small{{display:block;font-size:11px}}figure{{margin:0 0 28px}}figure img{{display:block;width:100%;min-width:680px;height:auto;aspect-ratio:1717/360}}
 figcaption{{margin-top:10px}}ul{{padding-left:22px}}li{{margin-bottom:8px}}details{{margin:18px 0}}summary{{cursor:pointer;font-weight:600;color:#176c8c}}
 footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:anywhere}}
-@media(max-width:760px){{main{{padding:24px 16px}}h1{{font-size:24px}}.domains,.confirmation{{grid-template-columns:1fr;gap:24px}}.band{{padding:24px 0}}.state{{font-size:26px}}.domain table{{min-width:0}}.domain td:first-child{{min-width:90px}}.domain td,.domain th{{font-size:13px;padding:8px 6px}}}}
+@media(max-width:760px){{main{{padding:24px 16px}}h1{{font-size:24px}}.domains,.confirmation,.index-grid{{grid-template-columns:1fr;gap:18px}}.band{{padding:24px 0}}.state{{font-size:26px}}.domain table{{min-width:0}}.domain td:first-child{{min-width:90px}}.domain td,.domain th{{font-size:13px;padding:8px 6px}}}}
 @media print{{html{{background:#fff}}main{{max-width:none;padding:0}}nav{{display:none}}.table-wrap,.chart-wrap{{overflow:visible}}table{{min-width:0!important}}figure img{{min-width:0}}figure{{break-inside:avoid}}h2,h3{{break-after:avoid}}}}
 </style></head><body><main>
 <header><h1>{text(tag)}美股流动性与风险传导日报</h1>
 <p>盘前版 / 宏观与微观分层 · {text(report["report_date"])}</p>
 <p class="muted">美东{text(cutoff_label(report))}截止 · 收盘基准 {text(report["market_date"])} · 宏观按各源原生观测日</p>
-<nav aria-label="报告章节"><a href="#overview">环境总览</a><a href="#internals">市场内部结构</a><a href="#evidence">分类数据</a>
-<a href="#tactical">跨资产压力</a><a href="#trends">趋势图表</a><a href="#audit">来源与口径</a></nav></header>
-<section id="overview" class="band"><h2>{text(report["domains"]["headline"])}</h2>
-<p>{text(report["domains"]["relation"])}</p><p class="muted">{text(report["domains"].get("evidence_note", ""))}</p><div class="domains">{"".join(panels)}</div></section>
+<nav aria-label="报告章节"><a href="#priority">资金曲线</a><a href="#overview">宏微观概况</a><a href="#tactical">战术压力</a><a href="#alerts">关键异常</a>
+<a href="#capital">配置与持仓</a><a href="#internals">市场内部</a><a href="#evidence">数据明细</a><a href="#trends">更多趋势</a><a href="#audit">来源审计</a></nav></header>
+{front_html(report, front_images)}
+<section id="domain-evidence" class="band"><p class="muted">{text(report["domains"].get("evidence_note", ""))}</p>
+<details><summary>宏观与微观分组证据</summary><div class="domains">{"".join(panels)}</div></details></section>
 {internals_html(report)}
+{evidence_html(report)}
 <section class="band confirmation"><div><h2>跨资产确认 / 压力水位与方向</h2>{"".join(matrix)}
-<p class="muted">{text(pressure_note)}</p><p class="muted">{text(pressure["reason"])}</p></div><div><h2>提示与分歧</h2><ul>{alerts}</ul>
+<p class="muted">{text(pressure_note)}</p><p class="muted">{text(pressure["reason"])}</p></div><div><h2>异常明细与分歧</h2><ul>{alerts or "<li>未检出既有观察规则异常，不代表没有风险。</li>"}</ul>
+<p class="notice">数据待核查：{text("；".join(front["gaps"]) or "无已识别缺口")}</p>
 <p>{text(disagreement(report))}</p></div></section>
 <section id="evidence" class="band"><h2>分类数据与观测日期</h2>
 {"".join(f"<p>{text(line)}</p>" for line in summary_lines(report))}
 {"".join(data)}<p class="warning">待更新或需核查：{text(gaps)}。缺失及过期数据不参与状态确认。</p>
 <p class="notice">错期参考：{text("；".join(report.get("publication_lags", [])) or "无")}。不冒充昨日同步数据。</p></section>
-<section id="tactical" class="band"><h2>盘后跨资产战术压力观察 / 综合确认层</h2>
-{"".join(f"<p>{text(line)}</p>" for line in tactical_lines(report))}
-<p class="muted">影子观察，不触发预警；跨资产确认并非纯微观，不作为宏观或微观的重复投票。</p></section>
 <section id="trends" class="band"><h2>趋势与证据 / 近150个自然日</h2>{"".join(charts)}
 <p>{text(funding_line)}</p>{"".join(market_states)}<h3>优先查阅</h3>
 <ul>{focus or "<li>尚无足够连续观测确认方向。</li>"}</ul></section>
@@ -169,6 +173,10 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 <details><summary>逐项来源、观测日与抓取时间</summary>
 {table(("指标", "来源", "观测日", "抓取时间", "状态"), sources)}</details>
 <details><summary>采集审计</summary>{table(("输入项", "来源", "状态", "接收时间", "尝试时间"), captures)}</details>
+<details><summary>首页资金指数口径</summary>{table(("指标", "表", "版本", "快照日", "接收时间"),
+[(i["label"], i["source"], i["version"], i["source_date"], i["fetched_at"]) for i in front["indices"].values()])}
+<p>核心资金实测与PIT_REPLAY回放分开，回放不参与当前状态或趋势；水位仪历史为存档计算值，非逐日已知信息回测。
+仅使用各自固定权重版本，缺失或部分覆盖诊断值不作为正式总分，不跨版本拼线。</p></details>
 </section><footer><p class="version">影子观察 · {text(report["version"])} · {text(report["domains"]["version"])}</p>
 <p>缺失不等于平稳，未触发观察线不等于低风险。原有独立报告与预警保持不变。</p></footer>
 </main></body></html>"""

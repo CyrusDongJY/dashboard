@@ -78,9 +78,13 @@ def panel_state(report, key):
     if not current or not eligible(current, key):
         return result
     version = current["details"]["source_calc_version"]
+    signature = current["details"].get("comparison_signature")
+    start = current["details"].get("comparison_start_date", "")
     records = {r["report_date"]: r for r in raw if eligible(r, key)
                and r["calc_version"] == current["calc_version"]
-               and r["details"]["source_calc_version"] == version}
+               and r["details"]["source_calc_version"] == version
+               and r["details"].get("comparison_signature") == signature
+               and r["report_date"] >= start}
     days = sessions(date.fromisoformat(report["market_date"]) - timedelta(days=100), report["market_date"])
     value = float(current["risk_value"])
     changes = {}

@@ -5,6 +5,7 @@ leaders each day, but an isolated company event never becomes a market-level
 risk-appetite confirmation on its own.
 """
 from datetime import datetime, timezone
+from collections import Counter
 import math
 
 from risk_capital_ladder import (
@@ -341,4 +342,9 @@ def format_event_pulse_summary(result):
     lines.append(
         "口径：动态榜单存在选择偏差；单只事件股只作情绪脉冲，至少3只、"
         "跨2个行业的同向价量确认才升级为市场扩散/撤退证据。")
+    industries = Counter(row.get("industry_group") or "UNKNOWN" for row in candidates)
+    if industries:
+        largest, count = industries.most_common(1)[0]
+        lines.append(f"候选样本行业集中度：最大组 {largest} {count}/{len(candidates)}；"
+                     f"行业未知 {industries.get('UNKNOWN', 0)}只。候选数不是全市场参与率。")
     return "\n".join(lines)

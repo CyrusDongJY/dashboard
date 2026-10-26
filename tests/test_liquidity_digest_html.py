@@ -46,6 +46,7 @@ def bundle(tmp_path, report, monkeypatch):
     store = Store(tmp_path)
     report["demo"] = False
     monkeypatch.setattr("liquidity_digest.job.chart_images", lambda r: images())
+    monkeypatch.setattr("liquidity_digest.job.index_images", lambda r: images()[:2])
     monkeypatch.setattr("liquidity_digest.job.render_pdf", stub_pdf)
     folder = tmp_path / "reports" / report["report_date"]
     write_bundle(report, folder)
@@ -58,7 +59,7 @@ def test_html_self_contained_and_complete(report):
     assert html.startswith("<!doctype html>")
     assert not {"script", "iframe", "object", "embed", "form", "link"} & {tag for tag, _ in nodes}
     imgs = [a for tag, a in nodes if tag == "img"]
-    assert len(imgs) == 3
+    assert len(imgs) == 5
     for img in imgs:
         assert img["src"].startswith("data:image/png;base64,")
         assert b64decode(img["src"].split(",", 1)[1]).startswith(b"\x89PNG")
@@ -66,7 +67,8 @@ def test_html_self_contained_and_complete(report):
     for _, attrs in nodes:
         assert not any(name.startswith("on") for name in attrs)
         if "href" in attrs:
-            assert attrs["href"].startswith("#")
+            from liquidity_digest.capital import CFTC_URL, ICI_URL, FINRA_URL
+            assert attrs["href"].startswith("#") or attrs["href"] in (CFTC_URL, ICI_URL, FINRA_URL)
     assert any(a.get("http-equiv") == "Content-Security-Policy" for _, a in nodes)
     for metric in report["metrics"].values():
         assert metric["label"] in html
@@ -84,7 +86,7 @@ def test_html_escapes_all_external_text(report):
     html = full_html(report, images())
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
-    assert len([1 for tag, _ in Elements(html).nodes if tag == "img"]) == 3
+    assert len([1 for tag, _ in Elements(html).nodes if tag == "img"]) == 5
 
 
 def test_missing_html_keeps_unknown_semantics():
@@ -164,7 +166,7 @@ def test_legacy_archive_still_readable_without_rewriting(bundle):
     assert file_hash(folder / "manifest.json") == before
 
 
-@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow"])
+@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow"])
 def test_prior_archives_preserve_html_attachment_contract(bundle, version):
     _, folder = bundle
     report = json.loads((folder / "report.json").read_text())

@@ -70,8 +70,9 @@ class EnvironmentIndexTests(unittest.TestCase):
         rows = [metric_row("ivr_pct", 45, scope="SPY"),
                 metric_row("short_gamma_m", 10, lag=47, scope="SPY")]
         scores, coverage, _, diagnostics = score_frame_details(pd.DataFrame(rows))
-        self.assertEqual(scores["idx_options_fragility"], 55.0)
-        self.assertAlmostEqual(coverage["idx_options_fragility"], 0.417)
+        self.assertIsNone(scores["idx_options_fragility"])
+        self.assertEqual(coverage["idx_options_fragility"], 0)
+        self.assertEqual(diagnostics["idx_options_fragility"][0]["diagnostic_value"], 55)
         gamma = diagnostics["idx_options_fragility"][2]
         self.assertEqual(gamma["status"], "STALE_COMPONENT")
         rows[0]["lag_days"] = 2
@@ -85,7 +86,7 @@ class EnvironmentIndexTests(unittest.TestCase):
         scores, _, _, _ = score_frame_details(pd.DataFrame([
             option, metric_row("nfci", 80, lag=5)]))
         self.assertIsNone(scores["idx_options_fragility"])
-        self.assertEqual(scores["idx_liquidity_stress"], 80)
+        self.assertIsNone(scores["idx_liquidity_stress"])
 
     def test_missing_or_future_option_source_date_fails_closed(self):
         for source_date in (None, "invalid", "2026-07-15"):

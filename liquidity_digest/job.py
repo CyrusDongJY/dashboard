@@ -17,6 +17,8 @@ from . import VERSION
 from .model import NY, UTC, assemble, plan, sessions, stamp
 from .render import chart_images, email_html, email_text, render_pdf
 from .html_report import full_html
+from .frontpage import index_images
+from .email_images import add_html_with_images
 from .sources import collect
 from .store import Store, atomic_json, file_hash
 
@@ -59,7 +61,7 @@ def verify_bundle(folder):
         if file_hash(folder / name) != expected:
             raise ValueError("Frozen report integrity check failed")
     report = json.loads((folder / "report.json").read_text())
-    if report["version"] not in (VERSION, "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.3-shadow", "liquidity_digest_v1.2-shadow"):
+    if report["version"] not in (VERSION, "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.3-shadow", "liquidity_digest_v1.2-shadow"):
         raise ValueError("Report version mismatch")
     expected = legacy_files | ({"report.html"} if report["version"] != "liquidity_digest_v1.2-shadow" else set())
     if files != expected:
@@ -79,10 +81,11 @@ def write_bundle(report, folder):
     try:
         atomic_json(temp / "report.json", report)
         (temp / "email.txt").write_text(email_text(report), encoding="utf-8")
-        (temp / "email.html").write_text(email_html(report), encoding="utf-8")
+        front_images = index_images(report)
+        (temp / "email.html").write_text(email_html(report, front_images=front_images), encoding="utf-8")
         images = chart_images(report)
-        render_pdf(report, temp / "report.pdf", images=images)
-        (temp / "report.html").write_text(full_html(report, images=images), encoding="utf-8")
+        render_pdf(report, temp / "report.pdf", images=images, front_images=front_images)
+        (temp / "report.html").write_text(full_html(report, images=images, front_images=front_images), encoding="utf-8")
         files = {name: file_hash(temp / name) for name in (
             "report.json", "report.pdf", "report.html", "email.txt", "email.html")}
         atomic_json(temp / "manifest.json", {"files": files, "built_at": datetime.now(UTC).isoformat()})
@@ -159,7 +162,7 @@ def send(store, config, report_plan, now=None, connector=smtp_connection):
         message["Message-ID"] = f"<liquidity-digest-{identifier}@{sender.split('@')[-1]}>"
         message["Date"] = format_datetime(datetime.now(UTC))
         message.set_content((folder / "email.txt").read_text())
-        message.add_alternative((folder / "email.html").read_text(), subtype="html")
+        add_html_with_images(message, (folder / "email.html").read_text(), identifier)
         message.add_attachment((folder / "report.pdf").read_bytes(), maintype="application",
                                subtype="pdf", filename="liquidity_digest_" + report_plan["report_date"] + ".pdf")
         if report["version"] != "liquidity_digest_v1.2-shadow":

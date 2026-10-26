@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 
-CALC_VERSION = "temporal_state_v1.0-shadow"
+CALC_VERSION = "temporal_state_v1.1-comparable-shadow"
 EVAL_VERSION = "temporal_eval_v1.0-shadow"
 SHADOW_MODE = True
 HORIZONS = (1, 5, 21)
@@ -69,6 +69,15 @@ PANEL_SPECS = {
         "report_date", None, "候选数量", "event_breadth",
         coverage_col="scan_coverage",
         confidence_col="candidate_coverage", min_coverage=0.50),
+}
+
+# A separate report is not independent evidence when its source families overlap.
+PANEL_EVIDENCE_FAMILIES = {
+    "environment": {"volatility", "credit", "market_prices"},
+    "tactical_stress": {"volatility", "credit", "market_prices"},
+    "liquidity": {"macro_quantity", "funding", "credit", "market_prices", "volatility"},
+    "risk_capital": {"market_prices"},
+    "event_pulse": {"market_prices"},
 }
 
 
@@ -188,6 +197,30 @@ def _confidence(row, spec, coverage):
     return round(max(0.0, min(1.0, explicit)), 4)
 
 
+def _comparison_signature(row, spec):
+    if spec.key == "tactical_stress":
+        return _mapping(_mapping(row.get("stress_components")).get("_meta")).get(
+            "comparison_signature")
+    if spec.key == "risk_capital":
+        return _mapping(_mapping(row.get("layer_details")).get("_meta")).get(
+            "comparison_signature")
+    return _mapping(row.get("details")).get("comparison_signature")
+
+
+def comparison_segments(rows):
+    """Partition display lines without connecting changed source definitions."""
+    groups, previous = [], None
+    for row in rows:
+        details = _mapping(row.get("details"))
+        signature = (row.get("calc_version"), details.get("source_calc_version"),
+                     details.get("comparison_signature"), details.get("comparison_start_date"))
+        if not groups or signature != previous:
+            groups.append([])
+        groups[-1].append(row)
+        previous = signature
+    return groups
+
+
 def _normalize_history(rows, spec):
     records = []
     if isinstance(rows, pd.DataFrame):
@@ -212,6 +245,8 @@ def _normalize_history(rows, spec):
             and coverage >= spec.min_coverage
             and (raw_value is not None or spec.key == "event_pulse")
         )
+        if spec.key == "risk_capital" and coverage < 1 and not _comparison_signature(row, spec):
+            eligible = False
         risk_value = None
         if eligible and raw_value is not None:
             risk_value = raw_value if spec.pressure_polarity > 0 else 100.0 - raw_value
@@ -228,6 +263,7 @@ def _normalize_history(rows, spec):
             "source_calc_version": row.get("calc_version") or row.get(
                 "stress_calc_version"),
             "source_fingerprint": _source_fingerprint(row, spec),
+            "comparison_signature": _comparison_signature(row, spec),
         }
         if spec.key == "event_pulse":
             details.update({
@@ -442,7 +478,7 @@ def _base_payload(spec, frame, index, observation_mode):
             payload["temporal_state"] = (
                 "PRESSURE_PERSISTENT" if streak >= 2 else "NEW_PRESSURE")
             labels = {
-                "ACTIVE_DELEVERAGING": "主动去杠杆延续" if streak >= 2 else "新发主动去杠杆",
+                "ACTIVE_DELEVERAGING": "放量收缩延续（去杠杆待确认）" if streak >= 2 else "新发放量收缩（去杠杆待确认）",
                 "MEGACAP_CONCENTRATION": "风险偏好持续集中" if streak >= 2 else "风险偏好转向集中",
                 "EDGE_CONTRACTION": "边缘风险层持续收缩" if streak >= 2 else "边缘风险层开始收缩",
                 "CONTRACTION": "风险资本收缩延续" if streak >= 2 else "风险资本开始收缩",
@@ -556,7 +592,8 @@ def _apply_turn_confirmation(rows):
         if not details.get("turn_candidate"):
             continue
         direction = details.get("turn_direction")
-        confirmations = 0
+        confirmation_groups = set()
+        used_families = set(PANEL_EVIDENCE_FAMILIES.get(row["panel"], ()))
         for other in by_date.get(row["report_date"], []):
             if other["panel"] == row["panel"] or other.get("risk_value") is None:
                 continue
@@ -565,12 +602,19 @@ def _apply_turn_confirmation(rows):
             if (row_spec and other_spec and
                     row_spec.confirmation_group == other_spec.confirmation_group):
                 continue
+            families = PANEL_EVIDENCE_FAMILIES.get(other["panel"], set())
+            if not families or families & used_families:
+                continue
             change = _finite(other.get("change_5d"))
             if change is None or abs(change) < IMPULSE_THRESHOLD:
                 continue
             if (change > 0 and direction > 0) or (change < 0 and direction < 0):
-                confirmations += 1
+                if other.get("quality_status") == "OK":
+                    confirmation_groups.add(other_spec.confirmation_group)
+                    used_families.update(families)
+        confirmations = len(confirmation_groups)
         row["independent_confirmation_count"] = confirmations
+        details["confirmation_basis"] = "NON_OVERLAPPING_SOURCE_FAMILIES_ONLY"
         if confirmations:
             row["temporal_state"] = "SUDDEN_TURN"
             row["temporal_state_cn"] = (
@@ -591,16 +635,27 @@ def build_temporal_history(histories, observation_mode="REPLAY"):
         frame = _normalize_history(histories.get(key), spec)
         if frame.empty:
             continue
+        # Never compare across a formula or membership boundary, including a
+        # temporary change followed by restoration of the original basket.
+        signatures = frame["details"].map(lambda d: (
+            d.get("source_calc_version"), d.get("comparison_signature")))
+        starts = [0]
         for index in range(len(frame)):
+            if index and signatures.iloc[index] != signatures.iloc[index - 1]:
+                starts.append(index)
+            segment = frame.iloc[starts[-1]:index + 1].reset_index(drop=True)
+            position = len(segment) - 1
             if key == "event_pulse":
-                payload = _event_payload(spec, frame, index, observation_mode)
+                payload = _event_payload(spec, segment, position, observation_mode)
             else:
-                payload = _base_payload(spec, frame, index, observation_mode)
+                payload = _base_payload(spec, segment, position, observation_mode)
                 if (key == "risk_capital" and
                         payload.get("source_state") == "SPECULATIVE_BLOWOFF" and
                         payload.get("quality_status") != "INSUFFICIENT"):
                     payload["temporal_state"] = "OVERHEAT"
-                    payload["temporal_state_cn"] = "投机层过热但机构层未确认"
+                    payload["temporal_state_cn"] = "投机层过热但高Beta成长层未确认"
+            payload["details"]["comparison_start_date"] = segment.iloc[0]["report_date"]
+            payload["details"]["comparison_reset"] = bool(index and position == 0)
             rows.append(payload)
     return _apply_turn_confirmation(rows)
 

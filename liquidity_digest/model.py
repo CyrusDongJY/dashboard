@@ -359,4 +359,8 @@ def assemble(report_plan, inputs, demo=False):
     report["domains"] = build_domains(report)
     from .internals import build_internals
     report["internals"] = build_internals(report_plan, inputs.get("db_market_history", {}), metrics)
+    from .frontpage import build_frontpage
+    report["frontpage"] = build_frontpage(report, inputs)
+    from .capital import build_capital
+    report["capital"] = build_capital(report, inputs)
     return report

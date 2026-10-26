@@ -15,6 +15,8 @@ FRED = {
     "ust2": ("DGS2", 1), "real10": ("DFII10", 1),
 }
 TABLES = {
+    "core_funding_daily": ("report_date", "report_date,calc_version,observation_mode,as_of,score,coverage,result,created_at"),
+    "liquidity_daily": ("report_date", "report_date,calc_version,composite,coverage,state,details,created_at"),
     "metric_daily": ("report_date", "*"),
     "market_history": ("record_date", "record_date,eod_stress_score,stress_components,"
                        "stress_coverage,stress_confidence,stress_calc_version,stress_computed_at,"
@@ -46,7 +48,9 @@ def points(series, multiplier=1):
 
 def fetch_table(session, config, table, start, end):
     field, select = TABLES[table]
-    if table == "market_history":
+    if table in ("core_funding_daily", "liquidity_daily"):
+        start = max(start, str(date.fromisoformat(end) - timedelta(days=150)))
+    elif table == "market_history":
         # Enough complete sessions for 21-day context; do not transfer years of stock snapshots.
         start = max(start, str(date.fromisoformat(end) - timedelta(days=70)))
     elif table not in ("metric_daily", "temporal_state_daily"):
@@ -67,6 +71,8 @@ def fetch_table(session, config, table, start, end):
             params["order"] = "report_date.asc,metric.asc,scope.asc,session.asc"
         elif table == "temporal_state_daily":
             params["order"] = "report_date.asc,panel.asc"
+        elif table == "core_funding_daily":
+            params["order"] = "report_date.asc,calc_version.asc,observation_mode.asc"
         response = session.get(base + "/rest/v1/" + table, headers=headers, params=params)
         response.raise_for_status()
         page = response.json()
@@ -98,6 +104,8 @@ def collect(config, store, report_plan, budget=180):
                 status = "OK" if data else "EMPTY"
         except TimeoutError:
             status, data = "DEADLINE", []
+        except PermissionError:
+            status, data = "ACCESS_DENIED", []
         except Exception:
             # Never log URL-bearing exception strings: FRED query strings contain API keys.
             status, data = "FETCH_ERROR", []
@@ -120,5 +128,9 @@ def collect(config, store, report_plan, budget=180):
         attempt("db_" + table, "Supabase / " + table,
                 lambda t=table: fetch_table(session, config, t, start, end),
                 bool(config.get("SUPABASE_URL") and config.get("SUPABASE_KEY")))
+    from .capital import fetch_observations, CFTC_URL, ICI_URL, FINRA_URL
+    # Supplemental slow data cannot consume the budget reserved for existing producers.
+    for key, url in (("cftc_positions", CFTC_URL), ("finra_margin", FINRA_URL), ("ici_flows", ICI_URL)):
+        attempt(key, url, lambda k=key: fetch_observations(session, k))
     session.close()
     return outcomes

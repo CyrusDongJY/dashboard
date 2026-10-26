@@ -76,13 +76,13 @@ def quality(metric):
 def tactical_lines(report):
     row = report["panels"].get("tactical")
     if not row:
-        return ["昨日收盘记录缺失，不能用旧分数替代。", "影子观察，不触发预警，不单独推断流动性挤兑。"]
+        return ["昨日收盘记录缺失，不能用旧分数替代；压力水位与方向待确认。", "影子观察，不触发预警，不单独推断流动性挤兑。"]
     components = row.get("stress_components") or {}
     if not isinstance(components, dict):
         components = {}
     coverage = finite(row.get("stress_coverage"))
     meta = components.get("_meta") or {}
-    score = number(row.get("eod_stress_score")) if meta.get("status") != "UNAVAILABLE" else "不可计算"
+    score = number(row.get("eod_stress_score")) if meta.get("status") in ("OK", "PARTIAL") else "不可计算"
     text = [f'跨资产确认，非纯微观。观察值 {score} / 100；覆盖率 {number(coverage * 100 if coverage is not None else None)}%；'
             f'截至 {report["market_date"]}。']
     parts = []
@@ -101,6 +101,10 @@ def tactical_lines(report):
     text.append("压力值变化（1／5／21日）：" + " / ".join(
         number(temporal["changes"].get(period), True) for period in ("1d", "5d", "21d"))
         + "；" + temporal["direction_cn"] + "。")
+    confidence = finite(row.get("stress_confidence"))
+    status = {"OK": "可用", "PARTIAL": "部分覆盖", "UNAVAILABLE": "不可计算"}.get(meta.get("status"), "状态待核实")
+    text.append(f'数据状态：{status}；置信度 {number(confidence * 100 if confidence is not None else None)}%；'
+                f'版本 {row.get("stress_calc_version") or "未记录"}。')
     return text
 
 
@@ -134,11 +138,19 @@ def email_text(report):
              f'报告日 {report["report_date"]}｜美东{cutoff_label(report)}截止｜收盘基准 {report["market_date"]}', ""]
     states = report["states"]
     domains = report["domains"]
-    lines.extend([domains["headline"], domains["relation"],
-                  "宏观使用截止前最新原生观测；微观及综合评分截至 " + report["market_date"] + " 收盘。"])
-    lines.extend(domain_lines(report))
+    from .frontpage import build_frontpage, index_summary
+    front = report.get("frontpage") or build_frontpage(report, {})
+    lines.extend(["核心观察", *[item["label"] + "：" + index_summary(item)
+                               for item in front["indices"].values()],
+                  "", domains["headline"], *domain_lines(report), domains["relation"],
+                  "宏观使用截止前最新原生观测；微观及综合评分截至 " + report["market_date"] + " 收盘。",
+                  "", "盘后跨资产战术压力观察", *tactical_lines(report),
+                  "", "关键异常与分歧", *[a["text"] for a in front["alerts"]],
+                  "数据待核查：" + ("；".join(front["gaps"]) or "无已识别缺口"), ""])
     lines.append(domains.get("evidence_note", ""))
     lines.extend(["", *internals_lines(report), ""])
+    from .capital import capital_lines
+    lines.extend(["资金配置、持仓与杠杆", *capital_lines(report.get("capital", {}))])
     lines.append("跨资产综合确认（不作为宏观/微观的重复投票）：" + states["headline"])
     for state in (states["funding"], states["pressure"]):
         lines.append(f'{state["label"]}：{state["level_cn"]} / {state["direction_cn"]}；'
@@ -174,48 +186,27 @@ def data_text(report):
             values.append(f'{m["label"]} {number(m["value"])} {m["unit"]}'
                           f'（{m["source_date"] or "无日期"}；{quality(m)}）')
         lines.append(title + "：" + "；".join(values))
-    lines.extend(["", "盘后跨资产战术压力观察", *tactical_lines(report),
-                  "", "优先查阅", *(report["focus"] or ["尚无足够连续观测确认方向。"]),
+    lines.extend(["", "优先查阅", *(report["focus"] or ["尚无足够连续观测确认方向。"]),
                   disagreement(report), "", "完整数据、趋势和缺口见附件HTML网页版或PDF；原报告保持独立。",
                   "HTML附件可下载后用浏览器打开，图表已内嵌，无需联网或登录。",
                   "数据为截至抓取时可见的修订版本；历史图不是逐日已知信息回测。"])
     return "\n".join(lines)
 
 
-def email_html(report):
-    states = report["states"]
-    cells = []
-    arrows = {"UP": "↑", "DOWN": "↓", "FLAT": "→", "UNKNOWN": "?"}
-    arrows.update(MIXED="↔", EARLY_UP="↗", EARLY_DOWN="↘")
-    for key in ("macro", "micro"):
-        domain = report["domains"][key]
-        state = domain["short"]
-        rows = "".join(
-            f'<div style="font-size:13px">{escape(g["label"])}：'
-            f'<span style="color:{g["short"]["color"]}">{escape(g["short"]["label"])}</span></div>'
-            for g in domain["groups"])
-        flags = "；".join(domain["flags"]) or "未检出所列分项提示；不等于宽松或低压"
-        cells.append(
-            f'<td width="50%" style="vertical-align:top;padding:16px 10px;border-top:4px solid {state["color"]}">'
-            f'<div style="font-size:13px">{escape(domain["label"])}</div>'
-            f'<div style="font-size:22px;color:{state["color"]};margin:6px 0">'
-            f'{arrows[state["direction"]]} {escape(state["label"])}</div>{rows}'
-            f'<div style="font-size:12px;margin-top:6px">中期：{escape(domain["medium"]["label"])}；'
-            f'近期有效 {state["ready_groups"]}/3 组</div>'
-            f'<div style="font-size:12px;color:#9c6812">{escape(flags)}</div>'
-            f'<div style="font-size:12px">{escape(domain.get("timing_note", ""))}</div></td>')
+def email_html(report, front_images=None):
+    from .frontpage import front_html
+    from .evidence import evidence_html
     tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
-    table = f'<table width="100%" cellspacing="0" cellpadding="0"><tr>{"".join(cells)}</tr></table>'
-    notes = "".join(f'<p style="margin:8px 0">{escape(a["text"])}</p>' for a in states["alerts"][:3])
-    return ('<html><body style="font-family:sans-serif;color:#293b40;line-height:1.65;max-width:760px;margin:auto">'
+    return ('<html lang="zh-CN"><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+            '<body style="font-family:sans-serif;color:#293b40;line-height:1.65;max-width:760px;margin:auto;padding:12px">'
             f'<h2>{tag}美股流动性与风险传导日报</h2>'
             f'<p>{escape(report["report_date"])} 盘前版 | 微观与评分截至 {escape(report["market_date"])} 收盘；宏观按原生观测日</p>'
-            + table + f'<p>{escape(report["domains"]["relation"])}</p>'
+            + front_html(report, front_images)
             + f'<p>{escape(report["domains"].get("evidence_note", ""))}</p>'
             + internals_html(report, compact=True)
-            + f'<p>跨资产综合确认：{escape(states["headline"])}。{escape(states["pressure_note"])}</p>' + notes
-            + '<hr><pre style="white-space:pre-wrap;font-family:sans-serif;font-size:13px">'
-            + escape(data_text(report)) + "</pre></body></html>")
+            + evidence_html(report, compact=True)
+            + '<p style="font-size:13px">完整分类数据、历史趋势和来源审计见HTML网页版或PDF附件。'
+            'HTML附件可离线打开，原有独立报告保持不变。</p></body></html>')
 
 
 def chart_images(report):
@@ -303,10 +294,12 @@ def chart_images(report):
     images.append(finish(fig, axes))
 
     fig, ax = plt.subplots(figsize=(10.1, 2.12))
+    from temporal_monitor import comparison_segments
     for key, color in COLORS.items():
         records = report["temporal"].get(key, [])
-        line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in records],
-             PANEL_CN[key], color)
+        for i, segment in enumerate(comparison_segments(records)):
+            line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in segment],
+                 PANEL_CN[key] if i == 0 else "_nolegend_", color)
     ax.set_ylim(0, 100)
     ax.set_title("核心板块时间状态：各自尺度，不能相加或当作交易信号", fontsize=9)
     ax.set_ylabel("压力方向值", fontsize=8)
@@ -314,7 +307,7 @@ def chart_images(report):
     return images
 
 
-def render_pdf(report, path, images=None):
+def render_pdf(report, path, images=None, front_images=None):
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
     from reportlab.platypus import Paragraph
@@ -327,7 +320,7 @@ def render_pdf(report, path, images=None):
     c.setTitle("美股流动性与风险传导日报")
     c.setAuthor("Market Dashboard")
     margin, width = 34, 527
-    total_pages = 3 if report.get("internals") else 2
+    total_pages = (4 if report.get("internals") else 3) + bool(report.get("capital"))
 
     def text(value, x, y, size=9, color="#293b40"):
         c.setFont(font, size)
@@ -354,7 +347,55 @@ def render_pdf(report, path, images=None):
         c.line(margin, 752, 561, 752)
         text(f'影子观察 | {report["version"]} | {page}/{total_pages}', margin, 23, 7, "#63757a")
 
-    header("盘前版 / 宏观与微观分层", 1)
+    from .frontpage import build_frontpage, index_images, index_summary
+    front = report.get("frontpage") or build_frontpage(report, {})
+    front_images = index_images(report) if front_images is None else front_images
+    if len(front_images) != 2:
+        raise ValueError("Front page requires two index charts")
+    header("首页 / 宏微观概况、资金曲线与跨资产压力", 1)
+    y = paragraph(report["domains"]["headline"], 740, 13)
+    y = paragraph(report["domains"]["relation"], y, 9)
+    top = y - 8
+    for i, (item, image) in enumerate(zip(front["indices"].values(), front_images)):
+        x = margin + i * 273
+        text(item["label"], x, top, 12, item["color"])
+        bottom = paragraph(index_summary(item), top - 10, 8, x=x, max_width=254)
+        c.drawImage(ImageReader(image), x, bottom - 111, width=254, height=111, mask="auto")
+        paragraph(item["reason"], bottom - 115, 7, "#63757a", x=x, max_width=254)
+    y = paragraph(front["scope_note"], top - 180, 8, "#63757a")
+    domain_top = y - 8
+    for key, x in (("macro", margin), ("micro", 307)):
+        domain = report["domains"][key]
+        state = domain["short"]
+        text(domain["label"], x, domain_top, 10)
+        text(state["label"], x, domain_top - 22, 16, state["color"])
+        text("中期：" + domain["medium"]["label"] +
+             ("；近中期背离" if domain["disagreement"] else ""), x, domain_top - 37, 8)
+        for i, group in enumerate(domain["groups"]):
+            text(group["label"] + "：" + group["short"]["label"], x,
+                 domain_top - 52 - i * 12, 8, group["short"]["color"])
+        text(f'近期有效 {state["ready_groups"]}/3 组；缺失不代表平稳。', x, domain_top - 90, 7, "#63757a")
+    y = domain_top - 98
+    text("盘后跨资产战术压力观察", margin, y - 12, 12, "#7255a5")
+    y -= 26
+    for line in tactical_lines(report):
+        y = paragraph(line, y, 9)
+    y = paragraph("影子观察，不触发预警；跨资产确认层，不作为宏微观重复投票。", y, 8, "#63757a")
+    text("关键异常与分歧", margin, y - 10, 12, "#9b3545")
+    y -= 23
+    alerts = front["alerts"][:4] or [{"text": "未检出既有观察规则异常；不代表没有风险。"}]
+    for alert in alerts:
+        y = paragraph("• " + alert["text"], y, 9, "#9b3545")
+    if len(front["alerts"]) > 4:
+        y = paragraph(f'另有 {len(front["alerts"]) - 4} 项提示，见网页版异常明细。', y, 8)
+    if front["gaps"]:
+        y = paragraph("数据完整性：" + "；".join(front["gaps"][:2]) + "。完整缺口见分类数据与审计。", y - 3, 8, "#806120")
+    y = paragraph("曲线仅连接同版有效观测，缺测处断线；回放参考单列，不补入实测趋势。资金分数不代表股票现金流。", y, 7, "#63757a")
+    if y < 40:
+        raise ValueError("Priority page exceeds layout budget")
+    c.showPage()
+
+    header("分类证据 / 宏观与微观分层", 2)
     states = report["states"]
     domains = report["domains"]
     paragraph(domains["headline"], 741, 14)
@@ -449,11 +490,8 @@ def render_pdf(report, path, images=None):
     paragraph(f'风险资本：{capital["level_cn"]} / {capital["direction_cn"]}。', yright - 4, 8,
               x=307, max_width=254)
     text("棕色：错期参考；红色：缺测或过期，不参与确认。", 307, yright - 37, 7, "#63757a")
-    y = min(yleft, yright) - 10
-    text("盘后跨资产战术压力观察 / 综合确认层", margin, y, 11, "#7255a5")
-    y -= 12
-    for line in tactical_lines(report):
-        y = paragraph(line, y, 8)
+    y = min(yleft, yright - 50) - 10
+    y = paragraph("战术压力与关键异常已前置首页；本页保留分组证据，不重复累加不同评分。", y, 8)
     y = paragraph("宏微观方向采用独立分组影子规则，非交易信号；缺失不等于平稳，边际改善不等于当前宽松。"
                   "综合压力仍沿用原评分与35/65水位、5日±5点方向线，不新增总评分或改变原预警。", y - 3, 7)
     if y < 40:
@@ -461,7 +499,7 @@ def render_pdf(report, path, images=None):
     c.showPage()
 
     if report.get("internals"):
-        header("微观环境解读 / 市场内部结构", 2)
+        header("微观环境解读 / 市场内部结构", 3)
         panel = report["internals"]
         y = paragraph(panel["headline"], 737, 14)
         y = paragraph(panel["scope_note"] + " 截至 " + panel["market_date"] + " 收盘。", y, 9)
@@ -493,6 +531,25 @@ def render_pdf(report, path, images=None):
             raise ValueError("Market internals page exceeds layout budget")
         c.showPage()
 
+    if report.get("capital"):
+        from .capital import capital_lines
+        from .evidence import funding_evidence
+        header("资金配置、持仓与杠杆 / 与价格代理分开观察", total_pages - 1)
+        y = paragraph(report["capital"]["scope_note"], 735, 10)
+        for line in capital_lines(report["capital"]):
+            y = paragraph(line, y - 8, 10)
+        y = paragraph(report["capital"]["etf_note"], y - 8, 9, "#806120")
+        y = paragraph("周度持仓与月度融资不是盘前实时资金流；实际接收时间及完整持仓分项见网页版。", y, 8, "#63757a")
+        y = paragraph("资金条件、基数效应与传导", y - 14, 13, "#176c8c")
+        facts = funding_evidence(report)
+        for line in facts["notes"][:10]:
+            y = paragraph(line, y, 9)
+        for pillar in facts["pillars"]:
+            y = paragraph(pillar["label"] + "：" + number(pillar["score"]) + "/100；" +
+                          ("；".join(pillar["missing"][:2]) or "完整分项见网页版"), y, 8)
+        if y < 40:
+            raise ValueError("Capital evidence page exceeds layout budget")
+        c.showPage()
     header("趋势与证据 / 近150个自然日", total_pages)
     images = chart_images(report) if images is None else images
     y = 740

@@ -128,11 +128,12 @@ def test_relative_leader_can_still_be_falling(p):
 
 def test_persistence_exact_windows_and_gap_break(p):
     metrics = metric(p)
-    panel = build_internals(p, {}, metrics)
+    snapshots = capture([record(r["date"]) for r in metrics["pct_20ma"]["history"]])
+    panel = build_internals(p, snapshots, metrics)
     assert panel["persistence"]["state"] == "IMPROVING"
     assert panel["persistence"]["changes"] == {"5d": 10, "21d": 42}
     metrics["pct_20ma"]["history"].pop(-3)
-    panel = build_internals(p, {}, metrics)
+    panel = build_internals(p, snapshots, metrics)
     assert panel["persistence"]["state"] == "UNKNOWN"
     assert panel["persistence"]["changes"] == {"5d": None, "21d": None}
     assert panel["history"][-3]["pct_20ma"] is None
@@ -148,9 +149,20 @@ def test_single_day_up_does_not_hide_deteriorating_participation(p):
 def test_turn_pending_not_confirmed_reversal(p):
     metrics = metric(p)
     metrics["pct_20ma"]["history"][-1]["value"] -= 5
-    panel = build_internals(p, {}, metrics)
+    snapshots = capture([record(r["date"]) for r in metrics["pct_20ma"]["history"]])
+    panel = build_internals(p, snapshots, metrics)
     assert panel["persistence"]["state"] == "TURN_PENDING"
     assert panel["persistence"]["streak"] == 1
+
+
+def test_changed_or_unknown_stock_sample_cannot_confirm_persistence(p):
+    metrics = metric(p)
+    assert build_internals(p, {}, metrics)["persistence"]["state"] == "UNKNOWN"
+    rows = [record(r["date"]) for r in metrics["pct_20ma"]["history"]]
+    observations(rows[-2])["breadth"]["constituents"][0]["symbol"] = "NYSE:NEW_MEMBER"
+    result = build_internals(p, capture(rows), metrics)["persistence"]
+    assert result["state"] == "UNKNOWN"
+    assert result["comparable_sample_days"] == 1
 
 
 def rotation_records(p):

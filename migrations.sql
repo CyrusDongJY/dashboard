@@ -720,6 +720,7 @@ CREATE TABLE IF NOT EXISTS environment_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_environment_report_date ON environment_daily (report_date DESC);
 ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS shadow_mode boolean NOT NULL DEFAULT true;
+ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS details jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE environment_daily ADD COLUMN IF NOT EXISTS calc_version text NOT NULL DEFAULT 'env_v2';
 ALTER TABLE environment_daily ALTER COLUMN calc_version SET DEFAULT 'env_v2';
 

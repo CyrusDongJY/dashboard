@@ -7,7 +7,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from temporal_monitor import PANEL_SPECS
+from temporal_monitor import PANEL_SPECS, comparison_segments
 from report_style import configure_chinese_font
 
 
@@ -74,14 +74,15 @@ def generate_temporal_chart(history_rows, report_date, lookback_days=63,
         series = frame[frame["panel"] == panel].sort_values("report_date")
         if series.empty or series["risk_value"].notna().sum() == 0:
             continue
-        series = (series.drop_duplicates("report_date", keep="last")
-                  .set_index("report_date").reindex(dates))
-        ax_curve.plot(
-            series.index, series["risk_value"], linewidth=1.9,
-            marker=".", markersize=3.0, color=LINE_COLORS[panel],
-            linestyle="--" if panel == "risk_capital" else "-",
-            label=PANEL_LABELS_CN[panel],
-        )
+        for i, rows in enumerate(comparison_segments(series.to_dict("records"))):
+            segment = (pd.DataFrame(rows).drop_duplicates("report_date", keep="last")
+                       .set_index("report_date").reindex(dates))
+            ax_curve.plot(
+                segment.index, segment["risk_value"], linewidth=1.9,
+                marker=".", markersize=3.0, color=LINE_COLORS[panel],
+                linestyle="--" if panel == "risk_capital" else "-",
+                label=PANEL_LABELS_CN[panel] if i == 0 else "_nolegend_",
+            )
     ax_curve.axhspan(65, 100, color="#d92d20", alpha=0.06)
     ax_curve.axhline(65, color="#d92d20", linewidth=0.9, linestyle="--")
     ax_curve.axhline(35, color="#039855", linewidth=0.8, linestyle=":")
