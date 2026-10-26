@@ -588,9 +588,11 @@ def render_pdf(report, path, images=None, front_images=None):
                   "周频变化列依次为1周／4周；日频为1／5／21个原生业务日（股票NYSE、SOFR债市、EFFR联储）。"
                   "变化为原单位差值，百分数的变化为百分点，不是收益率。", y, 8)
     gap_text = "、".join(report["gaps"]) or "无已识别缺口"
+    if len(report["gaps"]) > 6:
+        gap_text = "、".join(report["gaps"][:6]) + f'等{len(report["gaps"])}项（完整清单见网页版）'
     if report.get("correction"):
         y = paragraph("本次核查更新：" + report["correction"]["note"] + "。原定时报告保留不动。", y, 8)
-    y = paragraph("原始指标日期/覆盖缺口：" + gap_text + "；不包含同版历史不足与补充来源不可用，详见首页及配置持仓页。", y, 8, "#8c3944")
+    y = paragraph("原始指标缺口：" + gap_text + "。历史不足与补充来源缺口见首页及配置持仓页。", y, 8, "#8c3944")
     y = paragraph("数据来源：纽约联储参考利率、FRED各原始序列、美国财政部DTS及现有系统收盘表。"
                   "逐项抓取时间、源名称、原始序列、规则版本与缺口原因见随日报保存的JSON。"
                   "定时报告09:15之后发布的信息不回填原邮件；核查更新版以页首独立截止时间为准。", y, 8)
