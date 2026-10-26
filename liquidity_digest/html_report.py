@@ -139,8 +139,9 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 @media print{{html{{background:#fff}}main{{max-width:none;padding:0}}nav{{display:none}}.table-wrap,.chart-wrap{{overflow:visible}}table{{min-width:0!important}}figure img{{min-width:0}}figure{{break-inside:avoid}}h2,h3{{break-after:avoid}}}}
 </style></head><body><main>
 <header><h1>{text(tag)}美股流动性与风险传导日报</h1>
-<p>盘前版 / 宏观与微观分层 · {text(report["report_date"])}</p>
+<p>{"核查更新版" if report.get("diagnostic") else "盘前版"} / 宏观与微观分层 · {text(report["report_date"])}</p>
 <p class="muted">美东{text(cutoff_label(report))}截止 · 收盘基准 {text(report["market_date"])} · 宏观按各源原生观测日</p>
+{('<p class="notice">本次核查：' + text(report['correction']['note']) + '。原定时报告保留不动。</p>') if report.get('correction') else ''}
 <nav aria-label="报告章节"><a href="#priority">资金曲线</a><a href="#overview">宏微观概况</a><a href="#tactical">战术压力</a><a href="#alerts">关键异常</a>
 <a href="#capital">配置与持仓</a><a href="#internals">市场内部</a><a href="#evidence">数据明细</a><a href="#trends">更多趋势</a><a href="#audit">来源审计</a></nav></header>
 {front_html(report, front_images)}

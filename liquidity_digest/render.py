@@ -134,8 +134,11 @@ def disagreement(report):
 
 def email_text(report):
     tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
-    lines = [tag + "美股流动性与风险传导日报｜盘前版",
+    edition = "核查更新版" if report.get("diagnostic") else "盘前版"
+    lines = [tag + "美股流动性与风险传导日报｜" + edition,
              f'报告日 {report["report_date"]}｜美东{cutoff_label(report)}截止｜收盘基准 {report["market_date"]}', ""]
+    if report.get("correction"):
+        lines.extend(["本次核查：" + report["correction"]["note"], "原定时报告保留不动。", ""])
     states = report["states"]
     domains = report["domains"]
     from .frontpage import build_frontpage, index_summary
@@ -197,10 +200,13 @@ def email_html(report, front_images=None):
     from .frontpage import front_html
     from .evidence import evidence_html
     tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
+    edition = "核查更新版" if report.get("diagnostic") else "盘前版"
     return ('<html lang="zh-CN"><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
             '<body style="font-family:sans-serif;color:#293b40;line-height:1.65;max-width:760px;margin:auto;padding:12px">'
             f'<h2>{tag}美股流动性与风险传导日报</h2>'
-            f'<p>{escape(report["report_date"])} 盘前版 | 微观与评分截至 {escape(report["market_date"])} 收盘；宏观按原生观测日</p>'
+            f'<p>{escape(report["report_date"])} {edition} | 美东{escape(cutoff_label(report))}截止；'
+            f'微观与评分截至 {escape(report["market_date"])} 收盘；宏观按原生观测日</p>'
+            + (f'<p>本次核查：{escape(report["correction"]["note"])}。原定时报告保留不动。</p>' if report.get("correction") else "")
             + front_html(report, front_images)
             + f'<p>{escape(report["domains"].get("evidence_note", ""))}</p>'
             + internals_html(report, compact=True)
@@ -579,6 +585,8 @@ def render_pdf(report, path, images=None, front_images=None):
                   "周频变化列依次为1周／4周；日频为1／5／21个原生业务日（股票NYSE、SOFR债市、EFFR联储）。"
                   "变化为原单位差值，百分数的变化为百分点，不是收益率。", y, 8)
     gap_text = "、".join(report["gaps"]) or "无已识别缺口"
+    if report.get("correction"):
+        y = paragraph("本次核查更新：" + report["correction"]["note"] + "。原定时报告保留不动。", y, 8)
     y = paragraph("待更新或需核查：" + gap_text + "。", y, 8, "#8c3944")
     y = paragraph("数据来源：纽约联储参考利率、FRED各原始序列、美国财政部DTS及现有系统收盘表。"
                   "逐项抓取时间、源名称、原始序列、规则版本与缺口原因见随日报保存的JSON。"

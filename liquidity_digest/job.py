@@ -61,7 +61,7 @@ def verify_bundle(folder):
         if file_hash(folder / name) != expected:
             raise ValueError("Frozen report integrity check failed")
     report = json.loads((folder / "report.json").read_text())
-    if report["version"] not in (VERSION, "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.3-shadow", "liquidity_digest_v1.2-shadow"):
+    if report["version"] not in (VERSION, "liquidity_digest_v1.7-shadow", "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.3-shadow", "liquidity_digest_v1.2-shadow"):
         raise ValueError("Report version mismatch")
     expected = legacy_files | ({"report.html"} if report["version"] != "liquidity_digest_v1.2-shadow" else set())
     if files != expected:
@@ -150,7 +150,7 @@ def send(store, config, report_plan, now=None, connector=smtp_connection):
             return {"status": "SKIPPED", "receipt": previous["status"]}
         folder = store.root / "reports" / report_plan["report_date"]
         report = verify_bundle(folder)
-        if report["demo"] or any(report[k] != report_plan[k]
+        if report["demo"] or report.get("diagnostic") or report.get("correction") or any(report[k] != report_plan[k]
                                  for k in ("report_date", "market_date", "cutoff", "send_at")):
             raise ValueError("Only today's frozen live report may be sent")
         sender, recipient = email_addresses(config)

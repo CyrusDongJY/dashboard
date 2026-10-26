@@ -48,6 +48,7 @@ def index_observation(report_plan, capture, key):
     result = dict(key=key, label=label, color=color, source=table, version=version,
                   value=None, source_date=None, coverage=None, state="数据不足", status="MISSING",
                   history=[], replay_history=[], changes={"1d": None, "5d": None, "21d": None},
+                  window_coverage={},
                   reason="尚无昨日合格记录", details={}, fetched_at=capture.get("captured_at"))
     try:
         captured = stamp(capture["captured_at"])
@@ -81,6 +82,12 @@ def index_observation(report_plan, capture, key):
     # Deterministic latest record; an invalid new row must not resurrect an older good one.
     indexed = {r["report_date"]: r for r in sorted(live, key=lambda r: (r["report_date"], stamp(r["created_at"])))}
     result["history"] = [{"date": d, "value": _value(r, key)} for d, r in sorted(indexed.items())]
+    days = sessions(date.fromisoformat(end) - timedelta(days=70), end)
+    for count in (1, 5, 21):
+        window = days[-count - 1:]
+        missing = [d for d in window if d not in indexed or _value(indexed[d], key) is None]
+        result["window_coverage"][str(count) + "d"] = {
+            "required": count + 1, "valid": len(window) - len(missing), "missing_dates": missing}
     if key == "core_funding":
         replay = {r["report_date"]: r for r in sorted(accepted, key=lambda r: stamp(r["created_at"]))
                   if r["observation_mode"] == "PIT_REPLAY"}
@@ -105,7 +112,21 @@ def index_observation(report_plan, capture, key):
                          else current.get("state") or "状态待核实") if value is not None else "数据不足",
                   reason="正式固定权重分数；越高代表支持越强" if value is not None else
                          "正式总分不可用；部分覆盖诊断值不替代正式分数")
-    days = sessions(date.fromisoformat(end) - timedelta(days=70), end)
+    if value is None:
+        components = detail.get("components") or []
+        if isinstance(components, dict):
+            components = list(components.values())
+        missing = []
+        for component in components:
+            if not isinstance(component, dict) or component.get("score") is not None:
+                continue
+            label = ("VX标准月期货曲线" if component.get("key") == "vix_futures_curve"
+                     else component.get("label") or component.get("key") or "未命名分项")
+            count, required = component.get("valid_obs_count"), component.get("required_obs_count")
+            suffix = f"（有效历史{count}/{required}）" if isinstance(count, int) and isinstance(required, int) else ""
+            missing.append(label + suffix)
+        if missing:
+            result["reason"] = "缺少合格分项：" + "、".join(missing) + "；不以诊断值替代正式总分"
     for count in (1, 5, 21):
         window = days[-count - 1:]
         if len(window) == count + 1 and all(d in indexed and _value(indexed[d], key) is not None for d in window):
@@ -158,6 +179,12 @@ def build_frontpage(report, inputs):
     for item in indices.values():
         if item["status"] != "OK":
             gaps.append(item["label"] + "：" + item["reason"])
+        elif item["changes"]["5d"] is None and item.get("window_coverage", {}).get("5d"):
+            window = item["window_coverage"]["5d"]
+            gaps.append(f'{item["label"]}：5日比较需6个同版有效快照，当前{window["valid"]}/6；历史回放不冒充实测')
+    ici = inputs.get("ici_flows", {})
+    if ici.get("status") and ici["status"] != "OK":
+        gaps.append("基金净申赎：ICI来源本次不可用；不据此推断资金流入或流出")
     core = indices["core_funding"]
     pressure = core["details"].get("funding_pressure") or {}
     if core["source_date"] == report["market_date"] and pressure.get("state") in ("ACUTE", "WATCH"):
@@ -232,7 +259,10 @@ def index_images(report):
 def index_summary(item):
     from .render import number
     coverage = item["coverage"]
-    return (f'{number(item["value"])}/100 · {item["state"]} · 5日 {number(item["changes"]["5d"], True)} 点；'
+    window = item.get("window_coverage", {}).get("5d")
+    change = (f'5日 {number(item["changes"]["5d"], True)} 点' if item["changes"]["5d"] is not None
+              else f'5日样本 {window["valid"]}/{window["required"]}' if window else '5日不可比较')
+    return (f'{number(item["value"])}/100 · {item["state"]} · {change}；'
             f'快照 {item["source_date"] or "缺失"} · 覆盖 {number(coverage * 100 if coverage is not None else None)}%')
 
 
