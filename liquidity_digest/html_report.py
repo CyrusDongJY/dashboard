@@ -3,12 +3,13 @@ from base64 import b64encode
 from html import escape
 
 from .render import (
-    LAYERS, chart_images, disagreement, number, quality, summary_lines, cutoff_label,
+    LAYERS, CHART_TITLES, chart_images, disagreement, number, quality, summary_lines, cutoff_label,
 )
 from .states import MATRIX_TEXT, matrix_note
 from .internals_view import internals_html
 from .frontpage import front_html, build_frontpage
 from .evidence import evidence_html
+from .reading import pressure_identity
 
 
 def text(value):
@@ -23,8 +24,8 @@ def table(headers, rows):
 
 def full_html(report, images=None, front_images=None):
     images = chart_images(report) if images is None else images
-    if len(images) != 3:
-        raise ValueError("Full report requires all three chart panels")
+    if len(images) != len(CHART_TITLES):
+        raise ValueError("Full report requires all eight chart panels")
     panels = []
     for key in ("macro", "micro"):
         domain = report["domains"][key]
@@ -58,6 +59,7 @@ def full_html(report, images=None, front_images=None):
                           + ("<small>当前</small>" if chosen else "") + "</span>")
     matrix.append("</div>")
     pressure_note = matrix_note(pressure)
+    pressure_title, pressure_source = pressure_identity(report)
     front = report.get("frontpage") or build_frontpage(report, {})
     alerts = "".join(f'<li>{text(a["text"])}</li>' for a in front["alerts"])
 
@@ -80,16 +82,13 @@ def full_html(report, images=None, front_images=None):
                     table(("指标", "单位", "当前", "各窗口变化", "观测日", "数据状态"), rows) + '</details>')
 
     charts = []
-    for title, caption, image in zip(
-        ("资金数量与分解", "资金价格与信用", "市场传导与连续状态"),
-        ("同日口径的净流动性代理与周变化分解，不等于进入股市的资金流。",
-         "融资利差与分层信用利差；日频缺失处断线，不以旧值填补。",
-         "各板块使用各自尺度；只保留最新规则版本，不相加或作为交易信号。"),
-        images,
-    ):
+    for i, (title, image) in enumerate(zip(CHART_TITLES, images)):
+        caption = ("同日口径，非进入股市的资金流。" if i < 2 else
+                   "原始利差；缺测断线，不以前值填补。" if i < 4 else
+                   "独立尺度；实线为正式观察，虚线为重算参考，非当时可得信号。65/35沿用既有观察线，非交易触发线。")
         data_uri = b64encode(image.getvalue()).decode("ascii")
-        charts.append(f'<figure><h3>{text(title)}</h3><div class="chart-wrap">'
-                      f'<img src="data:image/png;base64,{data_uri}" alt="{text(title)}" width="1717" height="360">'
+        charts.append(f'<figure><div class="chart-wrap">'
+                      f'<img src="data:image/png;base64,{data_uri}" alt="{text(title)}" width="918" height="476">'
                       f'</div><figcaption>{text(caption)}</figcaption></figure>')
     funding = report["states"]["funding"]
     funding_line = (f'综合流动性支持（混合指标，非纯宏观）：{number(funding["display_value"])}/100，'
@@ -115,52 +114,52 @@ def full_html(report, images=None, front_images=None):
 <title>{text(tag)}美股流动性与风险传导日报 {text(report["report_date"])}</title>
 <style>
 *{{box-sizing:border-box}}html{{background:#f4f6f7;color:#293b40;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;line-height:1.65;letter-spacing:0}}
-body{{margin:0}}main{{max-width:1180px;margin:auto;background:#fff;padding:32px 40px}}
-h1{{font-size:28px;line-height:1.35;margin:0 0 12px}}h2{{font-size:21px;line-height:1.4;margin:0 0 16px}}
+body{{margin:0}}main{{max-width:1180px;margin:auto;background:#fff;padding:22px 32px}}
+h1{{font-size:25px;line-height:1.35;margin:0 0 6px}}h2{{font-size:21px;line-height:1.4;margin:0 0 16px}}
 h3{{font-size:17px;margin:24px 0 10px}}p{{margin:10px 0}}a{{color:#176c8c;text-underline-offset:3px}}
-header{{border-bottom:2px solid #176c8c;padding-bottom:14px}}nav{{display:flex;gap:10px 20px;flex-wrap:wrap;margin-top:12px;font-size:13px}}
+header{{border-bottom:2px solid #176c8c;padding-bottom:8px}}header p{{margin:4px 0}}nav{{display:flex;gap:8px 20px;flex-wrap:wrap;margin-top:8px;font-size:13px}}
 .index-grid{{display:grid;grid-template-columns:1fr 1fr;gap:28px}}.index-panel p{{overflow-wrap:anywhere}}
-.band{{padding:28px 0;border-bottom:1px solid #dbe2e4}}.domains{{display:grid;grid-template-columns:1fr 1fr;gap:32px}}
+.band{{padding:22px 0;border-bottom:1px solid #dbe2e4}}.domains,.chart-grid{{display:grid;grid-template-columns:1fr 1fr;gap:24px}}
 .domain{{min-width:0}}.state{{font-size:29px;font-weight:600;line-height:1.25;margin:12px 0}}.muted,figcaption{{color:#5c7078;font-size:13px}}
 .notice{{color:#8c5e12}}.warning{{color:#a23646;border-left:3px solid #a23646;padding-left:12px}}
 .table-wrap,.chart-wrap{{overflow-x:auto;max-width:100%}}table{{width:100%;border-collapse:collapse;font-size:14px;text-align:left}}
 th{{background:#edf3f5;font-weight:600}}th,td{{padding:10px 12px;border-bottom:1px solid #e1e7e9;vertical-align:top}}
 td,th{{overflow-wrap:anywhere}}td:first-child{{min-width:120px}}.table-wrap table{{min-width:590px}}.domain table{{min-width:440px}}
+#tactical td,.tactical-components td{{min-width:0}}.tactical-components th{{min-width:0}}.tactical-detail{{margin:8px 0 0}}
 #internals td,#internals th{{min-width:0}}#internals table[role="presentation"] td,#internals table[role="img"] td{{border:0}}
 .confirmation{{display:grid;grid-template-columns:1fr 1fr;gap:32px}}.confirmation>*{{min-width:0}}
 .matrix{{display:grid;grid-template-columns:42px repeat(3,minmax(0,1fr));gap:4px;font-size:13px;text-align:center}}
 .matrix>span,.matrix>strong{{display:flex;align-items:center;justify-content:center;min-height:44px;padding:7px 3px;overflow-wrap:anywhere}}
 .matrix-cell{{background:#edf2f4;flex-direction:column}}.matrix-cell.current{{background:#293b40;color:#fff;outline:2px solid #176c8c;outline-offset:-2px}}
 .known-level{{color:#a23646;border-left:3px solid #a23646}}
-.matrix small{{display:block;font-size:11px}}figure{{margin:0 0 28px}}figure img{{display:block;width:100%;min-width:680px;height:auto;aspect-ratio:1717/360}}
+.matrix small{{display:block;font-size:11px}}figure{{margin:0;min-width:0}}figure img{{display:block;width:100%;height:auto;aspect-ratio:918/476}}
 figcaption{{margin-top:10px}}ul{{padding-left:22px}}li{{margin-bottom:8px}}details{{margin:18px 0}}summary{{cursor:pointer;font-weight:600;color:#176c8c}}
 footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:anywhere}}
-@media(max-width:760px){{main{{padding:24px 16px}}h1{{font-size:24px}}.domains,.confirmation,.index-grid{{grid-template-columns:1fr;gap:18px}}.band{{padding:24px 0}}.state{{font-size:26px}}.domain table{{min-width:0}}.domain td:first-child{{min-width:90px}}.domain td,.domain th{{font-size:13px;padding:8px 6px}}}}
+@media(max-width:760px){{main{{padding:16px}}h1{{font-size:22px}}.domains,.confirmation,.index-grid,.chart-grid{{grid-template-columns:1fr;gap:18px}}.band{{padding:20px 0}}.state{{font-size:26px}}.domain table{{min-width:0}}.domain td:first-child{{min-width:90px}}.domain td,.domain th{{font-size:13px;padding:8px 6px}}#overview h2{{font-size:14px!important}}}}
 @media print{{html{{background:#fff}}main{{max-width:none;padding:0}}nav{{display:none}}.table-wrap,.chart-wrap{{overflow:visible}}table{{min-width:0!important}}figure img{{min-width:0}}figure{{break-inside:avoid}}h2,h3{{break-after:avoid}}}}
 </style></head><body><main>
-<header><h1>{text(tag)}美股流动性与风险传导日报</h1>
-<p>{"核查更新版" if report.get("diagnostic") else "盘前版"} / 宏观与微观分层 · {text(report["report_date"])}</p>
+<header><h1>美股流动性与风险传导日报</h1>
+<p class="muted">{text(tag) if tag else "盘前版"} · {text(report["report_date"])}</p>
 <p class="muted">美东{text(cutoff_label(report))}截止 · 收盘基准 {text(report["market_date"])} · 宏观按各源原生观测日</p>
-{('<p class="notice">本次核查：' + text(report['correction']['note']) + '。原定时报告保留不动。</p>') if report.get('correction') else ''}
-<nav aria-label="报告章节"><a href="#priority">资金曲线</a><a href="#overview">宏微观概况</a><a href="#tactical">战术压力</a><a href="#alerts">关键异常</a>
-<a href="#capital">配置与持仓</a><a href="#internals">市场内部</a><a href="#evidence">数据明细</a><a href="#trends">更多趋势</a><a href="#audit">来源审计</a></nav></header>
+<nav aria-label="报告章节"><a href="#overview">今日概况</a><a href="#trends">趋势图表</a><a href="#evidence">分类证据</a><a href="#audit">来源审计</a></nav></header>
 {front_html(report, front_images)}
 <section id="domain-evidence" class="band"><p class="muted">{text(report["domains"].get("evidence_note", ""))}</p>
 <details><summary>宏观与微观分组证据</summary><div class="domains">{"".join(panels)}</div></details></section>
 {internals_html(report)}
 {evidence_html(report)}
-<section class="band confirmation"><div><h2>跨资产确认 / 压力水位与方向</h2>{"".join(matrix)}
-<p class="muted">{text(pressure_note)}</p><p class="muted">{text(pressure["reason"])}</p></div><div><h2>异常明细与分歧</h2><ul>{alerts or "<li>未检出既有观察规则异常，不代表没有风险。</li>"}</ul>
-<p class="notice">数据待核查：{text("；".join(front["gaps"]) or "无已识别缺口")}</p>
-<p>{text(disagreement(report))}</p></div></section>
+<section class="band confirmation"><div><h2>{text(pressure_title)}</h2><p><strong>{text(pressure_source)}</strong> · {text(number(pressure["risk_value"]))}/100</p>{"".join(matrix)}
+<p class="muted">{text(pressure_note)}</p><p class="muted">{text(pressure["reason"])}</p></div><div><h2>交叉核查</h2>
+<p>{text(disagreement(report))}</p><p class="muted">环境压力与战术压力并非同一指标，不相加、不重复投票。关键异常及数据缺口见首页。</p></div></section>
 <section id="evidence" class="band"><h2>分类数据与观测日期</h2>
 {"".join(f"<p>{text(line)}</p>" for line in summary_lines(report))}
 {"".join(data)}<p class="warning">原始指标日期/覆盖缺口：{text(gaps)}；不包含同版历史不足与补充来源不可用，详见首页及配置持仓板块。缺失及过期数据不参与状态确认。</p>
 <p class="notice">错期参考：{text("；".join(report.get("publication_lags", [])) or "无")}。不冒充昨日同步数据。</p></section>
-<section id="trends" class="band"><h2>趋势与证据 / 近150个自然日</h2>{"".join(charts)}
+<section id="trends" class="band"><h2>趋势与证据 / 近150个自然日</h2><h3>资金数量、融资价格与信用</h3><div class="chart-grid">{"".join(charts[:4])}</div>
+<h3>市场传导与连续状态</h3><p class="muted">四个指标各自独立，不比较分数大小，不求和；缺测仍断线。</p><div class="chart-grid">{"".join(charts[4:])}</div>
 <p>{text(funding_line)}</p>{"".join(market_states)}<h3>优先查阅</h3>
 <ul>{focus or "<li>尚无足够连续观测确认方向。</li>"}</ul></section>
 <section id="audit" class="band"><h2>数据来源与解释边界</h2>
+{('<p class="notice">本次核查：' + text(report['correction']['note']) + '。原定时报告保留不动。</p>') if report.get('correction') else ''}
 <p>{text(report["domains"]["scope_note"])}</p>
 <p>宏微观各3组证据需完整，至少2组同向且无反向；1组变化称局部，冲突称分化。
 数量组用1周/4周，其他组用5日/21日，不能视为同日同步变化。边际改善不等于当前宽松。</p>

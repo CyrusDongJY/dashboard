@@ -122,5 +122,5 @@ def test_chart_uses_existing_pressure_boundaries(monkeypatch):
         return original(self, y, *args, **kwargs)
 
     monkeypatch.setattr(Axes, "axhline", record)
-    assert len(chart_images(sample_report(plan("2026-10-23")))) == 3
+    assert len(chart_images(sample_report(plan("2026-10-23")))) == 8
     assert HIGH_PRESSURE in seen and LOW_PRESSURE in seen

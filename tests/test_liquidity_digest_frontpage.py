@@ -158,11 +158,11 @@ def test_alerts_explain_raw_values_and_thresholds_separately_from_gaps():
     assert "400.00基点" not in str(build_frontpage(report, {})["alerts"])
 
 
-def test_home_has_funds_then_domains_then_tactical_then_alerts():
+def test_home_has_domains_then_tactical_then_alerts_then_funds():
     report = sample_report(P)
     images = [BytesIO(PNG), BytesIO(PNG)]
     html = front_html(report, images)
-    assert html.index('id="priority"') < html.index('id="overview"') < html.index('id="tactical"') < html.index('id="alerts"')
+    assert html.index('id="overview"') < html.index('id="tactical"') < html.index('id="alerts"') < html.index('id="priority"')
     assert html.count('id="overview"') == 1
     assert html.index("宏观资金与融资") < html.index("盘后跨资产战术压力观察")
     assert html.index("微观市场承接") < html.index("盘后跨资产战术压力观察")

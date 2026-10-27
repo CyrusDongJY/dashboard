@@ -167,7 +167,7 @@ def test_single_temporal_observation_has_visible_marker_and_label(monkeypatch):
         report['temporal'][key] = report['temporal'][key][-1:]
     images = chart_images(report)
     singles = [c for c in calls if '单点，趋势待积累' in c.get('label', '')]
-    assert len(images) == 3 and len(singles) == 4
+    assert len(images) == 8 and len(singles) == 4
     assert all(c['marker'] == 'o' and c['markersize'] >= 4 and c['clip_on'] is False for c in singles)
 
 

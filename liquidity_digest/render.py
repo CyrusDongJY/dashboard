@@ -22,6 +22,8 @@ COLORS = {"environment": "#b83e4b", "tactical_stress": "#7255a5",
           "risk_capital": "#008c83", "liquidity": "#246ca0"}
 PANEL_CN = {"environment": "综合环境压力", "tactical_stress": "跨资产战术压力",
             "risk_capital": "风险资本收缩", "liquidity": "综合流动性压力"}
+CHART_TITLES = ("净流动性代理", "同日口径的周变化分解", "融资成本与尾部利差", "信用风险分层",
+                *PANEL_CN.values())
 
 
 @lru_cache(maxsize=1)
@@ -205,20 +207,21 @@ def data_text(report):
 
 
 def email_html(report, front_images=None):
-    from .frontpage import front_html
+    from .frontpage import front_html, tactical_detail_html
     from .evidence import evidence_html
     tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
     edition = "核查更新版" if report.get("diagnostic") else "盘前版"
     return ('<html lang="zh-CN"><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
             '<body style="font-family:sans-serif;color:#293b40;line-height:1.65;max-width:760px;margin:auto;padding:12px">'
-            f'<h2>{tag}美股流动性与风险传导日报</h2>'
-            f'<p>{escape(report["report_date"])} {edition} | 美东{escape(cutoff_label(report))}截止；'
+            '<h2 style="font-size:22px;margin:8px 0">美股流动性与风险传导日报</h2>'
+            + (f'<p style="font-size:12px;color:#9b3545;margin:4px 0">{tag}</p>' if tag else '')
+            + f'<p style="font-size:12px;margin:4px 0">{escape(report["report_date"])} {edition} | 美东{escape(cutoff_label(report))}截止；'
             f'微观与评分截至 {escape(report["market_date"])} 收盘；宏观按原生观测日</p>'
-            + (f'<p>本次核查：{escape(report["correction"]["note"])}。原定时报告保留不动。</p>' if report.get("correction") else "")
-            + front_html(report, front_images)
-            + f'<p>{escape(report["domains"].get("evidence_note", ""))}</p>'
+            + front_html(report, front_images, compact=True)
             + internals_html(report, compact=True)
             + evidence_html(report, compact=True)
+            + '<h3>战术压力分项</h3>' + tactical_detail_html(report)
+            + (f'<p style="font-size:12px;color:#806120">本次核查：{escape(report["correction"]["note"])}。原定时报告保留不动。</p>' if report.get("correction") else "")
             + '<p style="font-size:13px">完整分类数据、历史趋势和来源审计见HTML网页版或PDF附件。'
             'HTML附件可离线打开，原有独立报告保持不变。</p></body></html>')
 
@@ -258,26 +261,43 @@ def chart_images(report):
             ax.set_xlim(start, date.fromisoformat(report["market_date"]))
             ax.grid(axis="y", alpha=.18)
             ax.spines[["top", "right"]].set_visible(False)
-            ax.tick_params(labelsize=7)
+            ax.tick_params(labelsize=9)
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=5))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
             handles, _ = ax.get_legend_handles_labels()
             if handles:
-                ax.legend(fontsize=7, frameon=False, loc="best")
+                ax.legend(fontsize=8, frameon=False, loc="best")
             else:
                 ax.text(.5, .5, "数据不足，等待有效观测", transform=ax.transAxes, ha="center", fontsize=9)
-        fig.tight_layout(pad=.8)
+        fig.tight_layout(pad=1.1)
         out = BytesIO()
         fig.savefig(out, format="png", dpi=170, facecolor="white")
         plt.close(fig)
         out.seek(0)
         return out
 
+    def canvas(title, unit):
+        fig, ax = plt.subplots(figsize=(5.4, 2.8))
+        ax.set_title(title, loc="left", fontsize=11, pad=12)
+        ax.set_ylabel(unit, fontsize=9)
+        return fig, ax
+
+    def endpoint(ax, points, color, prefix=""):
+        valid = [p for p in points if str(start) <= p["date"] <= report["market_date"] and finite(p["value"]) is not None]
+        if valid:
+            last = max(valid, key=lambda p: p["date"])
+            value = last["value"]
+            ax.annotate(f'{prefix}{value:.1f} · {last["date"][5:]}',
+                        (date.fromisoformat(last["date"]), value), xytext=(-4, -15 if value > 85 else 9),
+                        textcoords="offset points", ha="right", fontsize=8, color=color,
+                        bbox={"facecolor": "white", "alpha": .85, "edgecolor": "none", "pad": 1})
+
     images = []
-    fig, axes = plt.subplots(1, 2, figsize=(10.1, 2.12))
-    line(axes[0], metrics["net_liquidity"]["history"], "净流动性代理", "#176c8c", "weekly")
-    axes[0].set_title("同日资产 - 财政账户 - 逆回购", fontsize=9)
-    axes[0].set_ylabel("十亿美元", fontsize=8)
+    fig, ax = canvas(CHART_TITLES[0], "十亿美元")
+    line(ax, metrics["net_liquidity"]["history"], "同日资产 - 财政账户 - 逆回购", "#176c8c", "weekly")
+    endpoint(ax, metrics["net_liquidity"]["history"], "#176c8c")
+    images.append(finish(fig, [ax]))
+    fig, ax = canvas(CHART_TITLES[1], "十亿美元 / 周")
     net_dates = [p["date"] for p in metrics["net_liquidity"]["history"] if p["date"] >= str(start)]
     for key, label, color, sign in (
         ("fed_assets", "总资产变化", "#176c8c", 1),
@@ -290,50 +310,48 @@ def chart_images(report):
             previous = str(date.fromisoformat(day) - timedelta(days=7))
             if day in raw and previous in raw:
                 changes.append({"date": day, "value": sign * (raw[day] - raw[previous])})
-        line(axes[1], changes, label, color, "weekly")
-    axes[1].axhline(0, color="#777777", linewidth=.6)
-    axes[1].set_title("同日口径的周变化分解", fontsize=9)
-    axes[1].set_ylabel("十亿美元 / 周", fontsize=8)
-    images.append(finish(fig, axes))
+        line(ax, changes, label, color, "weekly")
+    ax.axhline(0, color="#777777", linewidth=.6)
+    images.append(finish(fig, [ax]))
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.1, 2.12))
+    fig, ax = canvas(CHART_TITLES[2], "基点")
     for key, label, color in (("sofr_iorb", "SOFR-IORB", "#176c8c"),
                                ("effr_iorb", "EFFR-IORB", "#008c83"),
                                ("sofr_tail", "SOFR尾部", "#bd5135")):
-        line(axes[0], metrics[key]["history"], label, color, key=key)
-    axes[0].set_title("融资成本与尾部利差", fontsize=9)
+        line(ax, metrics[key]["history"], label, color, key=key)
+    images.append(finish(fig, [ax]))
+    fig, ax = canvas(CHART_TITLES[3], "基点")
     for key, label, color in (("ig", "投资级", "#176c8c"), ("hy", "高收益", "#bd5135"),
                                ("ccc", "CCC及以下", "#7255a5")):
-        line(axes[1], metrics[key]["history"], label, color, key=key)
-    axes[1].set_title("信用风险分层", fontsize=9)
-    for ax in axes:
-        ax.set_ylabel("基点", fontsize=8)
-    images.append(finish(fig, axes))
+        line(ax, metrics[key]["history"], label, color, key=key)
+    images.append(finish(fig, [ax]))
 
-    fig, ax = plt.subplots(figsize=(10.1, 2.12))
     from temporal_monitor import comparison_segments
+    from temporal_monitor import HIGH_PRESSURE, LOW_PRESSURE
     for key, color in COLORS.items():
+        fig, ax = canvas(PANEL_CN[key], "压力方向值 / 100")
         references = report.get("reference_history", {}).get(key, [])
         for i, segment in enumerate(comparison_segments(references)):
             line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in segment],
-                 PANEL_CN[key] + "（重算参考）" if i == 0 else "_nolegend_", color, style="--")
+                 "历史重算参考（非当时可得）" if i == 0 else "_nolegend_", color, style="--")
         records = report["temporal"].get(key, [])
         for i, segment in enumerate(comparison_segments(records)):
             line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in segment],
-                 PANEL_CN[key] if i == 0 else "_nolegend_", color)
-    ax.set_ylim(0, 100)
-    from temporal_monitor import HIGH_PRESSURE, LOW_PRESSURE
-    ax.axhspan(HIGH_PRESSURE, 100, color="#b83e4b", alpha=.055, zorder=0)
-    ax.axhline(HIGH_PRESSURE, color="#9e283b", linewidth=1.05, linestyle="-.", zorder=1)
-    ax.axhline(LOW_PRESSURE, color="#637a70", linewidth=.8, linestyle=":", zorder=1)
-    for value, label, color in ((HIGH_PRESSURE, f"{HIGH_PRESSURE:g} 高压观察线", "#9e283b"),
-                                (LOW_PRESSURE, f"{LOW_PRESSURE:g} 低压分界线", "#637a70")):
-        ax.annotate(label, xy=(.99, value), xycoords=("axes fraction", "data"),
-                    xytext=(0, 3), textcoords="offset points", ha="right", fontsize=7,
-                    color=color, bbox={"facecolor": "white", "alpha": .85, "edgecolor": "none", "pad": 1})
-    ax.set_title("核心板块时间状态：既有影子观察线，非交易触发线；各自尺度，不可相加", fontsize=9)
-    ax.set_ylabel("压力方向值", fontsize=8)
-    images.append(finish(fig, [ax]))
+                 "正式观察记录" if i == 0 else "_nolegend_", color)
+        observed = [r for r in records if finite(r.get("risk_value")) is not None]
+        latest = observed or [r for r in references if finite(r.get("risk_value")) is not None]
+        endpoint(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in latest],
+                 color, "" if observed else "重算 ")
+        ax.set_ylim(0, 100)
+        ax.axhspan(HIGH_PRESSURE, 100, color="#b83e4b", alpha=.055, zorder=0)
+        ax.axhline(HIGH_PRESSURE, color="#9e283b", linewidth=1.05, linestyle="-.", zorder=1)
+        ax.axhline(LOW_PRESSURE, color="#637a70", linewidth=.8, linestyle=":", zorder=1)
+        for value, label, ink in ((HIGH_PRESSURE, f"{HIGH_PRESSURE:g} 高压观察线", "#9e283b"),
+                                  (LOW_PRESSURE, f"{LOW_PRESSURE:g} 低压分界线", "#637a70")):
+            ax.annotate(label, xy=(.01, value), xycoords=("axes fraction", "data"),
+                        xytext=(0, 3), textcoords="offset points", fontsize=8,
+                        color=ink, bbox={"facecolor": "white", "alpha": .85, "edgecolor": "none", "pad": 1})
+        images.append(finish(fig, [ax]))
     return images
 
 
@@ -350,7 +368,7 @@ def render_pdf(report, path, images=None, front_images=None):
     c.setTitle("美股流动性与风险传导日报")
     c.setAuthor("Market Dashboard")
     margin, width = 34, 527
-    total_pages = (4 if report.get("internals") else 3) + bool(report.get("capital"))
+    total_pages = (5 if report.get("internals") else 4) + bool(report.get("capital"))
 
     def text(value, x, y, size=9, color="#293b40"):
         c.setFont(font, size)
@@ -375,25 +393,17 @@ def render_pdf(report, path, images=None, front_images=None):
             text("核查更新版 · 非原定时报告", 390, 807, 9, "#b83e4b")
         c.setStrokeColor("#c4d0d3")
         c.line(margin, 752, 561, 752)
-        text(f'影子观察 | {report["version"]} | {page}/{total_pages}', margin, 23, 7, "#63757a")
+        text(f'影子观察 | {report["version"]} | 第 {c.getPageNumber()} 页', margin, 23, 7, "#63757a")
 
     from .frontpage import build_frontpage, index_images, index_summary
     front = report.get("frontpage") or build_frontpage(report, {})
     front_images = index_images(report) if front_images is None else front_images
     if len(front_images) != 2:
         raise ValueError("Front page requires two index charts")
-    header("首页 / 宏微观概况、资金曲线与跨资产压力", 1)
-    y = paragraph(report["domains"]["headline"], 740, 13)
-    y = paragraph(report["domains"]["relation"], y, 9)
-    top = y - 8
-    for i, (item, image) in enumerate(zip(front["indices"].values(), front_images)):
-        x = margin + i * 273
-        text(item["label"], x, top, 12, item["color"])
-        bottom = paragraph(index_summary(item), top - 10, 8, x=x, max_width=254)
-        c.drawImage(ImageReader(image), x, bottom - 111, width=254, height=111, mask="auto")
-        paragraph(item["reason"], bottom - 115, 7, "#63757a", x=x, max_width=254)
-    y = paragraph(front["scope_note"], top - 180, 8, "#63757a")
-    domain_top = y - 8
+    from .reading import tactical_view, pressure_identity
+    view = tactical_view(report)
+    header("今日概况 / 宏观、微观与跨资产压力", 1)
+    domain_top = 735
     for key, x in (("macro", margin), ("micro", 307)):
         domain = report["domains"][key]
         state = domain["short"]
@@ -405,24 +415,50 @@ def render_pdf(report, path, images=None, front_images=None):
             text(group["label"] + "：" + group["short"]["label"], x,
                  domain_top - 52 - i * 12, 8, group["short"]["color"])
         text(f'近期有效 {state["ready_groups"]}/3 组；缺失不代表平稳。', x, domain_top - 90, 7, "#63757a")
-    y = domain_top - 98
+    y = paragraph(report["domains"]["relation"], domain_top - 101, 8, "#63757a")
     text("盘后跨资产战术压力观察", margin, y - 12, 12, "#7255a5")
     y -= 26
-    for line in tactical_lines(report):
-        y = paragraph(line, y, 9)
-    y = paragraph("影子观察，不触发预警；跨资产确认层，不作为宏微观重复投票。", y, 8, "#63757a")
+    y = paragraph(f'当前 {number(view["score"])}/100 · {view["direction"]} · 截至 {view["date"]}', y, 12, "#7255a5")
+    for i, (key, label) in enumerate((("1d", "1日净变化"), ("5d", "5日净变化"), ("21d", "21日净变化"))):
+        text(label, margin + i * 176, y - 10, 8, "#63757a")
+        text(number(view["changes"].get(key), True) + " 点", margin + i * 176, y - 28, 13)
+    y = paragraph("连续性：" + view["continuity"], y - 38, 9, "#806120")
+    context = view["context"]
+    y = paragraph(f'VIX {number(view["components"][0]["value"])}；VIX 5日变化 {number(context.get("vix_5d_change"), True)} 点；'
+                  f'VIX/VIX3M {number(context.get("vix_term_ratio"))}。分项与观测日见末页。', y, 8)
+    y = paragraph(view["change_basis"] + "；跨资产确认，非纯微观。影子观察，不触发预警，不重复投票。", y, 7, "#63757a")
     text("关键异常与分歧", margin, y - 10, 12, "#9b3545")
     y -= 23
-    alerts = front["alerts"][:4] or [{"text": "未检出既有观察规则异常；不代表没有风险。"}]
+    alerts = front["alerts"] or [{"text": "未检出既有观察规则异常；不代表没有风险。"}]
+
+    def flow_notice(value, y, color):
+        style = ParagraphStyle("notice", fontName=font, fontSize=8, leading=12, wordWrap="CJK")
+        _, height = Paragraph(escape(value), style).wrap(width, 700)
+        if y - height < 48:
+            c.showPage()
+            header("关键异常与数据完整性（续）", c.getPageNumber())
+            y = 738
+        return paragraph(value, y, 8, color)
+
     for alert in alerts:
-        y = paragraph("• " + alert["text"], y, 9, "#9b3545")
-    if len(front["alerts"]) > 4:
-        y = paragraph(f'另有 {len(front["alerts"]) - 4} 项提示，见网页版异常明细。', y, 8)
-    if front["gaps"]:
-        y = paragraph("数据完整性：" + "；".join(front["gaps"][:2]) + "。完整缺口见分类数据与审计。", y - 3, 8, "#806120")
-    y = paragraph("曲线仅连接同版有效观测，缺测处断线；回放参考单列，不补入实测趋势。资金分数不代表股票现金流。", y, 7, "#63757a")
+        y = flow_notice("观察：" + alert["text"], y, "#9b3545")
+    for gap in front["gaps"]:
+        y = flow_notice("数据完整性：" + gap, y, "#806120")
+    if y < 248:
+        c.showPage()
+        header("核心资金曲线 / 首页警示续页后", c.getPageNumber())
+        y = 740
+    top = y - 16
+    bottoms = []
+    for i, (item, image) in enumerate(zip(front["indices"].values(), front_images)):
+        x = margin + i * 273
+        text(item["label"], x, top, 12, item["color"])
+        bottom = paragraph(index_summary(item), top - 10, 8, x=x, max_width=254)
+        c.drawImage(ImageReader(image), x, bottom - 111, width=254, height=111, mask="auto")
+        bottoms.append(paragraph(item["reason"], bottom - 115, 7, "#63757a", x=x, max_width=254))
+    y = paragraph(front["scope_note"], min(bottoms) - 4, 7, "#63757a")
     if y < 40:
-        raise ValueError("Priority page exceeds layout budget")
+        raise ValueError("Priority chart page exceeds layout budget")
     c.showPage()
 
     header("分类证据 / 宏观与微观分层", 2)
@@ -455,7 +491,8 @@ def render_pdf(report, path, images=None, front_images=None):
 
     domain_panel(domains["macro"], 34, 682)
     domain_panel(domains["micro"], 307, 682)
-    text("跨资产确认 / 压力水位 × 方向", margin, 553, 11, "#176c8c")
+    pressure_title, pressure_source = pressure_identity(report)
+    text(pressure_title + "（" + pressure_source.replace("本图采用：", "") + "）", margin, 553, 10, "#176c8c")
     pressure = states.get("display_pressure", states["pressure"])
     text("提示与分歧", 350, 553, 11, "#176c8c")
     matrix_x, matrix_top, cell_w, cell_h = 71, 530, 82, 30
@@ -581,13 +618,14 @@ def render_pdf(report, path, images=None, front_images=None):
         if y < 40:
             raise ValueError("Capital evidence page exceeds layout budget")
         c.showPage()
-    header("趋势与证据 / 近150个自然日", total_pages)
+    header("资金数量、融资价格与信用 / 近150个自然日", total_pages - 1)
     images = chart_images(report) if images is None else images
-    y = 740
-    for title, image in zip(("01 资金数量与分解", "02 资金价格与信用", "03 市场传导与连续状态"), images):
-        text(title, margin, y, 11, "#176c8c")
-        c.drawImage(ImageReader(image), margin, y - 127, width=width, height=111, mask="auto")
-        y -= 145
+    if len(images) != len(CHART_TITLES):
+        raise ValueError("PDF requires all eight chart panels")
+    for i, image in enumerate(images[:4]):
+        x, top = margin + (i % 2) * 273, 735 - (i // 2) * 167
+        c.drawImage(ImageReader(image), x, top - 132, width=254, height=132, mask="auto")
+    y = 393
     funding = states["funding"]
     y = paragraph(f'综合流动性支持（混合指标，非纯宏观）：{number(funding["display_value"])}/100，'
                   f'{funding["level_cn"]} / {funding["direction_cn"]}；5日压力方向变化 '
@@ -600,8 +638,7 @@ def render_pdf(report, path, images=None, front_images=None):
         row = report["panels"].get(panel)
         value = (row.get("state_cn") or "状态待核实") if row else "昨日记录缺失"
         y = paragraph(f"{label}：{value}。", y, 9)
-    y = paragraph("读图口径：周频按原始观测点展示，日频缺失处断线；各面板只保留最新规则版本，"
-                  "不拼接回放结果。历史序列采用本次抓取时可见的修订值，不代表当时已经可知。", y, 8)
+    y = paragraph("读图口径：周频按原始观测点展示，日频缺失处断线。历史序列采用本次抓取时可见的修订值，不代表当时已经可知。", y, 8)
     y = paragraph("宏微观方向要求各3组证据完整，至少2组同向且无反向；1组变化只称局部，冲突称分化。"
                   "数量组用1周/4周，其他组用5日/21日，窗口不能视为同日同步变化。"
                   "利率、美元、日元、CCC利差与集中度作背景；VIX、MOVE与战术压力作综合确认，不重复投票。", y, 8)
@@ -620,4 +657,30 @@ def render_pdf(report, path, images=None, front_images=None):
                   "定时报告09:15之后发布的信息不回填原邮件；核查更新版以页首独立截止时间为准。", y, 8)
     if y < 40:
         raise ValueError("Page two content exceeds layout budget")
+    c.showPage()
+    header("市场传导与连续状态 / 独立尺度，不相加", total_pages)
+    for i, image in enumerate(images[4:]):
+        x, top = margin + (i % 2) * 273, 735 - (i // 2) * 167
+        c.drawImage(ImageReader(image), x, top - 132, width=254, height=132, mask="auto")
+    y = paragraph("实线为正式观察记录，虚线为历史重算参考；缺测处断线，单点不构成趋势。"
+                  "65高压观察线、35低压分界线沿用既有影子规则，非交易触发线。四项分数不作横向风险排名。", 402, 8, "#63757a")
+    y = paragraph("战术压力评分分项 / 与综合环境压力分开观察", y - 10, 12, "#7255a5")
+    for dx, label in ((0, "指标"), (125, "观测值"), (230, "贡献分"), (330, "观测日期"), (440, "数据状态")):
+        text(label, margin + dx, y - 8, 8, "#63757a")
+    y -= 27
+    for item in view["components"]:
+        for dx, value in ((0, item["label"]), (125, number(item["value"])),
+                          (230, number(item["contribution"], True) if item["status"] == "可用" else "不可用"),
+                          (330, item["date"]), (440, item["status"])):
+            text(value, margin + dx, y, 9)
+        c.setStrokeColor("#e1e7e9")
+        c.line(margin, y - 5, 561, y - 5)
+        y -= 21
+    y = paragraph(f'VIX 252日分位 {number(view["context"].get("vix_percentile_252"))}%；'
+                  f'覆盖率 {number(view["coverage"] * 100 if view["coverage"] is not None else None)}%；'
+                  f'原评分置信度 {number(view["confidence"] * 100 if view["confidence"] is not None else None)}%（非预测准确率）。', y, 8)
+    y = paragraph("版本 " + view["version"] + "；TRIN为样本代理；分项贡献不改变现有封顶与取整规则。", y, 8, "#63757a")
+    y = paragraph("连续性：" + view["continuity"], y, 8, "#806120")
+    if y < 40:
+        raise ValueError("Transmission page exceeds layout budget")
     c.save()

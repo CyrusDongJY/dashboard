@@ -200,7 +200,7 @@ def test_multiple_warning_pdf_preserves_five_page_layout(tmp_path):
     path = tmp_path / "warnings.pdf"
     render_pdf(full, path)
     reader = PdfReader(path)
-    assert len(reader.pages) == 5
+    assert len(reader.pages) == 6
     assert "单日突变" in reader.pages[0].extract_text()
     assert "证据不足" in reader.pages[0].extract_text()
     assert "方向待确认" in reader.pages[4].extract_text()

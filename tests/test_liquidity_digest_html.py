@@ -34,7 +34,7 @@ def report():
 
 
 def images():
-    return [BytesIO(PNG) for _ in range(3)]
+    return [BytesIO(PNG) for _ in range(8)]
 
 
 def stub_pdf(report, path, **kwargs):
@@ -59,7 +59,7 @@ def test_html_self_contained_and_complete(report):
     assert html.startswith("<!doctype html>")
     assert not {"script", "iframe", "object", "embed", "form", "link"} & {tag for tag, _ in nodes}
     imgs = [a for tag, a in nodes if tag == "img"]
-    assert len(imgs) == 5
+    assert len(imgs) == 10
     for img in imgs:
         assert img["src"].startswith("data:image/png;base64,")
         assert b64decode(img["src"].split(",", 1)[1]).startswith(b"\x89PNG")
@@ -86,7 +86,7 @@ def test_html_escapes_all_external_text(report):
     html = full_html(report, images())
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
-    assert len([1 for tag, _ in Elements(html).nodes if tag == "img"]) == 5
+    assert len([1 for tag, _ in Elements(html).nodes if tag == "img"]) == 10
 
 
 def test_missing_html_keeps_unknown_semantics():
@@ -166,7 +166,7 @@ def test_legacy_archive_still_readable_without_rewriting(bundle):
     assert file_hash(folder / "manifest.json") == before
 
 
-@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.7-shadow", "liquidity_digest_v1.7.1-shadow", "liquidity_digest_v1.7.2-shadow", "liquidity_digest_v1.7.3-shadow"])
+@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.7-shadow", "liquidity_digest_v1.7.1-shadow", "liquidity_digest_v1.7.2-shadow", "liquidity_digest_v1.7.3-shadow", "liquidity_digest_v1.7.4-shadow"])
 def test_prior_archives_preserve_html_attachment_contract(bundle, version):
     _, folder = bundle
     report = json.loads((folder / "report.json").read_text())

@@ -268,7 +268,7 @@ def index_images(report):
         for item in front["indices"].values():
             fig, ax = plt.subplots(figsize=(5.4, 2.35))
             labeled = False
-            for segment in item.get("legacy_segments", []):
+            for segment_index, segment in enumerate(item.get("legacy_segments", [])):
                 points = {p["date"]: p["value"] for p in segment["points"]}
                 if any(v is not None for v in points.values()):
                     ax.plot([date.fromisoformat(d) for d in grid],
@@ -276,6 +276,11 @@ def index_images(report):
                             color="#75858d", linewidth=1.3, marker=".", markersize=2,
                             label="旧版存档（按版本断开）" if not labeled else "_nolegend_")
                     labeled = True
+                    if segment is not item["legacy_segments"][0]:
+                        boundary = date.fromisoformat(segment["points"][0]["date"])
+                        ax.axvline(boundary, color="#a4adb1", linewidth=.7, linestyle=":")
+                        ax.text(boundary, 96 - (segment_index % 2) * 12, segment["version"].replace("liquidity_", ""),
+                                color="#63757a", fontsize=7, va="top", ha="left")
             for key, label, style, color in (
                 ("replay_history", "新版同口径重算参考" if item["key"] == "liquidity" else "历史回放参考（非实测）", "--", "#46699a" if item["key"] == "liquidity" else "#8b9299"),
                 ("history", "实测发布" if item["key"] == "core_funding" else "存档计算值（非PIT）", "-", item["color"]),
@@ -285,6 +290,18 @@ def index_images(report):
                     ax.plot([date.fromisoformat(d) for d in grid],
                             [values.get(d) if values.get(d) is not None else float("nan") for d in grid],
                             linestyle=style, color=color, linewidth=1.8, marker=".", markersize=2.5, label=label)
+            if item.get("legacy_segments") and item["history"]:
+                boundary = date.fromisoformat(item["history"][0]["date"])
+                ax.axvline(boundary, color=item["color"], linewidth=.7, linestyle=":")
+                ax.text(boundary, 96, "新版", color=item["color"], fontsize=7, ha="right", va="top")
+            valid = [p for p in item["history"] if p["value"] is not None and str(start) <= p["date"] <= str(end)]
+            if valid:
+                last = max(valid, key=lambda p: p["date"])
+                ax.annotate(f'{last["value"]:.1f} · {last["date"][5:]}',
+                            (date.fromisoformat(last["date"]), last["value"]),
+                            xytext=(-4, 9 if last["value"] < 85 else -15), textcoords="offset points",
+                            fontsize=8, color=item["color"], ha="right",
+                            bbox={"facecolor": "white", "alpha": .85, "edgecolor": "none", "pad": 1})
             ax.set(xlim=(start, end), ylim=(0, 100), ylabel="支持分 / 100")
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=5))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
@@ -322,6 +339,9 @@ def domain_overview_html(report):
     for key in ("macro", "micro"):
         domain = report["domains"][key]
         state = domain["short"]
+        state_label = escape(state["label"])
+        if state["label"].endswith("（错期）"):
+            state_label = escape(state["label"].removesuffix("（错期）")) + '<small style="display:block;font-size:12px;font-weight:400;margin-top:3px">错期参考</small>'
         rows = "".join(
             f'<div style="font-size:13px;margin:3px 0">{escape(g["label"])}：'
             f'<span style="color:{escape(g["short"]["color"])}">{escape(g["short"]["label"])}</span></div>'
@@ -331,23 +351,68 @@ def domain_overview_html(report):
             f'border-top:3px solid {escape(state["color"])};overflow-wrap:anywhere">'
             f'<h2 style="font-size:16px;margin:0 0 6px">{escape(domain["label"])}</h2>'
             f'<p style="font-size:22px;font-weight:600;line-height:1.3;margin:6px 0;color:{escape(state["color"])}">'
-            f'{escape(state["label"])}</p>'
+            f'{state_label}</p>'
             f'<p style="font-size:12px;margin:4px 0">中期：{escape(domain["medium"]["label"])}'
             + ("；近中期背离" if domain["disagreement"] else "") + '</p>' + rows
             + f'<p style="font-size:12px;color:#63757a;margin:6px 0 0">近期有效 {state["ready_groups"]}/3 组</p></td>')
     return (
-        '<section id="overview" style="padding:20px 0;border-bottom:1px solid #dbe2e4">'
+        '<section id="overview" style="padding:12px 0;border-bottom:1px solid #dbe2e4">'
         '<table role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse" cellspacing="0" cellpadding="0">'
         '<tr>' + "".join(cells) + '</tr></table>'
         f'<p style="font-size:13px;margin:10px 0 0">{escape(report["domains"]["relation"])}</p>'
-        '<p style="font-size:12px;color:#63757a;margin:6px 0 0">宏观按原生观测日；微观截至 '
-        f'{escape(report["market_date"])} 收盘。缺失不代表平稳。</p></section>')
+        '</section>')
 
 
-def front_html(report, images=None):
+def tactical_detail_html(report):
+    from html import escape
+    from .reading import tactical_view
+    from .render import number
+    view = tactical_view(report)
+    rows = []
+    for item in view["components"]:
+        values = (item["label"], number(item["value"]),
+                  number(item["contribution"], True) if item["status"] == "可用" else "不可用", item["date"])
+        rows.append('<tr>' + ''.join(f'<td style="padding:5px 4px;border-bottom:1px solid #e1e7e9;font-size:12px">{escape(v)}</td>' for v in values) + '</tr>')
+    context = view["context"]
+    return ('<table class="tactical-components" style="width:100%;border-collapse:collapse;table-layout:fixed">'
+            '<thead><tr>' + ''.join(f'<th scope="col" style="font-size:12px;text-align:left;padding:5px 4px">{h}</th>'
+                                    for h in ("指标", "观测值", "贡献分", "观测日期")) + '</tr></thead><tbody>'
+            + ''.join(rows) + '</tbody></table>'
+            f'<p class="muted" style="font-size:12px">VIX 252日分位 {number(context.get("vix_percentile_252"))}%；'
+            f'数据状态：{escape(view["status"])}；覆盖率 {number(view["coverage"] * 100 if view["coverage"] is not None else None)}%；'
+            f'原评分置信度 {number(view["confidence"] * 100 if view["confidence"] is not None else None)}%（非预测准确率）。</p>'
+            f'<p class="version muted" style="font-size:12px;overflow-wrap:anywhere">版本 {escape(view["version"])}；'
+            'TRIN为样本代理，分项贡献不改变现有封顶和取整规则。</p>')
+
+
+def tactical_html(report, compact=False):
+    from html import escape
+    from .reading import tactical_view
+    from .render import number
+    view = tactical_view(report)
+    context = view["context"]
+    changes = ''.join(
+        f'<td style="width:33.33%;padding:5px 8px;border:0;border-left:1px solid #dbe2e4">'
+        f'<span style="font-size:12px;color:#63757a">{label}净变化</span><br>'
+        f'<strong style="font-size:18px">{number(view["changes"].get(key), True)}</strong> 点</td>'
+        for key, label in (("1d", "1日"), ("5d", "5日"), ("21d", "21日")))
+    return ('<section id="tactical" style="padding:14px 0;border-bottom:1px solid #dbe2e4">'
+            '<h2 style="font-size:18px;margin:0 0 6px">盘后跨资产战术压力观察</h2>'
+            f'<p style="margin:4px 0"><strong style="font-size:25px;color:#7255a5">{number(view["score"])}</strong> / 100'
+            f' · {escape(view["direction"])}<span style="font-size:12px;color:#63757a"> · 截至 {escape(view["date"])}</span></p>'
+            '<table role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse"><tr>' + changes + '</tr></table>'
+            f'<p style="margin:6px 0;font-size:13px;color:#806120"><strong>连续性：</strong>{escape(view["continuity"])}</p>'
+            f'<p style="margin:4px 0;font-size:13px">VIX {number(context.get("vix_current", view["components"][0]["value"]))}；'
+            f'VIX 5日变化 {number(context.get("vix_5d_change"), True)} 点；VIX/VIX3M {number(context.get("vix_term_ratio"))}</p>'
+            f'<p style="font-size:12px;color:#63757a;margin:4px 0">{escape(view["change_basis"])}；跨资产确认，非纯微观。影子观察，不触发预警，不重复投票。</p>'
+            + ('' if compact else '<details class="tactical-detail"><summary>评分分项与数据口径</summary>' + tactical_detail_html(report) + '</details>')
+            + '</section>')
+
+
+def front_html(report, images=None, compact=False):
     from base64 import b64encode
     from html import escape
-    from .render import tactical_lines
+    from .reading import alert_groups
     front = report.get("frontpage") or build_frontpage(report, {})
     images = index_images(report) if images is None else images
     if len(images) != 2:
@@ -361,23 +426,22 @@ def front_html(report, images=None):
             f'<img style="display:block;width:100%;height:auto;max-width:864px" width="864" height="376" '
             f'src="data:image/png;base64,{b64encode(image.getvalue()).decode("ascii")}" alt="{escape(item["label"])}近150日曲线">'
             f'<p style="font-size:12px;color:#63757a;margin:4px 0">{escape(item["reason"])}</p></section>')
-    alerts = front["alerts"]
-    warnings = "".join(f'<li style="margin:8px 0">{escape(a["text"])}</li>' for a in alerts[:4])
+    alerts, secondary = alert_groups(front)
+    if compact:
+        alerts, secondary = alerts + secondary, []
+    warnings = "".join(f'<li style="margin:5px 0">{escape(a["text"])}</li>' for a in alerts)
     if not warnings:
         warnings = "<li>未检出既有观察规则异常；不代表没有风险，请同时查看数据完整性。</li>"
-    more = (f'<p>另有 {len(alerts) - 4} 项提示，见网页版异常明细。</p>' if len(alerts) > 4 else "")
-    gaps = "；".join(front["gaps"])
+    more = ('<details><summary>其他观察事项（' + str(len(secondary)) + '）</summary><ul>'
+            + ''.join(f'<li>{escape(a["text"])}</li>' for a in secondary) + '</ul></details>') if secondary else ''
+    gaps = ''.join(f'<li style="margin:3px 0">{escape(g)}</li>' for g in front["gaps"])
     return (
-        '<section id="priority" style="padding:20px 0;border-bottom:1px solid #dbe2e4">'
+        domain_overview_html(report) + tactical_html(report, compact)
+        + '<section id="alerts" style="padding:12px 0;border-bottom:1px solid #dbe2e4">'
+        '<h2 style="font-size:18px;margin:0 0 6px">关键异常与分歧</h2>'
+        f'<ul style="padding-left:18px;margin:5px 0;font-size:13px;color:#9b3545">{warnings}</ul>{more}'
+        + (f'<div class="quality-notices" style="font-size:12px;color:#806120"><strong>数据完整性</strong><ul style="padding-left:18px;margin:4px 0">{gaps}</ul></div>' if gaps else "")
+        + '</section>'
+        '<section id="priority" style="padding:16px 0;border-bottom:1px solid #dbe2e4">'
         '<div class="index-grid">' + "".join(figures) + '</div>'
-        f'<p style="font-size:12px;color:#63757a">{escape(front["scope_note"])}</p></section>'
-        + domain_overview_html(report)
-        + '<section id="tactical" style="padding:20px 0;border-bottom:1px solid #dbe2e4">'
-        '<h2 style="font-size:20px;margin:0 0 10px">盘后跨资产战术压力观察</h2>'
-        + "".join(f'<p style="font-size:14px;margin:6px 0">{escape(line)}</p>' for line in tactical_lines(report))
-        + '<p style="font-size:12px;color:#63757a">影子观察，不触发预警；跨资产确认层，不作为宏微观重复投票。</p></section>'
-        '<section id="alerts" style="padding:20px 0;border-bottom:1px solid #dbe2e4">'
-        '<h2 style="font-size:20px;margin:0 0 10px">关键异常与分歧</h2>'
-        f'<ul style="padding-left:20px;color:#9b3545">{warnings}</ul>{more}'
-        + (f'<p style="font-size:12px;color:#806120">数据待核查：{escape(gaps)}</p>' if gaps else "")
-        + '</section>')
+        f'<p style="font-size:12px;color:#63757a;margin:6px 0">{escape(front["scope_note"])}</p></section>')

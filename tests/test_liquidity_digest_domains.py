@@ -199,7 +199,7 @@ def test_pdf_retains_tactical_and_distinguishes_three_layers(report, tmp_path):
     path = tmp_path / "domains.pdf"
     render_pdf(report, path)
     pages = PdfReader(path).pages
-    assert len(pages) == 5
+    assert len(pages) == 6
     first = pages[0].extract_text()
     assert first.index("宏观资金与融资") < first.index("盘后跨资产战术压力观察")
     assert first.index("微观市场承接") < first.index("盘后跨资产战术压力观察")
