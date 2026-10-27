@@ -143,19 +143,23 @@ def email_text(report):
     edition = "核查更新版" if report.get("diagnostic") else "盘前版"
     lines = [tag + "美股流动性与风险传导日报｜" + edition,
              f'报告日 {report["report_date"]}｜美东{cutoff_label(report)}截止｜收盘基准 {report["market_date"]}', ""]
-    if report.get("correction"):
-        lines.extend(["本次核查：" + report["correction"]["note"], "原定时报告保留不动。", ""])
     states = report["states"]
     domains = report["domains"]
     from .frontpage import build_frontpage, index_summary
+    from .reading import tactical_view
     front = report.get("frontpage") or build_frontpage(report, {})
-    lines.extend(["核心观察", *[item["label"] + "：" + index_summary(item)
-                               for item in front["indices"].values()],
-                  "", domains["headline"], *domain_lines(report), domains["relation"],
+    view = tactical_view(report)
+    lines.extend([domains["headline"],
+                  *[domains[k]["label"] + "：近期" + domains[k]["short"]["label"] + "；中期" + domains[k]["medium"]["label"] for k in ("macro", "micro")],
+                  domains["relation"],
                   "宏观使用截止前最新原生观测；微观及综合评分截至 " + report["market_date"] + " 收盘。",
-                  "", "盘后跨资产战术压力观察", *tactical_lines(report),
+                  "", "盘后跨资产战术压力观察",
+                  "当前 " + number(view["score"]) + "/100；" + view["direction"],
+                  "1／5／21日净变化：" + " / ".join(number(view["changes"].get(p), True) for p in ("1d", "5d", "21d")) + " 点",
+                  "连续性：" + view["continuity"],
                   "", "关键异常与分歧", *[a["text"] for a in front["alerts"]],
-                  "数据待核查：" + ("；".join(front["gaps"]) or "无已识别缺口"), ""])
+                  "数据待核查：" + ("；".join(front["gaps"]) or "无已识别缺口"), "",
+                  "资金指数", *[item["label"] + "：" + index_summary(item) for item in front["indices"].values()], ""])
     lines.append(domains.get("evidence_note", ""))
     lines.extend(["", *internals_lines(report), ""])
     from .capital import capital_lines
@@ -168,8 +172,13 @@ def email_text(report):
         if state["direction"] == "UNKNOWN" and reference.get("direction", "UNKNOWN") != "UNKNOWN":
             lines.append(f'历史重算参考：{reference["direction_cn"]}；5日变化 '
                          f'{number(reference["changes"]["5d"], True)} 点。非当时可得，不参与预警。')
-    lines.extend([states["pressure_note"], *[a["text"] for a in states["alerts"][:3]], ""])
+    lines.extend([states["pressure_note"], "", "宏微观分组依据",
+                  *[g["label"] + "：" + g["short"]["label"] + " / " + g["medium"]["label"] + "（" + g["windows"] + "）"
+                    for k in ("macro", "micro") for g in domains[k]["groups"]], "",
+                  "战术压力分项与口径", *tactical_lines(report), ""])
     lines.append(data_text(report))
+    if report.get("correction"):
+        lines.extend(["本次核查：" + report["correction"]["note"], "原定时报告保留不动。", ""])
     return "\n".join(lines)
 
 

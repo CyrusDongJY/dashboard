@@ -7,7 +7,7 @@ from liquidity_digest.sample import sample_report
 from liquidity_digest.reading import tactical_view, pressure_identity, alert_groups
 from liquidity_digest.frontpage import front_html
 from liquidity_digest.html_report import full_html
-from liquidity_digest.render import render_pdf
+from liquidity_digest.render import render_pdf, email_text
 
 PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1ioAAAAASUVORK5CYII=")
 
@@ -66,6 +66,9 @@ def test_rendering_is_read_only_and_mobile_charts_are_not_forced_wide():
     assert "min-width:680px" not in html
     assert 'class="chart-grid"' in html and "本图采用：" in html
     assert html.count('alt="综合环境压力"') == 1
+    assert html.count("65/35沿用既有观察线") == 1
+    plain = email_text(report)
+    assert plain.index("宏观资金与融资") < plain.index("盘后跨资产战术压力观察") < plain.index("关键异常与分歧") < plain.index("资金指数")
 
 
 def test_pdf_flows_all_warnings_without_silent_truncation(tmp_path):

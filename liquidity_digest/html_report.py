@@ -85,7 +85,9 @@ def full_html(report, images=None, front_images=None):
     for i, (title, image) in enumerate(zip(CHART_TITLES, images)):
         caption = ("同日口径，非进入股市的资金流。" if i < 2 else
                    "原始利差；缺测断线，不以前值填补。" if i < 4 else
-                   "独立尺度；实线为正式观察，虚线为重算参考，非当时可得信号。65/35沿用既有观察线，非交易触发线。")
+                   ("综合环境压力，不等于资金净流出。", "VIX为主的跨资产确认，非纯微观。",
+                    "高值表示风险资本收缩，不是资金流出金额。",
+                    "高值表示流动性支持偏弱，方向与首页支持分相反。")[i - 4])
         data_uri = b64encode(image.getvalue()).decode("ascii")
         charts.append(f'<figure><div class="chart-wrap">'
                       f'<img src="data:image/png;base64,{data_uri}" alt="{text(title)}" width="918" height="476">'
@@ -155,7 +157,7 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 {"".join(data)}<p class="warning">原始指标日期/覆盖缺口：{text(gaps)}；不包含同版历史不足与补充来源不可用，详见首页及配置持仓板块。缺失及过期数据不参与状态确认。</p>
 <p class="notice">错期参考：{text("；".join(report.get("publication_lags", [])) or "无")}。不冒充昨日同步数据。</p></section>
 <section id="trends" class="band"><h2>趋势与证据 / 近150个自然日</h2><h3>资金数量、融资价格与信用</h3><div class="chart-grid">{"".join(charts[:4])}</div>
-<h3>市场传导与连续状态</h3><p class="muted">四个指标各自独立，不比较分数大小，不求和；缺测仍断线。</p><div class="chart-grid">{"".join(charts[4:])}</div>
+<h3>市场传导与连续状态</h3><p class="muted">四个指标各自独立，不比较分数大小，不求和。实线为正式观察，虚线为历史重算参考，非当时可得信号；缺测仍断线。65/35沿用既有观察线，非交易触发线。</p><div class="chart-grid">{"".join(charts[4:])}</div>
 <p>{text(funding_line)}</p>{"".join(market_states)}<h3>优先查阅</h3>
 <ul>{focus or "<li>尚无足够连续观测确认方向。</li>"}</ul></section>
 <section id="audit" class="band"><h2>数据来源与解释边界</h2>
