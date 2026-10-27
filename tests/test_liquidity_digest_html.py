@@ -166,7 +166,7 @@ def test_legacy_archive_still_readable_without_rewriting(bundle):
     assert file_hash(folder / "manifest.json") == before
 
 
-@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow"])
+@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.7-shadow", "liquidity_digest_v1.7.1-shadow", "liquidity_digest_v1.7.2-shadow", "liquidity_digest_v1.7.3-shadow"])
 def test_prior_archives_preserve_html_attachment_contract(bundle, version):
     _, folder = bundle
     report = json.loads((folder / "report.json").read_text())
@@ -176,6 +176,11 @@ def test_prior_archives_preserve_html_attachment_contract(bundle, version):
     manifest["files"]["report.json"] = file_hash(folder / "report.json")
     atomic_json(folder / "manifest.json", manifest)
     assert verify_bundle(folder)["version"] == version
+
+    with (folder / "report.pdf").open("ab") as stream:
+        stream.write(b"tampered")
+    with pytest.raises(ValueError, match="integrity"):
+        verify_bundle(folder)
 
 
 def test_unknown_version_rejected(bundle):
