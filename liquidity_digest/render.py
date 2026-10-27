@@ -98,9 +98,13 @@ def tactical_lines(report):
                 f'252日分位 {number(context.get("vix_percentile_252"))}%；'
                 f'VIX/VIX3M {number(context.get("vix_term_ratio"))}。')
     temporal = report["states"]["panels"]["tactical_stress"]
-    text.append("压力值变化（1／5／21日）：" + " / ".join(
-        number(temporal["changes"].get(period), True) for period in ("1d", "5d", "21d"))
-        + "；" + temporal["direction_cn"] + "。")
+    history = report.get("tactical_history") or {}
+    changes = history.get("changes", temporal["changes"])
+    text.append("压力值变化（1／5／21日，原始端点对比）：" + " / ".join(
+        number(changes.get(period), True) for period in ("1d", "5d", "21d"))
+        + "；" + history.get("direction_cn", temporal["direction_cn"]) + "。")
+    if history:
+        text.append(history["reason"] + "。")
     confidence = finite(row.get("stress_confidence"))
     status = {"OK": "可用", "PARTIAL": "部分覆盖", "UNAVAILABLE": "不可计算"}.get(meta.get("status"), "状态待核实")
     text.append(f'数据状态：{status}；置信度 {number(confidence * 100 if confidence is not None else None)}%；'
@@ -318,7 +322,16 @@ def chart_images(report):
             line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in segment],
                  PANEL_CN[key] if i == 0 else "_nolegend_", color)
     ax.set_ylim(0, 100)
-    ax.set_title("核心板块时间状态：重算与实测分列；非当时可得信号，不参与预警", fontsize=9)
+    from temporal_monitor import HIGH_PRESSURE, LOW_PRESSURE
+    ax.axhspan(HIGH_PRESSURE, 100, color="#b83e4b", alpha=.055, zorder=0)
+    ax.axhline(HIGH_PRESSURE, color="#9e283b", linewidth=1.05, linestyle="-.", zorder=1)
+    ax.axhline(LOW_PRESSURE, color="#637a70", linewidth=.8, linestyle=":", zorder=1)
+    for value, label, color in ((HIGH_PRESSURE, f"{HIGH_PRESSURE:g} 高压观察线", "#9e283b"),
+                                (LOW_PRESSURE, f"{LOW_PRESSURE:g} 低压分界线", "#637a70")):
+        ax.annotate(label, xy=(.99, value), xycoords=("axes fraction", "data"),
+                    xytext=(0, 3), textcoords="offset points", ha="right", fontsize=7,
+                    color=color, bbox={"facecolor": "white", "alpha": .85, "edgecolor": "none", "pad": 1})
+    ax.set_title("核心板块时间状态：既有影子观察线，非交易触发线；各自尺度，不可相加", fontsize=9)
     ax.set_ylabel("压力方向值", fontsize=8)
     images.append(finish(fig, [ax]))
     return images

@@ -357,6 +357,8 @@ def assemble(report_plan, inputs, demo=False):
     report["states"] = build_states(report)
     from .history_reference import attach
     attach(report, temporal)
+    from .tactical_history import build_tactical_history
+    report["tactical_history"] = build_tactical_history(report, inputs.get("db_market_history", {}))
     from .domains import build_domains
     report["domains"] = build_domains(report)
     from .internals import build_internals

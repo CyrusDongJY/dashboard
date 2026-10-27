@@ -11,6 +11,28 @@ INDEX_SPECS = {
 }
 CORE_STATES = {"LOW": "低水位", "TIGHT": "偏紧", "MIDDLE": "中间区间",
                "SUPPORTIVE": "较充裕", "HIGH": "高水位", "INSUFFICIENT": "数据不足"}
+LEGACY_LIQUIDITY_VERSIONS = {"liquidity_v2", "liquidity_v2.2", "liquidity_v2.3"}
+
+
+def archived_liquidity_segments(rows, current_start):
+    """Published old-model observations, never inputs to current-model deltas."""
+    indexed = {r["report_date"]: r for r in sorted(rows, key=lambda r: (r["report_date"], stamp(r["created_at"])))}
+    groups = []
+    previous = None
+    for day, row in sorted(indexed.items()):
+        version = row.get("calc_version")
+        if day >= current_start or version not in LEGACY_LIQUIDITY_VERSIONS:
+            previous = None
+            continue
+        if version != previous:
+            groups.append({"version": version, "basis": "LEGACY_PUBLISHED_ARCHIVE",
+                           "comparable_to_current": False, "points": []})
+        coverage = finite(row.get("coverage"))
+        value = (_score(row.get("composite")) if coverage is not None and .5 <= coverage <= 1
+                 and not str(row.get("state") or "").startswith("数据不足") else None)
+        groups[-1]["points"].append({"date": day, "value": value, "coverage": coverage})
+        previous = version
+    return groups
 
 
 def _score(value):
@@ -47,7 +69,7 @@ def index_observation(report_plan, capture, key):
     end = report_plan["market_date"]
     result = dict(key=key, label=label, color=color, source=table, version=version,
                   value=None, source_date=None, coverage=None, state="数据不足", status="MISSING",
-                  history=[], replay_history=[], changes={"1d": None, "5d": None, "21d": None},
+                  history=[], replay_history=[], legacy_segments=[], changes={"1d": None, "5d": None, "21d": None},
                   window_coverage={},
                   reason="尚无昨日合格记录", details={}, fetched_at=capture.get("captured_at"))
     try:
@@ -78,6 +100,9 @@ def index_observation(report_plan, capture, key):
             other_versions.append(row)
             continue
         accepted.append(row)
+    if key == "liquidity":
+        current_start = min((r["report_date"] for r in accepted), default=end)
+        result["legacy_segments"] = archived_liquidity_segments(other_versions, current_start)
     live = [r for r in accepted if key != "core_funding" or r["observation_mode"] == "LIVE_SHADOW"]
     # Deterministic latest record; an invalid new row must not resurrect an older good one.
     indexed = {r["report_date"]: r for r in sorted(live, key=lambda r: (r["report_date"], stamp(r["created_at"])))}
@@ -138,6 +163,9 @@ def build_frontpage(report, inputs):
     indices = {key: index_observation(report, inputs.get("db_" + spec[1], {}), key)
                for key, spec in INDEX_SPECS.items()}
     water = indices["liquidity"]
+    legacy_count = sum(p["value"] is not None for s in water["legacy_segments"] for p in s["points"])
+    if legacy_count:
+        water["reason"] += f"；另列{legacy_count}个旧版存档点，按版本断开，不与新版拼接或计算跨版涨跌"
     reference = report["states"]["panels"]["liquidity"].get("history_reference", {})
     if reference.get("risk_value") is not None and water["status"] == "OK":
         water["replay_history"] = [{"date": r["report_date"], "value":
@@ -239,8 +267,17 @@ def index_images(report):
     with plt.rc_context({"font.family": [font, "DejaVu Sans"], "axes.unicode_minus": False}):
         for item in front["indices"].values():
             fig, ax = plt.subplots(figsize=(5.4, 2.35))
+            labeled = False
+            for segment in item.get("legacy_segments", []):
+                points = {p["date"]: p["value"] for p in segment["points"]}
+                if any(v is not None for v in points.values()):
+                    ax.plot([date.fromisoformat(d) for d in grid],
+                            [points.get(d) if points.get(d) is not None else float("nan") for d in grid],
+                            color="#75858d", linewidth=1.3, marker=".", markersize=2,
+                            label="旧版存档（按版本断开）" if not labeled else "_nolegend_")
+                    labeled = True
             for key, label, style, color in (
-                ("replay_history", "历史回放参考（非实测）", "--", "#8b9299"),
+                ("replay_history", "新版同口径重算参考" if item["key"] == "liquidity" else "历史回放参考（非实测）", "--", "#46699a" if item["key"] == "liquidity" else "#8b9299"),
                 ("history", "实测发布" if item["key"] == "core_funding" else "存档计算值（非PIT）", "-", item["color"]),
             ):
                 values = {p["date"]: p["value"] for p in item[key] if p["date"] >= str(start)}
