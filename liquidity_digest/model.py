@@ -355,6 +355,8 @@ def assemble(report_plan, inputs, demo=False):
     }
     from .states import build_states
     report["states"] = build_states(report)
+    from .history_reference import attach
+    attach(report, temporal)
     from .domains import build_domains
     report["domains"] = build_domains(report)
     from .internals import build_internals

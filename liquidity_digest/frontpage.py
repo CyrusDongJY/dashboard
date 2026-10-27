@@ -137,6 +137,14 @@ def index_observation(report_plan, capture, key):
 def build_frontpage(report, inputs):
     indices = {key: index_observation(report, inputs.get("db_" + spec[1], {}), key)
                for key, spec in INDEX_SPECS.items()}
+    water = indices["liquidity"]
+    reference = report["states"]["panels"]["liquidity"].get("history_reference", {})
+    if reference.get("risk_value") is not None and water["status"] == "OK":
+        water["replay_history"] = [{"date": r["report_date"], "value":
+                                    100 - r["risk_value"] if r.get("risk_value") is not None else None}
+                                   for r in report.get("reference_history", {}).get("liquidity", [])]
+        water["reference_changes"] = {k: -v if v is not None else None for k, v in reference["changes"].items()}
+        water["reason"] += "；虚线为同公式历史重算，非当时可得，不覆盖发布快照"
     alerts, gaps = [], []
     for alert in report["states"]["alerts"]:
         if alert["kind"] == "quality":
@@ -181,7 +189,10 @@ def build_frontpage(report, inputs):
             gaps.append(item["label"] + "：" + item["reason"])
         elif item["changes"]["5d"] is None and item.get("window_coverage", {}).get("5d"):
             window = item["window_coverage"]["5d"]
-            gaps.append(f'{item["label"]}：5日比较需6个同版有效快照，当前{window["valid"]}/6；历史回放不冒充实测')
+            if item.get("reference_changes", {}).get("5d") is not None:
+                gaps.append(f'{item["label"]}：存档快照{window["valid"]}/6，已另列完整5日历史重算参考')
+            else:
+                gaps.append(f'{item["label"]}：5日比较需6个同版有效快照，当前{window["valid"]}/6；历史回放不冒充实测')
     ici = inputs.get("ici_flows", {})
     if ici.get("status") and ici["status"] != "OK":
         gaps.append("基金净申赎：ICI来源本次不可用；不据此推断资金流入或流出")
@@ -262,6 +273,8 @@ def index_summary(item):
     window = item.get("window_coverage", {}).get("5d")
     change = (f'5日 {number(item["changes"]["5d"], True)} 点' if item["changes"]["5d"] is not None
               else f'5日样本 {window["valid"]}/{window["required"]}' if window else '5日不可比较')
+    if item["changes"]["5d"] is None and item.get("reference_changes", {}).get("5d") is not None:
+        change = f'5日重算参考 {number(item["reference_changes"]["5d"], True)} 点'
     return (f'{number(item["value"])}/100 · {item["state"]} · {change}；'
             f'快照 {item["source_date"] or "缺失"} · 覆盖 {number(coverage * 100 if coverage is not None else None)}%')
 

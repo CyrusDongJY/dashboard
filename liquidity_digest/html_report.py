@@ -46,7 +46,7 @@ def full_html(report, images=None, front_images=None):
             + "".join(f'<p class="muted">待确认原因：{text(reason)}</p>' for reason in reasons)
             + "</section>")
 
-    pressure = report["states"]["pressure"]
+    pressure = report["states"].get("display_pressure", report["states"]["pressure"])
     matrix = ['<div class="matrix"><span></span><span>正在缓解</span><span>变化不明显</span><span>正在增加</span>']
     for zone, label in (("HIGH", "高压"), ("MID", "中间"), ("LOW", "低压")):
         known_row = pressure["zone"] == zone and pressure["direction"] == "UNKNOWN"

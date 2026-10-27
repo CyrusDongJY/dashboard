@@ -219,6 +219,44 @@ def _persistence(metric, grid):
     return result, history
 
 
+def dynamic_breadth_reference(capture, metric, grid, cutoff):
+    """Old daily top-500 aggregates are useful, but not a fixed-stock cohort."""
+    points = {}
+    if capture.get("status") != "OK":
+        return _persistence({}, grid)
+    try:
+        if stamp(capture["captured_at"]) > stamp(cutoff):
+            return _persistence({}, grid)
+    except (KeyError, ValueError, TypeError):
+        return _persistence({}, grid)
+    for row in capture.get("data", []):
+        day, full = row.get("record_date"), row.get("full_metrics") or {}
+        try:
+            if day not in grid or stamp(row["ingested_at"]) > stamp(cutoff):
+                continue
+            number = finite(full.get("pct_20ma"))
+            recorded = full.get("breadth_sample") == "top500_by_mktcap" and full.get("breadth_sample_size") == 500
+            archive = full.get("breadth_log_recovery") or {}
+            recovered = (archive.get("basis") == "original_500_stock_snapshot_not_recomputed"
+                         and archive.get("source_date") == day
+                         and len(archive.get("archive_sha256", "")) == 64
+                         and stamp(archive["restored_at"]) <= stamp(cutoff)
+                         and archive.get("values", {}).get("pct_20ma") == number)
+            if number is not None and 0 <= number <= 100 and (recorded or recovered):
+                points[day] = number
+        except (KeyError, ValueError, TypeError):
+            continue
+    current = finite(metric.get("value"))
+    if current is None or points.get(grid[-1]) != current:
+        return _persistence({}, grid)
+    reference, history = _persistence({**metric, "history": [
+        {"date": d, "value": v} for d, v in sorted(points.items())]}, grid)
+    reference.update(basis="DYNAMIC_TOP500_REFERENCE", alert_eligible=False,
+                     label="动态样本参考：" + reference["label"],
+                     reason="每日市值前500名的原始比例；成分可变，只描述动态样本变化，不确认固定股票持续性。")
+    return reference, history
+
+
 def build_internals(report_plan, capture, metrics):
     end, cutoff = report_plan["market_date"], report_plan["cutoff"]
     grid = sessions(date.fromisoformat(end) - timedelta(days=70), end)
@@ -277,6 +315,7 @@ def build_internals(report_plan, capture, metrics):
     sectors = sector_history.get(end) or _sectors(None, end, cutoff)
     leadership = _leadership(breadth, sectors)
     metric = dict(metrics.get("pct_20ma", {}))
+    reference_persistence, reference_history = dynamic_breadth_reference(capture, metric, grid, cutoff)
     signature = breadth.get("ma20_sample_signature")
     comparable = set()
     for day in reversed(grid):
@@ -316,10 +355,17 @@ def build_internals(report_plan, capture, metrics):
                 "advancing_pct": breadth_history.get(day, {}).get("advancing_pct")
                 if breadth_history.get(day, {}).get("quality") == "OK" else None,
                 "pct_20ma": ma_history.get(day)} for day in grid[-21:]]
+    display_persistence = (reference_persistence if persistence["state"] == "UNKNOWN"
+                           and reference_persistence["state"] != "UNKNOWN" else persistence)
+    display_history = [{**p, "pct_20ma": reference_history.get(p["date"])} for p in history]
+    if reference_persistence.get("basis") != "DYNAMIC_TOP500_REFERENCE":
+        display_history = history
     return {"version": VERSION, "rules": dict(RULES), "market_date": end,
             "headline": breadth["label"] + "｜" + leadership["label"],
             "scope_note": SCOPE_NOTE, "shadow_note": SHADOW_NOTE, "interpretation": interpretation,
             "breadth": breadth, "sectors": sectors, "leadership": leadership,
             "rotation": rotation, "persistence": persistence, "history": history, "gaps": gaps,
+            "reference_persistence": reference_persistence, "display_persistence": display_persistence,
+            "display_history": display_history,
             "audit": {"observation_version": OBSERVATION_VERSION, "accepted_dates": sorted(accepted),
                       "rejected_rows": rejections, "capture_status": capture.get("status", "MISSING")}}

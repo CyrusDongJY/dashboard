@@ -18,6 +18,7 @@ def internals_lines(report):
     if not panel:
         return []
     b, s, p, r = (panel[k] for k in ("breadth", "sectors", "persistence", "rotation"))
+    p = panel.get("display_persistence", p)
     lines = ["市场内部结构 / 微观环境的解释层", panel["headline"],
              panel["interpretation"],
              f'截至 {panel["market_date"]} 收盘；{panel["scope_note"]}',
@@ -33,6 +34,7 @@ def internals_lines(report):
     lines.append(r["label"] + ("：" + "、".join(r["from_sectors"]) + " → " + "、".join(r["to_sectors"])
                               if r["state"] == "CANDIDATE" else "；" + r["reason"]))
     lines.append(r.get("history_note", ""))
+    lines.append(p["reason"])
     lines.append(panel["shadow_note"])
     return lines
 
@@ -47,6 +49,7 @@ def internals_html(report, compact=False):
     if not panel:
         return ""
     b, s, p, rotation = (panel[k] for k in ("breadth", "sectors", "persistence", "rotation"))
+    p = panel.get("display_persistence", p)
     esc = lambda x: escape(str(x), quote=True)
     distribution = '<p style="color:#69777d">' + esc(b["reason"]) + "</p>"
     if b["quality"] == "OK":
@@ -83,7 +86,7 @@ def internals_html(report, compact=False):
                + ("min-width:300px" if compact else "min-width:590px") + '"><thead><tr>' + headings
                + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
     bars = []
-    for point in panel["history"]:
+    for point in panel.get("display_history", panel["history"]):
         number = finite(point["pct_20ma"])
         label = point["date"] + "：" + value(number, suffix="%")
         height = round(number * .55) if number is not None and 0 <= number <= 100 else 0
@@ -114,6 +117,7 @@ def internals_html(report, compact=False):
             + f'<h3 style="font-size:15px;margin:16px 0 6px">20日均线广度：{esc(p["label"])}</h3>'
             + f'<p style="font-size:12px">20日均线广度5日 / 21日变化：{value(p["changes"]["5d"], True)} / '
             + f'{value(p["changes"]["21d"], True)} 个百分点。</p>' + trend
+            + f'<p style="font-size:12px;color:#60737a">{esc(p["reason"])}</p>'
             + (f'<p style="font-size:12px;color:#946c22">待确认：{esc(gaps)}</p>' if gaps else "")
             + '<p style="font-size:11px;color:#60737a">扫描器日期按收盘后采集日标注，未获逐股源时间；收盘竞价覆盖未验证。'
             + f'{esc(panel["shadow_note"])}</p></section>')
@@ -152,8 +156,8 @@ def internals_image(report):
         ax.set_yticks([])
         ax.set_xticks([0, 25, 50, 75, 100], ["0%", "25%", "50%", "75%", "100%"])
         ax.spines[["top", "left", "right"]].set_visible(False)
-        points = panel["history"]
-        for key, label, color in (("pct_20ma", "20日均线广度", "#377e9e"),
+        points = panel.get("display_history", panel["history"])
+        for key, label, color in (("pct_20ma", "20日均线广度（动态样本参考）", "#377e9e"),
                                    ("advancing_pct", "当日上涨比例（新口径）", "#258269")):
             values = [p[key] if p[key] is not None else np.nan for p in points]
             trend.plot(range(len(points)), values, label=label, color=color, linewidth=1.6, marker=".", markersize=3)

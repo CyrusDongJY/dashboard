@@ -158,6 +158,10 @@ def email_text(report):
     for state in (states["funding"], states["pressure"]):
         lines.append(f'{state["label"]}：{state["level_cn"]} / {state["direction_cn"]}；'
                      f'5日压力方向值变化 {number(state["changes"]["5d"], True)} 点。')
+        reference = state.get("history_reference", {})
+        if state["direction"] == "UNKNOWN" and reference.get("direction", "UNKNOWN") != "UNKNOWN":
+            lines.append(f'历史重算参考：{reference["direction_cn"]}；5日变化 '
+                         f'{number(reference["changes"]["5d"], True)} 点。非当时可得，不参与预警。')
     lines.extend([states["pressure_note"], *[a["text"] for a in states["alerts"][:3]], ""])
     lines.append(data_text(report))
     return "\n".join(lines)
@@ -231,7 +235,7 @@ def chart_images(report):
     day_grid = sessions(start, report["market_date"])
     metrics = report["metrics"]
 
-    def line(ax, points, label, color, frequency="daily", key=None):
+    def line(ax, points, label, color, frequency="daily", key=None, style="-"):
         values = {p["date"]: p["value"] for p in points if p["date"] >= str(start)}
         if frequency == "weekly" and values:
             first, last = date.fromisoformat(min(values)), date.fromisoformat(max(values))
@@ -242,7 +246,7 @@ def chart_images(report):
             single = sum(finite(values.get(d)) is not None for d in grid) == 1
             ax.plot([date.fromisoformat(d) for d in grid], [values.get(d, np.nan) for d in grid],
                     label=label + "（单点，趋势待积累）" if single and not label.startswith("_") else label,
-                    color=color, linewidth=1.4, marker="o" if single else ".",
+                    color=color, linewidth=1.4, linestyle=style, marker="o" if single else ".",
                     markersize=4 if single else 1.5, clip_on=not single)
 
     def finish(fig, axes):
@@ -305,12 +309,16 @@ def chart_images(report):
     fig, ax = plt.subplots(figsize=(10.1, 2.12))
     from temporal_monitor import comparison_segments
     for key, color in COLORS.items():
+        references = report.get("reference_history", {}).get(key, [])
+        for i, segment in enumerate(comparison_segments(references)):
+            line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in segment],
+                 PANEL_CN[key] + "（重算参考）" if i == 0 else "_nolegend_", color, style="--")
         records = report["temporal"].get(key, [])
         for i, segment in enumerate(comparison_segments(records)):
             line(ax, [{"date": r["report_date"], "value": r["risk_value"]} for r in segment],
                  PANEL_CN[key] if i == 0 else "_nolegend_", color)
     ax.set_ylim(0, 100)
-    ax.set_title("核心板块时间状态：各自尺度，不能相加或当作交易信号", fontsize=9)
+    ax.set_title("核心板块时间状态：重算与实测分列；非当时可得信号，不参与预警", fontsize=9)
     ax.set_ylabel("压力方向值", fontsize=8)
     images.append(finish(fig, [ax]))
     return images
@@ -435,7 +443,7 @@ def render_pdf(report, path, images=None, front_images=None):
     domain_panel(domains["macro"], 34, 682)
     domain_panel(domains["micro"], 307, 682)
     text("跨资产确认 / 压力水位 × 方向", margin, 553, 11, "#176c8c")
-    pressure = states["pressure"]
+    pressure = states.get("display_pressure", states["pressure"])
     text("提示与分歧", 350, 553, 11, "#176c8c")
     matrix_x, matrix_top, cell_w, cell_h = 71, 530, 82, 30
     for j, label in enumerate(("正在缓解", "变化不明显", "正在增加")):
@@ -513,6 +521,7 @@ def render_pdf(report, path, images=None, front_images=None):
         y = paragraph(panel["headline"], 737, 14)
         y = paragraph(panel["scope_note"] + " 截至 " + panel["market_date"] + " 收盘。", y, 9)
         p, r, b = panel["persistence"], panel["rotation"], panel["breadth"]
+        p = panel.get("display_persistence", p)
         y = paragraph("20日均线广度：" + p["label"] + "；" + r["label"] + "。", y, 10)
         y = paragraph(panel["interpretation"], y, 9)
         image = internals_image(report)

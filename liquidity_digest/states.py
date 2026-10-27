@@ -42,12 +42,12 @@ def direction(delta):
     return "UP" if delta >= IMPULSE_THRESHOLD else "DOWN" if delta <= -IMPULSE_THRESHOLD else "FLAT"
 
 
-def eligible(row, key):
+def eligible(row, key, reference=False):
     risk = finite(row.get("risk_value"))
     coverage, confidence = finite(row.get("coverage")), finite(row.get("confidence"))
     details = row.get("details") or {}
     return (
-        row.get("quality_status") == "OK" and row.get("observation_mode") == "LIVE_SHADOW"
+        row.get("quality_status") == "OK" and row.get("observation_mode") == ("REPLAY" if reference else "LIVE_SHADOW")
         and row.get("source_date") == row.get("report_date")
         and risk is not None and 0 <= risk <= 100
         and coverage is not None and PANEL_SPECS[key].min_coverage <= coverage <= 1
@@ -58,7 +58,7 @@ def eligible(row, key):
     )
 
 
-def panel_state(report, key):
+def panel_state(report, key, reference=False):
     result = {
         "panel": key, "label": PANEL_NAMES[key], "risk_value": None, "display_value": None,
         "zone": "UNKNOWN", "direction": "UNKNOWN", "direction_cn": "方向待确认",
@@ -73,14 +73,14 @@ def panel_state(report, key):
     if audit.get("status") != "OK":
         result["reason"] = "时间状态源未刷新，旧缓存不参与当前判断"
         return result
-    raw = report["temporal"].get(key, [])
+    raw = report.get("reference_history" if reference else "temporal", {}).get(key, [])
     current = next((r for r in raw if r["report_date"] == report["market_date"]), None)
-    if not current or not eligible(current, key):
+    if not current or not eligible(current, key, reference=reference):
         return result
     version = current["details"]["source_calc_version"]
     signature = current["details"].get("comparison_signature")
     start = current["details"].get("comparison_start_date", "")
-    records = {r["report_date"]: r for r in raw if eligible(r, key)
+    records = {r["report_date"]: r for r in raw if eligible(r, key, reference=reference)
                and r["calc_version"] == current["calc_version"]
                and r["details"]["source_calc_version"] == version
                and r["details"].get("comparison_signature") == signature
@@ -144,7 +144,8 @@ def matrix_note(state):
     if state["direction"] == "UNKNOWN":
         count = state.get("windows", {}).get("5d", {}).get("available", 0)
         return known + f'；方向待确认（同版 {count}/6 点）'
-    return known + "；缓解不等于低压"
+    basis = "；历史重算方向参考，非实时历史信号" if state.get("history_basis") == "RECONSTRUCTED_REFERENCE" else ""
+    return known + "；缓解不等于低压" + basis
 
 
 def build_states(report):
