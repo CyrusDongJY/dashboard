@@ -10,6 +10,8 @@
   const iso = ms => new Date(ms).toISOString().slice(0, 10);
   const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(epoch(value)) && iso(epoch(value)) === value;
   const fmt = value => value.toLocaleString("zh-CN", {maximumFractionDigits: 2});
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = "11px system-ui";
   const ns = "http://www.w3.org/2000/svg";
   function el(tag, attrs = {}, text = null) {
     const node = document.createElementNS(ns, tag);
@@ -43,8 +45,7 @@
   function render(view) {
     const {chart, host, panel, svg, values, coverage} = view;
     const width = Math.max(240, Math.floor(host.getBoundingClientRect().width));
-    const height = 244, left = 51, right = 14, top = 25, bottom = 32;
-    const w = width - left - right, h = height - top - bottom;
+    const height = 244, right = 14, top = 25, bottom = 32;
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.replaceChildren();
     const title = el("title", {}, `${chart.title}，${iso(range[0])}至${iso(range[1])}，${chart.unit}`);
@@ -71,6 +72,9 @@
       const pad = (high - low || Math.max(Math.abs(high) * 0.05, 1)) * 0.12;
       low -= pad; high += pad;
     }
+    const labels = Array.from({length:5}, (_,i) => fmt(low + (high-low)*i/4));
+    const left = Math.max(51, Math.ceil(Math.max(...labels.map(v=>measure.measureText(v).width)))+12);
+    const w = width - left - right, h = height - top - bottom;
     const x = ms => left + (ms - range[0]) / Math.max(dayMs, range[1] - range[0]) * w;
     const y = value => top + (high - value) / (high - low) * h;
     const text = (x, y, value, extra = {}) => el("text", {x, y, fill: "#63757a", "font-size": 11, ...extra}, value);
