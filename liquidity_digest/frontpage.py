@@ -224,6 +224,9 @@ def build_frontpage(report, inputs):
     ici = inputs.get("ici_flows", {})
     if ici.get("status") and ici["status"] != "OK":
         gaps.append("基金净申赎：ICI来源本次不可用；不据此推断资金流入或流出")
+    if any((r.get("details") or {}).get("acquisition_method") == "OFFICIAL_PAGE_VERIFIED_IMPORT"
+           for r in ici.get("data", []) if isinstance(r, dict)):
+        gaps.append("基金净申赎：已补充官方页面核验数据；自动抓取尚未恢复，后续日期仍需核验")
     core = indices["core_funding"]
     pressure = core["details"].get("funding_pressure") or {}
     if core["source_date"] == report["market_date"] and pressure.get("state") in ("ACUTE", "WATCH"):
@@ -409,7 +412,7 @@ def tactical_html(report, compact=False):
             + '</section>')
 
 
-def front_html(report, images=None, compact=False):
+def front_html(report, images=None, compact=False, chart_controls=""):
     from base64 import b64encode
     from html import escape
     from .reading import alert_groups
@@ -423,8 +426,9 @@ def front_html(report, images=None, compact=False):
             '<section class="index-panel" style="min-width:0;margin:0 0 16px">'
             f'<h3 style="font-size:17px;margin:0 0 6px;color:{item["color"]}">{escape(item["label"])}</h3>'
             f'<p style="font-size:13px;margin:0 0 6px">{escape(index_summary(item))}</p>'
+            f'<div data-chart-id="index-{escape(item["key"])}">'
             f'<img style="display:block;width:100%;height:auto;max-width:864px" width="864" height="376" '
-            f'src="data:image/png;base64,{b64encode(image.getvalue()).decode("ascii")}" alt="{escape(item["label"])}近150日曲线">'
+            f'src="data:image/png;base64,{b64encode(image.getvalue()).decode("ascii")}" alt="{escape(item["label"])}近150日曲线"></div>'
             f'<p style="font-size:12px;color:#63757a;margin:4px 0">{escape(item["reason"])}</p></section>')
     alerts, secondary = alert_groups(front)
     if compact:
@@ -443,5 +447,6 @@ def front_html(report, images=None, compact=False):
         + (f'<div class="quality-notices" style="font-size:12px;color:#806120"><strong>数据完整性</strong><ul style="padding-left:18px;margin:4px 0">{gaps}</ul></div>' if gaps else "")
         + '</section>'
         '<section id="priority" style="padding:16px 0;border-bottom:1px solid #dbe2e4">'
-        '<div class="index-grid">' + "".join(figures) + '</div>'
+        + chart_controls
+        + '<div class="index-grid">' + "".join(figures) + '</div>'
         f'<p style="font-size:12px;color:#63757a;margin:6px 0">{escape(front["scope_note"])}</p></section>')

@@ -57,7 +57,9 @@ def test_html_self_contained_and_complete(report):
     html = full_html(report, images())
     nodes = Elements(html).nodes
     assert html.startswith("<!doctype html>")
-    assert not {"script", "iframe", "object", "embed", "form", "link"} & {tag for tag, _ in nodes}
+    assert not {"iframe", "object", "embed", "form", "link"} & {tag for tag, _ in nodes}
+    scripts = [a for tag, a in nodes if tag == "script"]
+    assert len(scripts) == 2 and all("src" not in s for s in scripts)
     imgs = [a for tag, a in nodes if tag == "img"]
     assert len(imgs) == 10
     for img in imgs:
@@ -166,7 +168,7 @@ def test_legacy_archive_still_readable_without_rewriting(bundle):
     assert file_hash(folder / "manifest.json") == before
 
 
-@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.7-shadow", "liquidity_digest_v1.7.1-shadow", "liquidity_digest_v1.7.2-shadow", "liquidity_digest_v1.7.3-shadow", "liquidity_digest_v1.7.4-shadow"])
+@pytest.mark.parametrize("version", ["liquidity_digest_v1.3-shadow", "liquidity_digest_v1.4-shadow", "liquidity_digest_v1.5-shadow", "liquidity_digest_v1.6-shadow", "liquidity_digest_v1.7-shadow", "liquidity_digest_v1.7.1-shadow", "liquidity_digest_v1.7.2-shadow", "liquidity_digest_v1.7.3-shadow", "liquidity_digest_v1.7.4-shadow", "liquidity_digest_v1.8-shadow"])
 def test_prior_archives_preserve_html_attachment_contract(bundle, version):
     _, folder = bundle
     report = json.loads((folder / "report.json").read_text())

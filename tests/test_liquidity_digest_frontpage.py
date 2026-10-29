@@ -198,6 +198,6 @@ def test_index_fetch_keeps_bounded_history_not_just_last_day(table):
     fetch_table(session, {"SUPABASE_URL": "https://example.test", "SUPABASE_KEY": "private"},
                 table, "2020-01-01", P["market_date"])
     params = session.get.call_args_list[0].kwargs["params"]
-    start = str(stamp(P["cutoff"]).date() - timedelta(days=151))
+    start = str(stamp(P["cutoff"]).date() - timedelta(days=431))
     assert f"report_date.gte.{start}" in params["and"]
     assert session.get.call_count == 2

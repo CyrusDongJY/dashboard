@@ -49,7 +49,7 @@ def points(series, multiplier=1):
 def fetch_table(session, config, table, start, end):
     field, select = TABLES[table]
     if table in ("core_funding_daily", "liquidity_daily"):
-        start = max(start, str(date.fromisoformat(end) - timedelta(days=150)))
+        start = max(start, str(date.fromisoformat(end) - timedelta(days=430)))
     elif table == "market_history":
         # Enough complete sessions for 21-day context; do not transfer years of stock snapshots.
         start = max(start, str(date.fromisoformat(end) - timedelta(days=70)))

@@ -248,4 +248,6 @@ def capital_lines(capital):
         lines.append(f'{row["label"]}：{row["state_cn"]}；{value}；{row["status_cn"]}；观测 {row["observation_date"] or "未取得"}；{changes}')
         if row["details"].get("structural_note_present"):
             lines.append("ICI本次发布含结构性活动说明，原值保留，不直接解释为投资者撤资。")
+        if row["details"].get("acquisition_method") == "OFFICIAL_PAGE_VERIFIED_IMPORT":
+            lines.append("ICI数据为官方页面单次核验补录，自动抓取尚未恢复；按实际补录时间可用，不回填为当时已知。")
     return lines

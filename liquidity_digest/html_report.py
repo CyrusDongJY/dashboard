@@ -1,4 +1,4 @@
-"""Self-contained, script-free full report attachment from the frozen snapshot."""
+"""Self-contained full report with offline chart controls and static fallbacks."""
 from base64 import b64encode
 from html import escape
 
@@ -10,6 +10,7 @@ from .internals_view import internals_html
 from .frontpage import front_html, build_frontpage
 from .evidence import evidence_html
 from .reading import pressure_identity
+from .interactive import assets, toolbar, CSS as CHART_CSS
 
 
 def text(value):
@@ -89,7 +90,7 @@ def full_html(report, images=None, front_images=None):
                     "高值表示风险资本收缩，不是资金流出金额。",
                     "高值表示流动性支持偏弱，方向与首页支持分相反。")[i - 4])
         data_uri = b64encode(image.getvalue()).decode("ascii")
-        charts.append(f'<figure><div class="chart-wrap">'
+        charts.append(f'<figure><div class="chart-wrap" data-chart-id="trend-{i}">'
                       f'<img src="data:image/png;base64,{data_uri}" alt="{text(title)}" width="918" height="476">'
                       f'</div><figcaption>{text(caption)}</figcaption></figure>')
     funding = report["states"]["funding"]
@@ -108,10 +109,11 @@ def full_html(report, images=None, front_images=None):
     tag = "【核查更新版，非原定时报告】" if report.get("diagnostic") else "【模拟样例】" if report["demo"] else ""
     gaps = "、".join(report["gaps"]) or "无已识别缺口"
     focus = "".join(f'<li>{text(line)}</li>' for line in report["focus"])
+    chart_policy, chart_script = assets(report)
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; {chart_policy}img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>{text(tag)}美股流动性与风险传导日报 {text(report["report_date"])}</title>
 <style>
@@ -139,12 +141,13 @@ figcaption{{margin-top:10px}}ul{{padding-left:22px}}li{{margin-bottom:8px}}detai
 footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:anywhere}}
 @media(max-width:760px){{main{{padding:16px}}h1{{font-size:22px}}.domains,.confirmation,.index-grid,.chart-grid{{grid-template-columns:1fr;gap:18px}}.band{{padding:20px 0}}.state{{font-size:26px}}.domain table{{min-width:0}}.domain td:first-child{{min-width:90px}}.domain td,.domain th{{font-size:13px;padding:8px 6px}}#overview h2{{font-size:14px!important}}}}
 @media print{{html{{background:#fff}}main{{max-width:none;padding:0}}nav{{display:none}}.table-wrap,.chart-wrap{{overflow:visible}}table{{min-width:0!important}}figure img{{min-width:0}}figure{{break-inside:avoid}}h2,h3{{break-after:avoid}}}}
+{CHART_CSS}
 </style></head><body><main>
 <header><h1>美股流动性与风险传导日报</h1>
 <p class="muted">{text(tag) if tag else "盘前版"} · {text(report["report_date"])}</p>
 <p class="muted">美东{text(cutoff_label(report))}截止 · 收盘基准 {text(report["market_date"])} · 宏观按各源原生观测日</p>
 <nav aria-label="报告章节"><a href="#overview">今日概况</a><a href="#trends">趋势图表</a><a href="#evidence">分类证据</a><a href="#audit">来源审计</a></nav></header>
-{front_html(report, front_images)}
+{front_html(report, front_images, chart_controls=toolbar())}
 <section id="domain-evidence" class="band"><p class="muted">{text(report["domains"].get("evidence_note", ""))}</p>
 <details><summary>宏观与微观分组证据</summary><div class="domains">{"".join(panels)}</div></details></section>
 {internals_html(report)}
@@ -156,7 +159,7 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 {"".join(f"<p>{text(line)}</p>" for line in summary_lines(report))}
 {"".join(data)}<p class="warning">原始指标日期/覆盖缺口：{text(gaps)}；不包含同版历史不足与补充来源不可用，详见首页及配置持仓板块。缺失及过期数据不参与状态确认。</p>
 <p class="notice">错期参考：{text("；".join(report.get("publication_lags", [])) or "无")}。不冒充昨日同步数据。</p></section>
-<section id="trends" class="band"><h2>趋势与证据 / 近150个自然日</h2><h3>资金数量、融资价格与信用</h3><div class="chart-grid">{"".join(charts[:4])}</div>
+<section id="trends" class="band"><h2>趋势与证据</h2><p class="muted"><a href="#priority">图表时间范围</a> · 静态图默认近150个自然日</p><h3>资金数量、融资价格与信用</h3><div class="chart-grid">{"".join(charts[:4])}</div>
 <h3>市场传导与连续状态</h3><p class="muted">四个指标各自独立，不比较分数大小，不求和。实线为正式观察，虚线为历史重算参考，非当时可得信号；缺测仍断线。65/35沿用既有观察线，非交易触发线。</p><div class="chart-grid">{"".join(charts[4:])}</div>
 <p>{text(funding_line)}</p>{"".join(market_states)}<h3>优先查阅</h3>
 <ul>{focus or "<li>尚无足够连续观测确认方向。</li>"}</ul></section>
@@ -181,4 +184,4 @@ footer{{font-size:12px;color:#5c7078;padding-top:22px}}.version{{overflow-wrap:a
 仅使用各自固定权重版本，缺失或部分覆盖诊断值不作为正式总分，不跨版本拼线。</p></details>
 </section><footer><p class="version">影子观察 · {text(report["version"])} · {text(report["domains"]["version"])}</p>
 <p>缺失不等于平稳，未触发观察线不等于低风险。原有独立报告与预警保持不变。</p></footer>
-</main></body></html>"""
+</main>{chart_script}</body></html>"""
